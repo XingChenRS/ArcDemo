@@ -18,8 +18,8 @@ AccDemoArcaea_CFLAGS += -I./WQSuspendView/SuspendView -I./WHToast -I./include
 AccDemoArcaea_LIBRARIES = substrate
 AccDemoArcaea_LOGOSFLAGS = -c generator=MobileSubstrate
 
-# Dobby 静态库
-AccDemoArcaea_LDFLAGS  = -L./libs -ldobby
+# Dobby 静态库（C++）需要 libc++
+AccDemoArcaea_LDFLAGS  = -L./libs -ldobby -lc++
 
 ADDITIONAL_CFLAGS += -Wno-error=unused-variable -Wno-error=unused-function -include Prefix.pch
 
