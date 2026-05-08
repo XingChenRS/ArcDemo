@@ -10,8 +10,16 @@
 #import <mach/mach_time.h>
 #import <mach-o/dyld.h>
 #import <sys/time.h>
+#import <sys/mman.h>
 #import <stdatomic.h>
+#import <errno.h>
+#import <limits.h>
+#import <mach/vm_map.h>
+#import <mach/mach_init.h>
 #import <UIKit/UIKit.h>
+#if __has_include(<ptrauth.h>)
+#  import <ptrauth.h>
+#endif
 
 #import "dobby.h"
 #import "fishhook.h"
@@ -233,6 +241,9 @@ typedef uint64_t (*orig_mach_cont_t)(void);
 typedef uint64_t (*orig_mach_appx_t)(void);
 typedef double   (*orig_ca_cmt_t)(void);
 typedef double   (*orig_cf_abs_t)(void);
+typedef time_t   (*orig_time_t_fn)(time_t *);
+typedef uint64_t (*orig_dispatch_time_t)(uint64_t when, int64_t delta);
+typedef uint64_t (*orig_dispatch_walltime_t)(const struct timespec *when, int64_t delta);
 static orig_mach_abs_t              s_orig_mach_abs = NULL;
 static orig_gettod_t                s_orig_gettod   = NULL;
 static orig_clock_gettime_t         s_orig_clock_gettime = NULL;
@@ -242,6 +253,9 @@ static orig_mach_appx_t             s_orig_mach_appx = NULL;
 static orig_mach_cont_t             s_orig_mach_cont_appx = NULL;
 static orig_ca_cmt_t                s_orig_ca_cmt = NULL;
 static orig_cf_abs_t                s_orig_cf_abs = NULL;
+static orig_time_t_fn               s_orig_time = NULL;
+static orig_dispatch_time_t         s_orig_dispatch_time = NULL;
+static orig_dispatch_walltime_t     s_orig_dispatch_walltime = NULL;
 
 static _Atomic(uint64_t) g_tw_t0_real_mach = 0;  // 切换瞬间的真实 mach
 static _Atomic(uint64_t) g_tw_t0_warp_mach = 0;  // 切换瞬间的 warp mach
@@ -265,6 +279,14 @@ static _Atomic(uint64_t) g_tw_mach_appx_calls = 0;
 static _Atomic(uint64_t) g_tw_mach_cont_appx_calls = 0;
 static _Atomic(uint64_t) g_tw_ca_cmt_calls = 0;
 static _Atomic(uint64_t) g_tw_cf_abs_calls = 0;
+static _Atomic(uint64_t) g_tw_time_calls   = 0;
+static _Atomic(uint64_t) g_tw_dt_calls     = 0;
+static _Atomic(uint64_t) g_tw_dwt_calls    = 0;
+// vtable swizzle 调用计数（每个 wrapper 独立）
+static _Atomic(uint64_t) g_tw_pu_rt_calls   = 0;  // PlatformUtils::time_realtime_ms
+static _Atomic(uint64_t) g_tw_pu_mono_calls = 0;  // PlatformUtils::time_monotonic_ms
+static _Atomic(uint64_t) g_tw_pi_gtod_calls = 0;  // PlatformUtilsIOS gettimeofday->ms
+static _Atomic(uint64_t) g_tw_pi_mach_calls = 0;  // PlatformUtilsIOS mach_abs->ms
 
 // 每个时钟通道独立开关：1=warp（按 rate 加速）, 0=passthrough（仅计数，返回原值）
 // 默认状态：mach_abs + gettimeofday 已被验证能影响 BGM/动画 → 默认 ON
@@ -278,6 +300,14 @@ static _Atomic(int) g_tw_en_mach_appx     = 1;
 static _Atomic(int) g_tw_en_mach_cont_appx= 1;
 static _Atomic(int) g_tw_en_ca_cmt        = 1;
 static _Atomic(int) g_tw_en_cf_abs        = 1;
+static _Atomic(int) g_tw_en_time          = 0; // 默认 OFF：秒级 wall-time，warp 它会让 NSDate 等乱跳
+static _Atomic(int) g_tw_en_dt            = 0; // 默认 OFF：dispatch_time 是相对偏移，warp 会让 GCD 延迟翻倍
+static _Atomic(int) g_tw_en_dwt           = 0; // 同上
+// vtable swizzle 开关：默认 OFF（arm64e PAC 风险，先要验证 binary 是 arm64 slice 才稳）
+static _Atomic(int) g_tw_en_pu_rt         = 0;
+static _Atomic(int) g_tw_en_pu_mono       = 0;
+static _Atomic(int) g_tw_en_pi_gtod       = 0;
+static _Atomic(int) g_tw_en_pi_mach       = 0;
 
 // mach_timebase: 用于把 CACurrentMediaTime (秒) 转 mach 滴答以共享 _compute_warp_mach 锚
 static mach_timebase_info_data_t s_tb_info = {0, 0};
@@ -459,6 +489,236 @@ static double tw_CFAbsoluteTimeGetCurrent(void) {
     return (double)warp_us / 1e6;
 }
 
+// time(time_t *): 返回秒级 wall-time，用 us 锚换算
+static time_t tw_time(time_t *out) {
+    time_t real = s_orig_time ? s_orig_time(NULL) : time(NULL);
+    atomic_fetch_add(&g_tw_time_calls, 1);
+    if (!atomic_load(&g_tw_en_time)) {
+        if (out) *out = real;
+        return real;
+    }
+    uint64_t real_us = (uint64_t)real * 1000000ULL;
+    uint64_t warp_us;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        warp_us = f ? f : real_us;
+    } else {
+        warp_us = _compute_warp_us(real_us);
+    }
+    time_t warp = (time_t)(warp_us / 1000000ULL);
+    if (out) *out = warp;
+    return warp;
+}
+
+// dispatch_time(when, delta): when=DISPATCH_TIME_NOW(0) 时 delta 是 ns 偏移
+// warp 它会让 GCD 调度时延按 rate 缩放（dispatch_after 等会变快）
+static uint64_t tw_dispatch_time(uint64_t when, int64_t delta) {
+    atomic_fetch_add(&g_tw_dt_calls, 1);
+    if (!atomic_load(&g_tw_en_dt) || delta == 0) {
+        return s_orig_dispatch_time ? s_orig_dispatch_time(when, delta) : 0;
+    }
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) {
+        return s_orig_dispatch_time ? s_orig_dispatch_time(when, delta) : 0;
+    }
+    int64_t scaled = (int64_t)((double)delta / rate);
+    return s_orig_dispatch_time ? s_orig_dispatch_time(when, scaled) : 0;
+}
+
+static uint64_t tw_dispatch_walltime(const struct timespec *when, int64_t delta) {
+    atomic_fetch_add(&g_tw_dwt_calls, 1);
+    if (!atomic_load(&g_tw_en_dwt)) {
+        return s_orig_dispatch_walltime ? s_orig_dispatch_walltime(when, delta) : 0;
+    }
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) {
+        return s_orig_dispatch_walltime ? s_orig_dispatch_walltime(when, delta) : 0;
+    }
+    int64_t scaled = (int64_t)((double)delta / rate);
+    return s_orig_dispatch_walltime ? s_orig_dispatch_walltime(when, scaled) : 0;
+}
+
+#pragma mark - vtable swizzle (PlatformUtils / PlatformUtilsIOS)
+//
+// IDA 6.13.10 已知:
+//   PlatformUtils    vtable @ base + 0x33E000
+//     slot1 = sub_1009E0FA0  realtime  -> ms (uint64_t)
+//     slot2 = sub_1009E0FE8  monotonic -> ms (uint64_t)
+//   PlatformUtilsIOS vtable @ base + 0x3637F0
+//     slot0 = sub_100AE9A94  gettimeofday -> ms (uint64_t)
+//     slot1 = sub_100AE9AE4  mach_abs     -> ms (uint64_t)
+//
+// Strategy: 在 vtable 周围 ±64 slots 范围内扫描,匹配原 fn 地址 (PAC strip 后)
+// 找到则 mprotect RW + 写 wrapper ptr (arm64e PAC vtable 风险:写 unsigned ptr 调用
+// 时会 BLRAA 失败崩溃; 默认开关 OFF, 由用户主动启用试错)。
+//
+// 若 PlatformUtils* 实例其实是堆对象, vtable 还是常驻 image __DATA_CONST,
+// 所有实例共享 → 一次性替换全局生效。
+
+#define ARC_OFF_PU_VTABLE   (0x33E000ULL)
+#define ARC_OFF_PI_VTABLE   (0x3637F0ULL)
+#define ARC_OFF_PU_RT_FN    (0x9E0FA0ULL)
+#define ARC_OFF_PU_MONO_FN  (0x9E0FE8ULL)
+#define ARC_OFF_PI_GTOD_FN  (0xAE9A94ULL)
+#define ARC_OFF_PI_MACH_FN  (0xAE9AE4ULL)
+
+typedef uint64_t (*orig_pu_ms_fn)(void *self);
+
+// 保存的原始 fn ptr (PAC 已 strip,可直接调用)
+static orig_pu_ms_fn s_orig_pu_rt   = NULL;
+static orig_pu_ms_fn s_orig_pu_mono = NULL;
+static orig_pu_ms_fn s_orig_pi_gtod = NULL;
+static orig_pu_ms_fn s_orig_pi_mach = NULL;
+
+// 各 wrapper:先调原函数拿 raw_ms,然后按 us 锚 warp 后返回 (PlatformUtils 都返回 ms)
+static uint64_t _warp_ms_via_us(uint64_t raw_ms) {
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        return f ? (f / 1000ULL) : raw_ms;
+    }
+    uint64_t real_us = raw_ms * 1000ULL;
+    uint64_t warp_us = _compute_warp_us(real_us);
+    return warp_us / 1000ULL;
+}
+
+static uint64_t tw_pu_realtime_ms(void *self) {
+    uint64_t raw = s_orig_pu_rt ? s_orig_pu_rt(self) : 0;
+    atomic_fetch_add(&g_tw_pu_rt_calls, 1);
+    if (!atomic_load(&g_tw_en_pu_rt)) return raw;
+    return _warp_ms_via_us(raw);
+}
+static uint64_t tw_pu_monotonic_ms(void *self) {
+    uint64_t raw = s_orig_pu_mono ? s_orig_pu_mono(self) : 0;
+    atomic_fetch_add(&g_tw_pu_mono_calls, 1);
+    if (!atomic_load(&g_tw_en_pu_mono)) return raw;
+    return _warp_ms_via_us(raw);
+}
+static uint64_t tw_pi_gtod_ms(void *self) {
+    uint64_t raw = s_orig_pi_gtod ? s_orig_pi_gtod(self) : 0;
+    atomic_fetch_add(&g_tw_pi_gtod_calls, 1);
+    if (!atomic_load(&g_tw_en_pi_gtod)) return raw;
+    return _warp_ms_via_us(raw);
+}
+static uint64_t tw_pi_mach_ms(void *self) {
+    uint64_t raw = s_orig_pi_mach ? s_orig_pi_mach(self) : 0;
+    atomic_fetch_add(&g_tw_pi_mach_calls, 1);
+    if (!atomic_load(&g_tw_en_pi_mach)) return raw;
+    return _warp_ms_via_us(raw);
+}
+
+// 在 vtable 区域 ±64 slots 范围内扫描,找到匹配 orig_fn 的 slot 并替换为 new_fn。
+// 返回找到的 slot index (相对 vtable 起始,可能负数),失败返回 INT_MIN。
+static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
+                                     void *new_fn, void **out_orig)
+{
+    uint64_t base = arc_image_base();
+    if (!base) return INT_MIN;
+    uint64_t target = base + orig_fn_off;
+    void **vt = (void **)vtable_addr;
+    for (int i = -4; i < 64; i++) {
+        void *cur = vt[i];
+        if (!cur) continue;
+        // PAC strip (arm64e instruction key A);arm64 上是 noop
+#if __has_feature(ptrauth_calls)
+        void *stripped = ptrauth_strip(cur, ptrauth_key_asia);
+#else
+        void *stripped = cur;
+#endif
+        if ((uint64_t)stripped != target) continue;
+        // 找到了。mprotect 整 16K 页 RW (iOS 16 __DATA_CONST 可能 deny → 退化 vm_protect+COPY)
+        uintptr_t page = (uintptr_t)&vt[i] & ~(uintptr_t)0x3FFF;
+        bool wrote = false;
+        if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE) == 0) {
+            wrote = true;
+        } else {
+            int e1 = errno;
+            // 备用:vm_protect with VM_PROT_COPY (fishhook 同款)
+            kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
+                                          0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+            if (kr == KERN_SUCCESS) {
+                wrote = true;
+            } else {
+                acc_flog(@"swizzle: mprotect RW fail errno=%d, vm_protect kr=%d @ %p",
+                         e1, kr, (void *)page);
+            }
+        }
+        if (!wrote) return INT_MIN;
+        if (out_orig) *out_orig = stripped;  // 裸地址,可直接调用
+#if __has_feature(ptrauth_calls)
+        // arm64e: 用相同 slot 地址作为 discriminator blend 重新签名
+        // 注意:C++ vtable 真实 discriminator 在编译期 hash 决定,这里只是尽力而为
+        void *signed_new = ptrauth_sign_unauthenticated(new_fn,
+                              ptrauth_key_asia,
+                              ptrauth_blend_discriminator(&vt[i], 0));
+        vt[i] = signed_new;
+#else
+        vt[i] = new_fn;
+#endif
+        // 不能 PROT_EXEC, __DATA_CONST 不允许; 恢复 RO (尽力而为,失败也无所谓)
+        mprotect((void *)page, 0x4000, PROT_READ);
+        acc_flog(@"swizzle OK: vtable=%p slot[%d] orig=%p -> new=%p",
+                 (void *)vtable_addr, i, stripped, new_fn);
+        return i;
+    }
+    acc_flog(@"swizzle: NOT FOUND in vtable=%p target=%p (image+0x%llx)",
+             (void *)vtable_addr, (void *)target, orig_fn_off);
+    return INT_MIN;
+}
+
+static void install_vtable_swizzles(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        uint64_t base = arc_image_base();
+        if (!base) { acc_flog(@"swizzle: no image base"); return; }
+        swizzle_vtable_find_swap(base + ARC_OFF_PU_VTABLE, ARC_OFF_PU_RT_FN,
+                                 (void *)tw_pu_realtime_ms,  (void **)&s_orig_pu_rt);
+        swizzle_vtable_find_swap(base + ARC_OFF_PU_VTABLE, ARC_OFF_PU_MONO_FN,
+                                 (void *)tw_pu_monotonic_ms, (void **)&s_orig_pu_mono);
+        swizzle_vtable_find_swap(base + ARC_OFF_PI_VTABLE, ARC_OFF_PI_GTOD_FN,
+                                 (void *)tw_pi_gtod_ms,      (void **)&s_orig_pi_gtod);
+        swizzle_vtable_find_swap(base + ARC_OFF_PI_VTABLE, ARC_OFF_PI_MACH_FN,
+                                 (void *)tw_pi_mach_ms,      (void **)&s_orig_pi_mach);
+    });
+}
+
+// 自检:直接调原函数 (我们保存的 stripped ptr) + 调 vtable 上现在挂着的 wrapper,
+// 输出对比看 vtable swizzle 是否真的让调用走到我们这边。
+static void self_test_vtable(void) {
+    uint64_t base = arc_image_base();
+    acc_flog(@"=== self_test_vtable rate=%.3f freeze=%d ===",
+             tw_get_rate(), atomic_load(&g_tw_freeze_count));
+    void *pu_vt = (void *)(base + ARC_OFF_PU_VTABLE);
+    void *pi_vt = (void *)(base + ARC_OFF_PI_VTABLE);
+    acc_flog(@"  PU  rt:   orig_saved=%p  pu_rt_calls=%llu  en=%d",
+             (void *)s_orig_pu_rt, atomic_load(&g_tw_pu_rt_calls),
+             atomic_load(&g_tw_en_pu_rt));
+    acc_flog(@"  PU  mono: orig_saved=%p  pu_mono_calls=%llu en=%d",
+             (void *)s_orig_pu_mono, atomic_load(&g_tw_pu_mono_calls),
+             atomic_load(&g_tw_en_pu_mono));
+    acc_flog(@"  PI  gtod: orig_saved=%p  pi_gtod_calls=%llu en=%d",
+             (void *)s_orig_pi_gtod, atomic_load(&g_tw_pi_gtod_calls),
+             atomic_load(&g_tw_en_pi_gtod));
+    acc_flog(@"  PI  mach: orig_saved=%p  pi_mach_calls=%llu en=%d",
+             (void *)s_orig_pi_mach, atomic_load(&g_tw_pi_mach_calls),
+             atomic_load(&g_tw_en_pi_mach));
+    // 直接读 vtable 当前内容,对比是否被替换
+    void **pu = (void **)pu_vt;
+    void **pi = (void **)pi_vt;
+    acc_flog(@"  PU vtable[-2..3]: %p %p %p %p %p %p",
+             pu[-2], pu[-1], pu[0], pu[1], pu[2], pu[3]);
+    acc_flog(@"  PI vtable[-2..3]: %p %p %p %p %p %p",
+             pi[-2], pi[-1], pi[0], pi[1], pi[2], pi[3]);
+    // 主动调 PlatformUtils 通过原 fn 拿 raw_ms (传 self=NULL,函数应不解引用 self)
+    if (s_orig_pu_mono) {
+        @try {
+            uint64_t raw = s_orig_pu_mono(NULL);
+            acc_flog(@"  PU mono(NULL) raw_ms=%llu", raw);
+        } @catch (NSException *e) {
+            acc_flog(@"  PU mono(NULL) EX: %@", e);
+        }
+    }
+}
+
 // 增加冻结计数（用户暂停 / 切后台 / seek 期间皆可调用）
 static void time_warp_freeze_inc(void) {
     int32_t prev = atomic_fetch_add(&g_tw_freeze_count, 1);
@@ -526,7 +786,7 @@ static void time_warp_set_rate(double rate) {
 static void time_warp_install(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        struct rebinding rs[9] = {
+        struct rebinding rs[12] = {
             { "mach_absolute_time",                (void *)tw_mach_absolute_time,                (void **)&s_orig_mach_abs },
             { "gettimeofday",                      (void *)tw_gettimeofday,                      (void **)&s_orig_gettod   },
             { "clock_gettime",                     (void *)tw_clock_gettime,                     (void **)&s_orig_clock_gettime },
@@ -536,15 +796,19 @@ static void time_warp_install(void) {
             { "mach_continuous_approximate_time",  (void *)tw_mach_continuous_approximate_time,  (void **)&s_orig_mach_cont_appx },
             { "CACurrentMediaTime",                (void *)tw_CACurrentMediaTime,                (void **)&s_orig_ca_cmt },
             { "CFAbsoluteTimeGetCurrent",          (void *)tw_CFAbsoluteTimeGetCurrent,          (void **)&s_orig_cf_abs },
+            { "time",                              (void *)tw_time,                              (void **)&s_orig_time },
+            { "dispatch_time",                     (void *)tw_dispatch_time,                     (void **)&s_orig_dispatch_time },
+            { "dispatch_walltime",                 (void *)tw_dispatch_walltime,                 (void **)&s_orig_dispatch_walltime },
         };
-        int r = rebind_symbols(rs, 9);
+        int r = rebind_symbols(rs, 12);
         ensure_timebase();
-        acc_flog(@"fishhook ret=%d mach=%p gtod=%p cgt=%p cgt_ns=%p mcont=%p mappx=%p mcappx=%p ca_cmt=%p cf_abs=%p tb=%u/%u",
+        acc_flog(@"fishhook ret=%d mach=%p gtod=%p cgt=%p cgt_ns=%p mcont=%p mappx=%p mcappx=%p ca_cmt=%p cf_abs=%p time=%p dt=%p dwt=%p tb=%u/%u",
                  r,
                  (void *)s_orig_mach_abs, (void *)s_orig_gettod,
                  (void *)s_orig_clock_gettime, (void *)s_orig_clock_gettime_nsec_np,
                  (void *)s_orig_mach_cont, (void *)s_orig_mach_appx,
                  (void *)s_orig_mach_cont_appx, (void *)s_orig_ca_cmt, (void *)s_orig_cf_abs,
+                 (void *)s_orig_time, (void *)s_orig_dispatch_time, (void *)s_orig_dispatch_walltime,
                  s_tb_info.numer, s_tb_info.denom);
     });
 }
@@ -870,6 +1134,13 @@ static void loadPref(void) {
         { "mach_continuous_approximate_time",  &g_tw_en_mach_cont_appx, &g_tw_mach_cont_appx_calls},
         { "CACurrentMediaTime",                &g_tw_en_ca_cmt,         &g_tw_ca_cmt_calls        },
         { "CFAbsoluteTimeGetCurrent",          &g_tw_en_cf_abs,         &g_tw_cf_abs_calls        },
+        { "time",                              &g_tw_en_time,           &g_tw_time_calls          },
+        { "dispatch_time",                     &g_tw_en_dt,             &g_tw_dt_calls            },
+        { "dispatch_walltime",                 &g_tw_en_dwt,            &g_tw_dwt_calls           },
+        { "[vt]PlatformUtils.realtime_ms",     &g_tw_en_pu_rt,          &g_tw_pu_rt_calls         },
+        { "[vt]PlatformUtils.monotonic_ms",    &g_tw_en_pu_mono,        &g_tw_pu_mono_calls       },
+        { "[vt]PlatformUtilsIOS.gtod_ms",      &g_tw_en_pi_gtod,        &g_tw_pi_gtod_calls       },
+        { "[vt]PlatformUtilsIOS.mach_ms",      &g_tw_en_pi_mach,        &g_tw_pi_mach_calls       },
     };
     int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
     for (int i = 0; i < nClocks; i++) {
@@ -946,6 +1217,13 @@ static void loadPref(void) {
     [card addSubview:addBtn];
     y += 40;
 
+    UIButton *selfTestBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    selfTestBtn.frame = CGRectMake(12, y, innerW, 32);
+    [selfTestBtn setTitle:@"自检 vtable swizzle (写日志)" forState:UIControlStateNormal];
+    [selfTestBtn addTarget:self action:@selector(selfTestTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:selfTestBtn];
+    y += 40;
+
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     closeBtn.frame = CGRectMake(12, y, innerW, 32);
     [closeBtn setTitle:@"关闭" forState:UIControlStateNormal];
@@ -994,6 +1272,8 @@ static void loadPref(void) {
         &g_tw_mach_calls, &g_tw_gtod_calls, &g_tw_cgt_calls, &g_tw_cgt_nsec_calls,
         &g_tw_mach_cont_calls, &g_tw_mach_appx_calls, &g_tw_mach_cont_appx_calls,
         &g_tw_ca_cmt_calls, &g_tw_cf_abs_calls,
+        &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
+        &g_tw_pu_rt_calls, &g_tw_pu_mono_calls, &g_tw_pi_gtod_calls, &g_tw_pi_mach_calls,
     };
     int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
     for (int i = 0; i < n; i++) {
@@ -1018,11 +1298,15 @@ static void loadPref(void) {
         &g_tw_en_mach, &g_tw_en_gtod, &g_tw_en_cgt, &g_tw_en_cgt_nsec,
         &g_tw_en_mach_cont, &g_tw_en_mach_appx, &g_tw_en_mach_cont_appx,
         &g_tw_en_ca_cmt, &g_tw_en_cf_abs,
+        &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
+        &g_tw_en_pu_rt, &g_tw_en_pu_mono, &g_tw_en_pi_gtod, &g_tw_en_pi_mach,
     };
     const char *names[] = {
         "mach_abs", "gtod", "cgt", "cgt_nsec",
         "mach_cont", "mach_appx", "mach_cont_appx",
         "ca_cmt", "cf_abs",
+        "time", "dispatch_time", "dispatch_walltime",
+        "[vt]pu_rt", "[vt]pu_mono", "[vt]pi_gtod", "[vt]pi_mach",
     };
     int n = (int)(sizeof(flags) / sizeof(flags[0]));
     if (idx < 0 || idx >= n) return;
@@ -1031,6 +1315,14 @@ static void loadPref(void) {
     if (toast) {
         [WHToast showMessage:[NSString stringWithFormat:@"%s %@", names[idx], sw.on ? @"ON" : @"OFF"]
                     duration:0.4 finishHandler:^{}];
+    }
+}
+
+- (void)selfTestTapped:(UIButton *)b {
+    self_test_vtable();
+    if (toast) {
+        [WHToast showMessage:@"自检已写入日志 Documents/AccDemoArcaea.log"
+                    duration:1.0 finishHandler:^{}];
     }
 }
 
@@ -1193,6 +1485,7 @@ static void doBootstrap(void) {
         @try { initButton(); }       @catch (NSException *e) { acc_flog(@"initButton EX: %@", e); }
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
         @try { time_warp_install(); } @catch (NSException *e) { acc_flog(@"time_warp_install EX: %@", e); }
+        @try { install_vtable_swizzles(); } @catch (NSException *e) { acc_flog(@"install_vtable_swizzles EX: %@", e); }
         // 后台轮询：不断给 channel 应用当前倍率（安全：setFrequency 是 FMOD 公开 API，不写 text）
         // 第一次进歌曲时会自动捕获 base_freq；之后每次倍率切换由 UI 触发，但 seek/重启歌曲会重置
         // FMOD 频率，所以这里也要兜底重新 apply。
