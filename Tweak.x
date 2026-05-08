@@ -555,8 +555,8 @@ static uint64_t tw_dispatch_walltime(const struct timespec *when, int64_t delta)
 // 若 PlatformUtils* 实例其实是堆对象, vtable 还是常驻 image __DATA_CONST,
 // 所有实例共享 → 一次性替换全局生效。
 
-#define ARC_OFF_PU_VTABLE   (0x33E000ULL)
-#define ARC_OFF_PI_VTABLE   (0x3637F0ULL)
+#define ARC_OFF_PU_VTABLE   (0x133E000ULL)
+#define ARC_OFF_PI_VTABLE   (0x13637F0ULL)
 #define ARC_OFF_PU_RT_FN    (0x9E0FA0ULL)
 #define ARC_OFF_PU_MONO_FN  (0x9E0FE8ULL)
 #define ARC_OFF_PI_GTOD_FN  (0xAE9A94ULL)
