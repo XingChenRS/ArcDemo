@@ -7,6 +7,7 @@ ARCHS = arm64 arm64e
 LIBRARY_NAME = AccDemoArcaea
 
 AccDemoArcaea_FILES = Tweak.x
+AccDemoArcaea_FILES += fishhook.c
 AccDemoArcaea_FILES += WQSuspendView/SuspendView/SuspendView/WQSuspendView.m
 AccDemoArcaea_FILES += $(wildcard WHToast/WHToast/*.m)
 

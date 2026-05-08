@@ -7,11 +7,14 @@
 #import <substrate.h>
 #import <time.h>
 #import <dlfcn.h>
+#import <mach/mach_time.h>
 #import <mach-o/dyld.h>
+#import <sys/time.h>
 #import <stdatomic.h>
 #import <UIKit/UIKit.h>
 
 #import "dobby.h"
+#import "fishhook.h"
 
 extern UIApplication *UIApp;
 
@@ -241,6 +244,118 @@ static void apply_speed_to_all_channels(void) {
         float target = base * rate;
         g_ch_set_frequency(chs[i], target);
     }
+}
+
+#pragma mark - Time Warp (fishhook 谱面同步变速)
+
+// 让游戏内部的 Clock::currentTimeMs (vtable @ 0x1013637e0) 看到的时间按 rate 加速。
+// 仅 rebind Arc-mobile 主二进制 GOT 的 mach_absolute_time + gettimeofday，
+// 不写任何 __TEXT 段，不影响 Firebase / 系统 framework，符合 iOS16 sideload 安全约束。
+//
+// 公式：t_warp(real) = t0_warp + (real - t0_real) * rate
+// 切倍率瞬间：t0_real = real_now; t0_warp = warp_now（保持连续，不跳变）
+
+typedef uint64_t (*orig_mach_abs_t)(void);
+typedef int      (*orig_gettod_t)(struct timeval *tv, void *tz);
+static orig_mach_abs_t s_orig_mach_abs = NULL;
+static orig_gettod_t   s_orig_gettod   = NULL;
+
+static _Atomic(uint64_t) g_tw_t0_real_mach = 0;  // 切换瞬间的真实 mach
+static _Atomic(uint64_t) g_tw_t0_warp_mach = 0;  // 切换瞬间的 warp mach
+static _Atomic(uint64_t) g_tw_t0_real_us   = 0;  // 切换瞬间的真实 microseconds (gettimeofday)
+static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;  // 切换瞬间的 warp microseconds
+static _Atomic(uint32_t) g_tw_rate_x1000   = 1000; // rate * 1000，整数避免原子 float 兼容性
+
+static inline double tw_get_rate(void) {
+    return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
+}
+
+static uint64_t tw_mach_absolute_time(void) {
+    uint64_t real = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) return real;
+    uint64_t t0r = atomic_load(&g_tw_t0_real_mach);
+    uint64_t t0w = atomic_load(&g_tw_t0_warp_mach);
+    if (t0r == 0) return real;  // 还没初始化基准
+    if (real <= t0r) return t0w;
+    uint64_t delta = real - t0r;
+    uint64_t scaled = (uint64_t)((double)delta * rate);
+    return t0w + scaled;
+}
+
+static int tw_gettimeofday(struct timeval *tv, void *tz) {
+    if (!tv) return s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
+    int r = s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
+    if (r != 0) return r;
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) return r;
+    uint64_t real_us = (uint64_t)tv->tv_sec * 1000000ULL + (uint64_t)tv->tv_usec;
+    uint64_t t0r = atomic_load(&g_tw_t0_real_us);
+    uint64_t t0w = atomic_load(&g_tw_t0_warp_us);
+    if (t0r == 0) return r;
+    uint64_t warp_us;
+    if (real_us <= t0r) warp_us = t0w;
+    else {
+        uint64_t delta = real_us - t0r;
+        warp_us = t0w + (uint64_t)((double)delta * rate);
+    }
+    tv->tv_sec  = (time_t)(warp_us / 1000000ULL);
+    tv->tv_usec = (suseconds_t)(warp_us % 1000000ULL);
+    return r;
+}
+
+// 设置新倍率：先用「当前 warp 时间」做新基准 t0_warp，再把 t0_real 设为「当前真实时间」。
+// 这样 warp 时间在切换瞬间是连续的，不会跳变（避免谱面 note 突跳）。
+static void time_warp_set_rate(double rate) {
+    if (rate <= 0.001) return;
+    // 1) 先算出当前 warp 时间（用旧 rate）
+    uint64_t real_mach_now = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
+    struct timeval tv_now;
+    int gtr = s_orig_gettod ? s_orig_gettod(&tv_now, NULL) : gettimeofday(&tv_now, NULL);
+    uint64_t real_us_now = 0;
+    if (gtr == 0) real_us_now = (uint64_t)tv_now.tv_sec * 1000000ULL + (uint64_t)tv_now.tv_usec;
+
+    double old_rate = tw_get_rate();
+    uint64_t t0r_m = atomic_load(&g_tw_t0_real_mach);
+    uint64_t t0w_m = atomic_load(&g_tw_t0_warp_mach);
+    uint64_t warp_mach_now;
+    if (t0r_m == 0 || (old_rate >= 0.999 && old_rate <= 1.001)) {
+        warp_mach_now = real_mach_now;
+    } else if (real_mach_now <= t0r_m) {
+        warp_mach_now = t0w_m;
+    } else {
+        warp_mach_now = t0w_m + (uint64_t)((double)(real_mach_now - t0r_m) * old_rate);
+    }
+    uint64_t t0r_u = atomic_load(&g_tw_t0_real_us);
+    uint64_t t0w_u = atomic_load(&g_tw_t0_warp_us);
+    uint64_t warp_us_now;
+    if (t0r_u == 0 || (old_rate >= 0.999 && old_rate <= 1.001)) {
+        warp_us_now = real_us_now;
+    } else if (real_us_now <= t0r_u) {
+        warp_us_now = t0w_u;
+    } else {
+        warp_us_now = t0w_u + (uint64_t)((double)(real_us_now - t0r_u) * old_rate);
+    }
+
+    // 2) 重置基准
+    atomic_store(&g_tw_t0_real_mach, real_mach_now);
+    atomic_store(&g_tw_t0_warp_mach, warp_mach_now);
+    atomic_store(&g_tw_t0_real_us,   real_us_now);
+    atomic_store(&g_tw_t0_warp_us,   warp_us_now);
+    atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
+}
+
+static void time_warp_install(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct rebinding rs[2] = {
+            { "mach_absolute_time", (void *)tw_mach_absolute_time, (void **)&s_orig_mach_abs },
+            { "gettimeofday",       (void *)tw_gettimeofday,       (void **)&s_orig_gettod   },
+        };
+        int r = rebind_symbols(rs, 2);
+        acc_flog(@"fishhook rebind_symbols ret=%d orig_mach=%p orig_gtod=%p",
+                 r, (void *)s_orig_mach_abs, (void *)s_orig_gettod);
+    });
 }
 
 static void player_seek_ms(uint32_t ms) {
@@ -524,11 +639,11 @@ static void initHook(void) {
     [card addSubview:title];
     y += 28;
 
-    // 重要说明：只能改音频，谱面不跟随
+    // 重要说明：现在已通过 fishhook 实现谱面同步变速
     UILabel *warn = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
-    warn.text = @"⚠️ 仅改变音频倍速；Arcaea 谱面/判定使用独立时钟，不受影响。谱面似乎不跟随是正常现象。";
+    warn.text = @"音频 + 谱面 + 判定全部同步变速（fishhook time-warp）。建议先测低倍率验证手感。";
     warn.font = [UIFont systemFontOfSize:11];
-    warn.textColor = [UIColor colorWithRed:0.8 green:0.4 blue:0.0 alpha:1.0];
+    warn.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.2 alpha:1.0];
     warn.numberOfLines = 0;
     [card addSubview:warn];
     y += 38;
@@ -713,6 +828,7 @@ static void initHook(void) {
     NSInteger i = b.tag - 1000;
     if (i < 0 || i >= rate_count) return;
     rate_i = i;
+    time_warp_set_rate((double)rates[rate_i]);
     apply_speed_to_all_channels();
     if (toast) {
         [WHToast showMessage:[NSString stringWithFormat:@"%.3fx", rates[rate_i]]
@@ -779,7 +895,8 @@ static void initButton(void) {
         // 单击：切换倍率（低频动作）
         if (rate_count <= 0) return;
         rate_i = (rate_i + 1) % rate_count;
-        apply_speed_to_all_channels();
+        time_warp_set_rate((double)rates[rate_i]);  // 谱面同步变速
+        apply_speed_to_all_channels();              // 音频同步变速
         if (toast) {
             [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (tap2x=menu)", rates[rate_i]]
                                    duration:0.5 finishHandler:^{}];
@@ -865,6 +982,7 @@ static void doBootstrap(void) {
         acc_flog(@"doBootstrap begin");
         @try { initButton(); }       @catch (NSException *e) { acc_flog(@"initButton EX: %@", e); }
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
+        @try { time_warp_install(); } @catch (NSException *e) { acc_flog(@"time_warp_install EX: %@", e); }
         // 后台轮询：不断给 channel 应用当前倍率（安全：setFrequency 是 FMOD 公开 API，不写 text）
         // 第一次进歌曲时会自动捕获 base_freq；之后每次倍率切换由 UI 触发，但 seek/重启歌曲会重置
         // FMOD 频率，所以这里也要兜底重新 apply。
