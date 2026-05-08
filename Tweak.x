@@ -66,18 +66,33 @@ static UIView        *menuView = nil;
 #define ARC_OFF_GET_REGISTRY       (0xC9D718ULL)
 #define ARC_OFF_GET_CURRENT_SOUND  (0xEC094CULL)
 #define ARC_OFF_GET_SOUND_LENGTH   (0xF2BB64ULL)
+// 直接 FMOD Channel API，绕开 MTP 包装。
+//   getPositionMs(MTP, ch) 内部就是 Channel::getPosition（已确认）→ 改频率 → 谱面/音频同步
+#define ARC_OFF_CH_GET_POSITION    (0xEC03ACULL)
+#define ARC_OFF_CH_SET_FREQUENCY   (0xEC069CULL)
+#define ARC_OFF_CH_GET_FREQUENCY   (0xEC077CULL)
 #define ARC_REG_PLAYER_OFFSET      (8)
 #define ARC_PLAYER_CHANNELS_OFFSET (0x38)
 #define ARC_CHANNEL_ENTRY_PTR_OFF  (8)
+#define ARC_CHANNEL_ENTRY_STRIDE   (16)
 
 typedef uint32_t (*get_position_ms_fn)(void *self, int channel);
 typedef void *   (*get_registry_fn)(void);
 typedef int      (*get_current_sound_fn)(void *channel, void **outSound);
 typedef int      (*get_sound_length_fn)(void *sound, uint32_t *outLen, int unit);
+typedef int      (*ch_get_position_fn)(void *channel, uint32_t *out_ms, int unit);
+typedef int      (*ch_set_frequency_fn)(void *channel, float hz);
+typedef int      (*ch_get_frequency_fn)(void *channel, float *out_hz);
 static get_position_ms_fn   orig_get_position_ms = NULL;
 static get_registry_fn      g_get_registry = NULL;
 static get_current_sound_fn g_get_current_sound = NULL;
 static get_sound_length_fn  g_get_sound_length = NULL;
+static ch_get_position_fn   g_ch_get_position = NULL;
+static ch_set_frequency_fn  g_ch_set_frequency = NULL;
+static ch_get_frequency_fn  g_ch_get_frequency = NULL;
+// 缓存每个 channel 的「初始基准频率」，第一次 setFrequency 前用 getFrequency 抓
+#define ARC_MAX_CHANNELS  (8)
+static _Atomic(float) g_base_freq[ARC_MAX_CHANNELS];   // 0 = 未捕获
 
 // �?hook 兜底捕获 + 主动通过 registry 获取
 static _Atomic(void *)   g_bgmPlayer = NULL;
@@ -166,8 +181,12 @@ static void install_arc_hooks(void) {
     g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
     g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
     g_get_sound_length  = (get_sound_length_fn) (base + ARC_OFF_GET_SOUND_LENGTH);
-    NSLog(@"[AccDemoArcaea] registry=%p getCurrentSound=%p getLength=%p",
-          (void *)g_get_registry, (void *)g_get_current_sound, (void *)g_get_sound_length);
+    g_ch_get_position   = (ch_get_position_fn) (base + ARC_OFF_CH_GET_POSITION);
+    g_ch_set_frequency  = (ch_set_frequency_fn)(base + ARC_OFF_CH_SET_FREQUENCY);
+    g_ch_get_frequency  = (ch_get_frequency_fn)(base + ARC_OFF_CH_GET_FREQUENCY);
+    NSLog(@"[AccDemoArcaea] registry=%p getCurrentSound=%p getLength=%p setFreq=%p",
+          (void *)g_get_registry, (void *)g_get_current_sound,
+          (void *)g_get_sound_length, (void *)g_ch_set_frequency);
     void *mtp = resolve_player_via_registry();
     NSLog(@"[AccDemoArcaea] initial MTP via registry = %p", mtp);
     if (mtp) try_capture_song_length(mtp);
@@ -181,12 +200,57 @@ static inline void *_player_vt_slot(void *self, size_t byte_off) {
     return vtable[byte_off / sizeof(void *)];
 }
 
+// 枚举 player 的所有 channel 指针；返回写入数量（最多 outCap 个）
+static int player_collect_channels(void **outChs, int outCap) {
+    void *self = get_player_or_resolve();
+    if (!self) return 0;
+    void *channels_base = *(void **)((char *)self + ARC_PLAYER_CHANNELS_OFFSET);
+    void *channels_end  = *(void **)((char *)self + ARC_PLAYER_CHANNELS_OFFSET + 8);
+    if (!channels_base || !channels_end || channels_end < channels_base) return 0;
+    size_t n = ((size_t)((char *)channels_end - (char *)channels_base)) / ARC_CHANNEL_ENTRY_STRIDE;
+    if (n > (size_t)outCap) n = (size_t)outCap;
+    int got = 0;
+    for (size_t i = 0; i < n; i++) {
+        void *ch = *(void **)((char *)channels_base + ARC_CHANNEL_ENTRY_STRIDE * i + ARC_CHANNEL_ENTRY_PTR_OFF);
+        if (ch) outChs[got++] = ch;
+    }
+    return got;
+}
+
+// 把当前 rate 应用到所有 channel：base_freq * rate；首个调用会缓存 base_freq
+static void apply_speed_to_all_channels(void) {
+    if (!g_ch_set_frequency || !g_ch_get_frequency) return;
+    if (rate_count <= 0 || !rates) return;
+    float rate = rates[rate_i];
+    if (rate <= 0.001f) return;
+    void *chs[ARC_MAX_CHANNELS] = {0};
+    int n = player_collect_channels(chs, ARC_MAX_CHANNELS);
+    for (int i = 0; i < n; i++) {
+        float base = atomic_load(&g_base_freq[i]);
+        if (base <= 1.0f) {
+            float cur = 0;
+            if (g_ch_get_frequency(chs[i], &cur) == 0 && cur > 1.0f) {
+                // 第一次：当前频率就是上次设置后的值。如果之前没改过，cur 就是 base。
+                // 为了简单起见：第一次见到 channel 时，cur 视为 base（要求第一次调用前 rate 必须 = 1.0）。
+                base = cur;
+                atomic_store(&g_base_freq[i], base);
+            } else {
+                continue;
+            }
+        }
+        float target = base * rate;
+        g_ch_set_frequency(chs[i], target);
+    }
+}
+
 static void player_seek_ms(uint32_t ms) {
     void *self = get_player_or_resolve();
     if (!self) return;
     typedef void (*seek_fn)(void *, uint32_t, int);
     seek_fn fn = (seek_fn)_player_vt_slot(self, 0x40); // slot 8 = seekTo(this, ms, channel)
     if (fn) fn(self, ms, 0);
+    // seek 后重新应用倍率（FMOD seek 可能重置 channel 频率）
+    apply_speed_to_all_channels();
 }
 
 static void player_set_paused(BOOL paused) {
@@ -652,6 +716,7 @@ static void initHook(void) {
     NSInteger i = b.tag - 1000;
     if (i < 0 || i >= rate_count) return;
     rate_i = i;
+    apply_speed_to_all_channels();
     if (toast) {
         [WHToast showMessage:[NSString stringWithFormat:@"%.3fx", rates[rate_i]]
                                duration:0.5 finishHandler:^{}];
@@ -717,6 +782,7 @@ static void initButton(void) {
         // 单击：切换倍率（低频动作）
         if (rate_count <= 0) return;
         rate_i = (rate_i + 1) % rate_count;
+        apply_speed_to_all_channels();
         if (toast) {
             [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (tap2x=menu)", rates[rate_i]]
                                    duration:0.5 finishHandler:^{}];
@@ -802,6 +868,12 @@ static void doBootstrap(void) {
         acc_flog(@"doBootstrap begin");
         @try { initButton(); }       @catch (NSException *e) { acc_flog(@"initButton EX: %@", e); }
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
+        // 后台轮询：不断给 channel 应用当前倍率（安全：setFrequency 是 FMOD 公开 API，不写 text）
+        // 第一次进歌曲时会自动捕获 base_freq；之后每次倍率切换由 UI 触发，但 seek/重启歌曲会重置
+        // FMOD 频率，所以这里也要兜底重新 apply。
+        [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
+            apply_speed_to_all_channels();
+        }];
         acc_flog(@"doBootstrap done");
     });
 }
