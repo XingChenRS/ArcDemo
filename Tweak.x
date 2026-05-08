@@ -229,10 +229,19 @@ typedef uint64_t (*orig_mach_abs_t)(void);
 typedef int      (*orig_gettod_t)(struct timeval *tv, void *tz);
 typedef int      (*orig_clock_gettime_t)(clockid_t clk, struct timespec *tp);
 typedef uint64_t (*orig_clock_gettime_nsec_np_t)(clockid_t clk);
-static orig_mach_abs_t          s_orig_mach_abs = NULL;
-static orig_gettod_t            s_orig_gettod   = NULL;
-static orig_clock_gettime_t     s_orig_clock_gettime = NULL;
+typedef uint64_t (*orig_mach_cont_t)(void);
+typedef uint64_t (*orig_mach_appx_t)(void);
+typedef double   (*orig_ca_cmt_t)(void);
+typedef double   (*orig_cf_abs_t)(void);
+static orig_mach_abs_t              s_orig_mach_abs = NULL;
+static orig_gettod_t                s_orig_gettod   = NULL;
+static orig_clock_gettime_t         s_orig_clock_gettime = NULL;
 static orig_clock_gettime_nsec_np_t s_orig_clock_gettime_nsec_np = NULL;
+static orig_mach_cont_t             s_orig_mach_cont = NULL;
+static orig_mach_appx_t             s_orig_mach_appx = NULL;
+static orig_mach_cont_t             s_orig_mach_cont_appx = NULL;
+static orig_ca_cmt_t                s_orig_ca_cmt = NULL;
+static orig_cf_abs_t                s_orig_cf_abs = NULL;
 
 static _Atomic(uint64_t) g_tw_t0_real_mach = 0;  // 切换瞬间的真实 mach
 static _Atomic(uint64_t) g_tw_t0_warp_mach = 0;  // 切换瞬间的 warp mach
@@ -251,6 +260,30 @@ static _Atomic(uint64_t) g_tw_mach_calls = 0;
 static _Atomic(uint64_t) g_tw_gtod_calls = 0;
 static _Atomic(uint64_t) g_tw_cgt_calls  = 0;
 static _Atomic(uint64_t) g_tw_cgt_nsec_calls = 0;
+static _Atomic(uint64_t) g_tw_mach_cont_calls = 0;
+static _Atomic(uint64_t) g_tw_mach_appx_calls = 0;
+static _Atomic(uint64_t) g_tw_mach_cont_appx_calls = 0;
+static _Atomic(uint64_t) g_tw_ca_cmt_calls = 0;
+static _Atomic(uint64_t) g_tw_cf_abs_calls = 0;
+
+// 每个时钟通道独立开关：1=warp（按 rate 加速）, 0=passthrough（仅计数，返回原值）
+// 默认状态：mach_abs + gettimeofday 已被验证能影响 BGM/动画 → 默认 ON
+//          其余的为新增候选，默认 ON 让用户先看综合效果，找到能影响谱面的那个后再单独留它开
+static _Atomic(int) g_tw_en_mach          = 1;
+static _Atomic(int) g_tw_en_gtod          = 1;
+static _Atomic(int) g_tw_en_cgt           = 1;
+static _Atomic(int) g_tw_en_cgt_nsec      = 0; // 默认 OFF：会影响 FMOD profiler，先别碰
+static _Atomic(int) g_tw_en_mach_cont     = 1;
+static _Atomic(int) g_tw_en_mach_appx     = 1;
+static _Atomic(int) g_tw_en_mach_cont_appx= 1;
+static _Atomic(int) g_tw_en_ca_cmt        = 1;
+static _Atomic(int) g_tw_en_cf_abs        = 1;
+
+// mach_timebase: 用于把 CACurrentMediaTime (秒) 转 mach 滴答以共享 _compute_warp_mach 锚
+static mach_timebase_info_data_t s_tb_info = {0, 0};
+static inline void ensure_timebase(void) {
+    if (s_tb_info.denom == 0) mach_timebase_info(&s_tb_info);
+}
 
 static inline double tw_get_rate(void) {
     return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
@@ -277,6 +310,7 @@ static uint64_t _compute_warp_us(uint64_t real_us) {
 static uint64_t tw_mach_absolute_time(void) {
     uint64_t real = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
     atomic_fetch_add(&g_tw_mach_calls, 1);
+    if (!atomic_load(&g_tw_en_mach)) return real;
     if (atomic_load(&g_tw_freeze_count) > 0) {
         uint64_t f = atomic_load(&g_tw_frozen_mach);
         return f ? f : real;
@@ -289,6 +323,7 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
     int r = s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
     atomic_fetch_add(&g_tw_gtod_calls, 1);
     if (r != 0) return r;
+    if (!atomic_load(&g_tw_en_gtod)) return r;
     uint64_t real_us = (uint64_t)tv->tv_sec * 1000000ULL + (uint64_t)tv->tv_usec;
     uint64_t warp_us;
     if (atomic_load(&g_tw_freeze_count) > 0) {
@@ -308,6 +343,7 @@ static int tw_clock_gettime(clockid_t clk, struct timespec *tp) {
     int r = s_orig_clock_gettime ? s_orig_clock_gettime(clk, tp) : clock_gettime(clk, tp);
     atomic_fetch_add(&g_tw_cgt_calls, 1);
     if (r != 0 || !tp) return r;
+    if (!atomic_load(&g_tw_en_cgt)) return r;
     // 只 warp 单调时钟（CLOCK_MONOTONIC=6, CLOCK_UPTIME_RAW=8）；CLOCK_REALTIME(0) 不动
     if (clk != 6 && clk != 8 && clk != 4) return r;
     uint64_t real_ns = (uint64_t)tp->tv_sec * 1000000000ULL + (uint64_t)tp->tv_nsec;
@@ -326,12 +362,13 @@ static int tw_clock_gettime(clockid_t clk, struct timespec *tp) {
     return r;
 }
 
-// clock_gettime_nsec_np → 直接返回纳秒，FMOD profiler / 部分 cocos 用这个
+// clock_gettime_nsec_np → 直接返回纳秒，FMOD profiler 用，默认不 warp
 static uint64_t tw_clock_gettime_nsec_np(clockid_t clk) {
     uint64_t real_ns = s_orig_clock_gettime_nsec_np ? s_orig_clock_gettime_nsec_np(clk) : 0;
     atomic_fetch_add(&g_tw_cgt_nsec_calls, 1);
     if (real_ns == 0) return real_ns;
-    if (clk != 8 && clk != 6 && clk != 4) return real_ns; // 同上，只 warp 单调
+    if (!atomic_load(&g_tw_en_cgt_nsec)) return real_ns;
+    if (clk != 8 && clk != 6 && clk != 4) return real_ns;
     uint64_t real_us = real_ns / 1000ULL;
     uint64_t warp_us;
     if (atomic_load(&g_tw_freeze_count) > 0) {
@@ -342,6 +379,84 @@ static uint64_t tw_clock_gettime_nsec_np(clockid_t clk) {
     }
     if (warp_us == real_us) return real_ns;
     return warp_us * 1000ULL + (real_ns % 1000ULL);
+}
+
+// mach_continuous_time: 含睡眠的单调时钟。音游可能用它当主时钟。
+static uint64_t tw_mach_continuous_time(void) {
+    uint64_t real = s_orig_mach_cont ? s_orig_mach_cont() : 0;
+    atomic_fetch_add(&g_tw_mach_cont_calls, 1);
+    if (!atomic_load(&g_tw_en_mach_cont)) return real;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_mach);
+        return f ? f : real;
+    }
+    return _compute_warp_mach(real); // 共用 mach 锚（前台时与 mach_absolute_time 几乎相等）
+}
+
+// mach_approximate_time: mach_absolute_time 的低分辨率快速版（约 1ms 精度）
+static uint64_t tw_mach_approximate_time(void) {
+    uint64_t real = s_orig_mach_appx ? s_orig_mach_appx() : 0;
+    atomic_fetch_add(&g_tw_mach_appx_calls, 1);
+    if (!atomic_load(&g_tw_en_mach_appx)) return real;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_mach);
+        return f ? f : real;
+    }
+    return _compute_warp_mach(real);
+}
+
+static uint64_t tw_mach_continuous_approximate_time(void) {
+    uint64_t real = s_orig_mach_cont_appx ? s_orig_mach_cont_appx() : 0;
+    atomic_fetch_add(&g_tw_mach_cont_appx_calls, 1);
+    if (!atomic_load(&g_tw_en_mach_cont_appx)) return real;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_mach);
+        return f ? f : real;
+    }
+    return _compute_warp_mach(real);
+}
+
+// CACurrentMediaTime: QuartzCore 的 mach_absolute_time 包装，返回秒（double）
+// 与 mach_absolute_time 共享 mach 锚 → toggle 切换瞬间无跳变（两者锚同步推进）
+static double tw_CACurrentMediaTime(void) {
+    if (!s_orig_ca_cmt) return 0.0;
+    double real = s_orig_ca_cmt();
+    atomic_fetch_add(&g_tw_ca_cmt_calls, 1);
+    if (!atomic_load(&g_tw_en_ca_cmt)) return real;
+    ensure_timebase();
+    if (s_tb_info.denom == 0) return real;
+    uint64_t real_ns   = (uint64_t)(real * 1e9);
+    uint64_t real_mach = real_ns * (uint64_t)s_tb_info.denom / (uint64_t)s_tb_info.numer;
+    uint64_t warp_mach;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_mach);
+        warp_mach = f ? f : real_mach;
+    } else {
+        warp_mach = _compute_warp_mach(real_mach);
+    }
+    if (warp_mach == real_mach) return real;
+    uint64_t warp_ns = warp_mach * (uint64_t)s_tb_info.numer / (uint64_t)s_tb_info.denom;
+    return (double)warp_ns / 1e9;
+}
+
+// CFAbsoluteTimeGetCurrent: CoreFoundation 的 wall-time 秒数（自 2001-01-01）
+// 与 gettimeofday 共享 us 锚
+static double tw_CFAbsoluteTimeGetCurrent(void) {
+    if (!s_orig_cf_abs) return 0.0;
+    double real = s_orig_cf_abs();
+    atomic_fetch_add(&g_tw_cf_abs_calls, 1);
+    if (!atomic_load(&g_tw_en_cf_abs)) return real;
+    // CFAbsoluteTime 是 double 秒，转 us 共用锚
+    uint64_t real_us = (uint64_t)(real * 1e6);
+    uint64_t warp_us;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        warp_us = f ? f : real_us;
+    } else {
+        warp_us = _compute_warp_us(real_us);
+    }
+    if (warp_us == real_us) return real;
+    return (double)warp_us / 1e6;
 }
 
 // 增加冻结计数（用户暂停 / 切后台 / seek 期间皆可调用）
@@ -411,16 +526,26 @@ static void time_warp_set_rate(double rate) {
 static void time_warp_install(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        struct rebinding rs[4] = {
-            { "mach_absolute_time",     (void *)tw_mach_absolute_time,     (void **)&s_orig_mach_abs },
-            { "gettimeofday",           (void *)tw_gettimeofday,           (void **)&s_orig_gettod   },
-            { "clock_gettime",          (void *)tw_clock_gettime,          (void **)&s_orig_clock_gettime },
-            { "clock_gettime_nsec_np",  (void *)tw_clock_gettime_nsec_np,  (void **)&s_orig_clock_gettime_nsec_np },
+        struct rebinding rs[9] = {
+            { "mach_absolute_time",                (void *)tw_mach_absolute_time,                (void **)&s_orig_mach_abs },
+            { "gettimeofday",                      (void *)tw_gettimeofday,                      (void **)&s_orig_gettod   },
+            { "clock_gettime",                     (void *)tw_clock_gettime,                     (void **)&s_orig_clock_gettime },
+            { "clock_gettime_nsec_np",             (void *)tw_clock_gettime_nsec_np,             (void **)&s_orig_clock_gettime_nsec_np },
+            { "mach_continuous_time",              (void *)tw_mach_continuous_time,              (void **)&s_orig_mach_cont },
+            { "mach_approximate_time",             (void *)tw_mach_approximate_time,             (void **)&s_orig_mach_appx },
+            { "mach_continuous_approximate_time",  (void *)tw_mach_continuous_approximate_time,  (void **)&s_orig_mach_cont_appx },
+            { "CACurrentMediaTime",                (void *)tw_CACurrentMediaTime,                (void **)&s_orig_ca_cmt },
+            { "CFAbsoluteTimeGetCurrent",          (void *)tw_CFAbsoluteTimeGetCurrent,          (void **)&s_orig_cf_abs },
         };
-        int r = rebind_symbols(rs, 4);
-        acc_flog(@"fishhook rebind_symbols ret=%d mach=%p gtod=%p cgt=%p cgt_nsec=%p",
-                 r, (void *)s_orig_mach_abs, (void *)s_orig_gettod,
-                 (void *)s_orig_clock_gettime, (void *)s_orig_clock_gettime_nsec_np);
+        int r = rebind_symbols(rs, 9);
+        ensure_timebase();
+        acc_flog(@"fishhook ret=%d mach=%p gtod=%p cgt=%p cgt_ns=%p mcont=%p mappx=%p mcappx=%p ca_cmt=%p cf_abs=%p tb=%u/%u",
+                 r,
+                 (void *)s_orig_mach_abs, (void *)s_orig_gettod,
+                 (void *)s_orig_clock_gettime, (void *)s_orig_clock_gettime_nsec_np,
+                 (void *)s_orig_mach_cont, (void *)s_orig_mach_appx,
+                 (void *)s_orig_mach_cont_appx, (void *)s_orig_ca_cmt, (void *)s_orig_cf_abs,
+                 s_tb_info.numer, s_tb_info.denom);
     });
 }
 
@@ -725,6 +850,53 @@ static void loadPref(void) {
     [card addSubview:toastSw];
     y += MAX(28, swSize.height) + 8;
 
+    // ---- 时钟通道开关（实验：找出谱面用哪个时钟）----
+    UILabel *clkHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
+    clkHdr.text = @"时钟通道（开=按 rate 加速；游戏内逐个切换可定位谱面用哪个）";
+    clkHdr.font = [UIFont systemFontOfSize:11];
+    clkHdr.textColor = [UIColor darkGrayColor];
+    clkHdr.numberOfLines = 0;
+    [card addSubview:clkHdr];
+    y += 36;
+
+    // 列表：name, enable_ptr, counter_ptr
+    struct { const char *label; _Atomic(int) *en; _Atomic(uint64_t) *cnt; } clocks[] = {
+        { "mach_absolute_time",                &g_tw_en_mach,           &g_tw_mach_calls          },
+        { "gettimeofday",                      &g_tw_en_gtod,           &g_tw_gtod_calls          },
+        { "clock_gettime",                     &g_tw_en_cgt,            &g_tw_cgt_calls           },
+        { "clock_gettime_nsec_np",             &g_tw_en_cgt_nsec,       &g_tw_cgt_nsec_calls      },
+        { "mach_continuous_time",              &g_tw_en_mach_cont,      &g_tw_mach_cont_calls     },
+        { "mach_approximate_time",             &g_tw_en_mach_appx,      &g_tw_mach_appx_calls     },
+        { "mach_continuous_approximate_time",  &g_tw_en_mach_cont_appx, &g_tw_mach_cont_appx_calls},
+        { "CACurrentMediaTime",                &g_tw_en_ca_cmt,         &g_tw_ca_cmt_calls        },
+        { "CFAbsoluteTimeGetCurrent",          &g_tw_en_cf_abs,         &g_tw_cf_abs_calls        },
+    };
+    int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
+    for (int i = 0; i < nClocks; i++) {
+        UILabel *nameLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 20)];
+        nameLbl.text = [NSString stringWithFormat:@"%s", clocks[i].label];
+        nameLbl.font = [UIFont systemFontOfSize:12];
+        nameLbl.textColor = [UIColor blackColor];
+        [card addSubview:nameLbl];
+
+        UILabel *cntLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 18, innerW - 60, 14)];
+        cntLbl.text = [NSString stringWithFormat:@"%llu calls", (unsigned long long)atomic_load(clocks[i].cnt)];
+        cntLbl.font = [UIFont systemFontOfSize:10];
+        cntLbl.textColor = [UIColor grayColor];
+        cntLbl.tag = 3000 + i; // 给 progressTick 用，后续可刷新
+        [card addSubview:cntLbl];
+
+        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
+        CGSize sz = sw.bounds.size;
+        sw.frame = CGRectMake(W - 12 - sz.width, y + 4, sz.width, sz.height);
+        sw.on = atomic_load(clocks[i].en) ? YES : NO;
+        sw.tag = 3100 + i;
+        [sw addTarget:self action:@selector(clockToggleChanged:) forControlEvents:UIControlEventValueChanged];
+        [card addSubview:sw];
+
+        y += MAX(36, sz.height) + 4;
+    }
+
     // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
     speedHdr.text = @"倍率列表（点击选中，长按删除）";
@@ -817,6 +989,20 @@ static void loadPref(void) {
     if (self.pauseSwitch && !self.pauseSwitch.enabled && get_player_or_resolve()) {
         self.pauseSwitch.enabled = YES;
     }
+    // 刷新时钟通道计数 label
+    _Atomic(uint64_t) *cnts[] = {
+        &g_tw_mach_calls, &g_tw_gtod_calls, &g_tw_cgt_calls, &g_tw_cgt_nsec_calls,
+        &g_tw_mach_cont_calls, &g_tw_mach_appx_calls, &g_tw_mach_cont_appx_calls,
+        &g_tw_ca_cmt_calls, &g_tw_cf_abs_calls,
+    };
+    int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
+    for (int i = 0; i < n; i++) {
+        UIView *v = [menuView viewWithTag:(3000 + i)];
+        if ([v isKindOfClass:[UILabel class]]) {
+            ((UILabel *)v).text = [NSString stringWithFormat:@"%llu calls",
+                                   (unsigned long long)atomic_load(cnts[i])];
+        }
+    }
 }
 
 - (void)toastChanged:(UISwitch *)s {
@@ -824,6 +1010,28 @@ static void loadPref(void) {
     p[@"toast"] = @(s.on);
     savePrefDict(p);
     loadPref();
+}
+
+- (void)clockToggleChanged:(UISwitch *)sw {
+    int idx = (int)(sw.tag - 3100);
+    _Atomic(int) *flags[] = {
+        &g_tw_en_mach, &g_tw_en_gtod, &g_tw_en_cgt, &g_tw_en_cgt_nsec,
+        &g_tw_en_mach_cont, &g_tw_en_mach_appx, &g_tw_en_mach_cont_appx,
+        &g_tw_en_ca_cmt, &g_tw_en_cf_abs,
+    };
+    const char *names[] = {
+        "mach_abs", "gtod", "cgt", "cgt_nsec",
+        "mach_cont", "mach_appx", "mach_cont_appx",
+        "ca_cmt", "cf_abs",
+    };
+    int n = (int)(sizeof(flags) / sizeof(flags[0]));
+    if (idx < 0 || idx >= n) return;
+    atomic_store(flags[idx], sw.on ? 1 : 0);
+    acc_flog(@"clock toggle: %s = %d", names[idx], sw.on ? 1 : 0);
+    if (toast) {
+        [WHToast showMessage:[NSString stringWithFormat:@"%s %@", names[idx], sw.on ? @"ON" : @"OFF"]
+                    duration:0.4 finishHandler:^{}];
+    }
 }
 
 - (void)rowTapped:(UIButton *)b {
