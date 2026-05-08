@@ -1,18 +1,12 @@
-name: Build AccDemoArcaea Tweak
+name: Build AccDemoArcaea Dylib
 
 on:
   push:
-    paths:
-      - '**'
-      - '.github/workflows/build-tweak.yml'
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-    defaults:
-      run:
-        working-directory: .
     env:
       THEOS: ${{ github.workspace }}/theos
 
@@ -24,7 +18,7 @@ jobs:
 
       - name: Install build deps
         run: |
-          brew install ldid dpkg make xz coreutils
+          brew install ldid xz coreutils
         shell: bash
 
       - name: Clone Theos
@@ -41,7 +35,7 @@ jobs:
           ls -la "$THEOS/sdks/"
         shell: bash
 
-      - name: Build Dobby (iOS arm64 + arm64e, lipo)
+      - name: Build Dobby (static, iOS arm64 + arm64e, lipo)
         run: |
           cd "${{ github.workspace }}"
           git clone --depth 1 https://github.com/jmpews/Dobby.git dobby-src
@@ -56,11 +50,12 @@ jobs:
               -DCMAKE_SYSTEM_NAME=Darwin \
               -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
               -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+              -DBUILD_SHARED_LIBS=OFF \
               -DDOBBY_BUILD_EXAMPLE=OFF \
-              -DDOBBY_BUILD_TEST=OFF \
-              -DDOBBY_GENERATE_SHARED=OFF
+              -DDOBBY_BUILD_TEST=OFF
             make -j$(sysctl -n hw.ncpu) dobby
             popd > /dev/null
+            ls -la "dobby-src/build-$ARCH" | grep -i dobby || true
           done
           mkdir -p libs
           lipo -create \
@@ -68,19 +63,24 @@ jobs:
             dobby-src/build-arm64e/libdobby.a \
             -output libs/libdobby.a
           lipo -info libs/libdobby.a
-          ls -la libs/
         shell: bash
 
-      - name: Build (.deb package)
+      - name: Build dylib (theos LIBRARY)
         run: |
           cd "${{ github.workspace }}"
           make clean
-          make package FINALPACKAGE=1
+          make
+          find .theos -name '*.dylib' -ls
+          mkdir -p out
+          cp .theos/obj/libAccDemoArcaea.dylib out/
+          ldid -S out/libAccDemoArcaea.dylib
+          file out/libAccDemoArcaea.dylib
+          lipo -info out/libAccDemoArcaea.dylib
         shell: bash
 
-      - name: Upload artifact
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: AccDemoArcaea-deb
-          path: packages/*.deb
+          name: libAccDemoArcaea-dylib
+          path: out/libAccDemoArcaea.dylib
           if-no-files-found: error
