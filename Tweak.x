@@ -746,7 +746,13 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                           CFStringRef name, const void *object,
                           CFDictionaryRef userInfo) {
     initButton();
-    initHook();
+    // 暂时禁用 gettimeofday/clock_gettime 全局 hook：
+    //   1) iOS16 arm64e PAC 严格校验，patch libsystem_c 函数会让 Crashlytics
+    //      等早期线程跨进未签名 trampoline 时触发 Permission fault (Instruction Abort)
+    //   2) 全局时间偏移会导致谱面/音乐/判定/网络心跳全部错位，与用户「不希望
+    //      时间轴错位」需求冲突。变速 / seek / pause 通过 player+channel 精确
+    //      hook 实现（getPositionMs / setFrequency / seekTo / setPaused）。
+    // initHook();
     install_arc_hooks();
 }
 
