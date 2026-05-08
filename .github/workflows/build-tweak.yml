@@ -25,7 +25,6 @@ jobs:
       - name: Install build deps
         run: |
           brew install ldid dpkg make xz coreutils
-          # ldid 是 fakecodesign 用; dpkg 用于打 .deb
         shell: bash
 
       - name: Clone Theos
@@ -33,37 +32,43 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git "$THEOS"
         shell: bash
 
-      - name: Download iOS SDK 14.5 (NEU 私镜像 / theos sdks)
+      - name: Download iOS SDK 14.5
         run: |
-          # 用 theos 维护的 SDK 镜像
           mkdir -p "$THEOS/sdks"
           curl -L -o /tmp/sdks.tar.gz https://github.com/theos/sdks/archive/master.tar.gz
           tar -xzf /tmp/sdks.tar.gz -C /tmp
-          # 只拷我们需要的 iPhoneOS14.5.sdk（足够覆盖 ARCHS=arm64 arm64e、min iOS 14）
           mv /tmp/sdks-master/iPhoneOS14.5.sdk "$THEOS/sdks/" || true
           ls -la "$THEOS/sdks/"
         shell: bash
 
-      - name: Build Dobby (iOS arm64 + arm64e)
+      - name: Build Dobby (iOS arm64 + arm64e, lipo)
         run: |
           cd "${{ github.workspace }}"
           git clone --depth 1 https://github.com/jmpews/Dobby.git dobby-src
-          cd dobby-src
-          mkdir build && cd build
-          # iOS toolchain：用系统 clang + iPhoneOS SDK
           IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e" \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DCMAKE_SYSTEM_NAME=Darwin \
-            -DDOBBY_BUILD_EXAMPLE=OFF \
-            -DDOBBY_BUILD_TEST=OFF
-          make -j$(sysctl -n hw.ncpu) dobby
-          # 拷到 tweak 的 libs/
-          cp libdobby.a "${{ github.workspace }}/libs/libdobby.a"
-          ls -la "${{ github.workspace }}/libs/"
+          for ARCH in arm64 arm64e; do
+            mkdir -p "dobby-src/build-$ARCH"
+            pushd "dobby-src/build-$ARCH" > /dev/null
+            cmake .. \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
+              -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
+              -DCMAKE_SYSTEM_NAME=Darwin \
+              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+              -DDOBBY_BUILD_EXAMPLE=OFF \
+              -DDOBBY_BUILD_TEST=OFF \
+              -DDOBBY_GENERATE_SHARED=OFF
+            make -j$(sysctl -n hw.ncpu) dobby
+            popd > /dev/null
+          done
+          mkdir -p libs
+          lipo -create \
+            dobby-src/build-arm64/libdobby.a \
+            dobby-src/build-arm64e/libdobby.a \
+            -output libs/libdobby.a
+          lipo -info libs/libdobby.a
+          ls -la libs/
         shell: bash
 
       - name: Build (.deb package)
