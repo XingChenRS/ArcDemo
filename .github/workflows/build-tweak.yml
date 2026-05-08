@@ -112,15 +112,14 @@ jobs:
             IPHONEOS_DEPLOYMENT_TARGET=14.0 \
             build SYMROOT=$PWD/build 2>&1 | tail -40
           set -e
-          # 找 framework 内的二进制（dylib）
-          find build -name 'ellekit*' -type f
-          DYLIB=$(find build -path '*ellekit.framework/ellekit' | head -n1)
+          # 找编出的 dylib（xcodebuild 输出 build/Release-iphoneos/libellekit.dylib）
+          DYLIB=$(find build -name 'libellekit.dylib' -not -path '*.dSYM*' | head -n1)
           if [ -z "$DYLIB" ]; then
-            DYLIB=$(find build -name 'ellekit' -type f | head -n1)
+            DYLIB=$(find build -path '*ellekit.framework/ellekit' | head -n1)
           fi
           if [ -z "$DYLIB" ]; then
             echo "ellekit binary not found"
-            find build
+            find build -type f | head -50
             exit 1
           fi
           cd "${{ github.workspace }}"
