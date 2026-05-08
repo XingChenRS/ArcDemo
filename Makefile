@@ -19,7 +19,8 @@ AccDemoArcaea_LIBRARIES = substrate
 AccDemoArcaea_LOGOSFLAGS = -c generator=MobileSubstrate
 
 # Dobby 静态库（C++）需要 libc++
-AccDemoArcaea_LDFLAGS  = -L./libs -ldobby -lc++
+# -not_for_dyld_shared_cache: sideload dylib 不进 shared cache，否则会拒绝链接 CydiaSubstrate
+AccDemoArcaea_LDFLAGS  = -L./libs -ldobby -lc++ -Xlinker -not_for_dyld_shared_cache
 
 ADDITIONAL_CFLAGS += -Wno-error=unused-variable -Wno-error=unused-function -include Prefix.pch
 

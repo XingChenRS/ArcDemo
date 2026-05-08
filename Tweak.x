@@ -198,11 +198,7 @@ static uint32_t player_get_position_ms_cached(void) {
     return atomic_load(&g_last_pos_ms);
 }
 
-static uint32_t player_get_max_seen_ms(void) {
-    return atomic_load(&g_max_seen_ms);
-}
-
-// 调用者需要的最大进度值：优先 FMOD 拿到的真实总长，其次是运行中看到过的最�?ms
+// 调用者需要的最大进度值：优先 FMOD 拿到的真实总长，其次是运行中看到过的最大 ms
 static uint32_t player_get_progress_max_ms(void) {
     uint32_t len = atomic_load(&g_song_length_ms);
     if (len > 0) return len;
