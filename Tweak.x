@@ -24,31 +24,17 @@ extern UIApplication *UIApp;
 // forward decl: 文件末尾定义，但中部诊断需要用
 static void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
-typedef NS_ENUM(NSInteger, AccMode) {
-    kModeClockGetTime = 0,   // Arcaea 默认（cocos2d-x 时基�?
-    kModeGetTimeOfDay = 1,   // 备用
-};
-
 #pragma mark - global
 
 static float    *rates = NULL;
 static NSInteger rate_i = 0;
 static NSInteger rate_count = 0;
 
-static AccMode  mode = kModeClockGetTime;
 static BOOL     buttonEnabled = YES;
 static BOOL     toast = YES;
 
-// 时基注入状�?
-static time_t       pre_sec, true_pre_sec;
-static suseconds_t  pre_usec, true_pre_usec;
-
 static WQSuspendView *button = nil;
 static UIView        *menuView = nil;
-
-#define USec_Scale (1000000LL)
-#define NSec_Scale (1000000000LL)
-
 #pragma mark - Arcaea binary hook (Dobby)
 //
 // 已知偏移（来�?IDA 6.13.10 分析）：
@@ -86,7 +72,6 @@ typedef int      (*get_sound_length_fn)(void *sound, uint32_t *outLen, int unit)
 typedef int      (*ch_get_position_fn)(void *channel, uint32_t *out_ms, int unit);
 typedef int      (*ch_set_frequency_fn)(void *channel, float hz);
 typedef int      (*ch_get_frequency_fn)(void *channel, float *out_hz);
-static get_position_ms_fn   orig_get_position_ms = NULL;
 static get_registry_fn      g_get_registry = NULL;
 static get_current_sound_fn g_get_current_sound = NULL;
 static get_sound_length_fn  g_get_sound_length = NULL;
@@ -119,19 +104,7 @@ static void try_capture_song_length(void *player) {
     }
 }
 
-static uint32_t hooked_get_position_ms(void *self, int channel) {
-    uint32_t ret = orig_get_position_ms(self, channel);
-    if (channel == 0) {
-        atomic_store(&g_bgmPlayer, self);
-        atomic_store(&g_last_pos_ms, ret);
-        uint32_t prev = atomic_load(&g_max_seen_ms);
-        if (ret > prev) atomic_store(&g_max_seen_ms, ret);
-        try_capture_song_length(self);
-    }
-    return ret;
-}
-
-// 主动通过 registry �?MTP（不需要等 hook 触发�?
+// 主动通过 registry 拿 MTP（不需要等 hook 触发）
 static void *resolve_player_via_registry(void) {
     if (!g_get_registry) return NULL;
     void *reg = g_get_registry();
@@ -178,9 +151,6 @@ static void install_arc_hooks(void) {
     // mprotect(rwx) 会破坏 amfi/CoreTrust 的 text page seal，
     // 其它线程跑该页时触发 EXC_BAD_ACCESS / Permission fault (Instruction Abort)。
     // 改为只读取函数指针，不修改函数实现。
-    orig_get_position_ms = (get_position_ms_fn)(base + ARC_OFF_GET_POSITION_MS);
-    NSLog(@"[AccDemoArcaea] getPositionMs (read-only) @ %p", (void *)orig_get_position_ms);
-
     g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
     g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
     g_get_sound_length  = (get_sound_length_fn) (base + ARC_OFF_GET_SOUND_LENGTH);
@@ -257,8 +227,12 @@ static void apply_speed_to_all_channels(void) {
 
 typedef uint64_t (*orig_mach_abs_t)(void);
 typedef int      (*orig_gettod_t)(struct timeval *tv, void *tz);
-static orig_mach_abs_t s_orig_mach_abs = NULL;
-static orig_gettod_t   s_orig_gettod   = NULL;
+typedef int      (*orig_clock_gettime_t)(clockid_t clk, struct timespec *tp);
+typedef uint64_t (*orig_clock_gettime_nsec_np_t)(clockid_t clk);
+static orig_mach_abs_t          s_orig_mach_abs = NULL;
+static orig_gettod_t            s_orig_gettod   = NULL;
+static orig_clock_gettime_t     s_orig_clock_gettime = NULL;
+static orig_clock_gettime_nsec_np_t s_orig_clock_gettime_nsec_np = NULL;
 
 static _Atomic(uint64_t) g_tw_t0_real_mach = 0;  // 切换瞬间的真实 mach
 static _Atomic(uint64_t) g_tw_t0_warp_mach = 0;  // 切换瞬间的 warp mach
@@ -266,78 +240,167 @@ static _Atomic(uint64_t) g_tw_t0_real_us   = 0;  // 切换瞬间的真实 micros
 static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;  // 切换瞬间的 warp microseconds
 static _Atomic(uint32_t) g_tw_rate_x1000   = 1000; // rate * 1000，整数避免原子 float 兼容性
 
+// 冻结机制：用户暂停 + 切后台 都会增加 freeze_count，归零才解冻。
+// 冻结时所有 tw_* 调用返回 frozen_*，不再随真实时间推进 → 防止 unpause/回前台时谱面飞过。
+static _Atomic(int32_t)  g_tw_freeze_count = 0;
+static _Atomic(uint64_t) g_tw_frozen_mach  = 0;
+static _Atomic(uint64_t) g_tw_frozen_us    = 0;
+
+// 诊断计数器：用于验证 fishhook 是否真的拦截到游戏代码路径
+static _Atomic(uint64_t) g_tw_mach_calls = 0;
+static _Atomic(uint64_t) g_tw_gtod_calls = 0;
+static _Atomic(uint64_t) g_tw_cgt_calls  = 0;
+static _Atomic(uint64_t) g_tw_cgt_nsec_calls = 0;
+
 static inline double tw_get_rate(void) {
     return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
 }
 
-static uint64_t tw_mach_absolute_time(void) {
-    uint64_t real = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
+// 仅根据 t0_*/rate 算 warp 时间（不考虑冻结，给 freeze 自己用）
+static uint64_t _compute_warp_mach(uint64_t real_mach) {
     double rate = tw_get_rate();
-    if (rate >= 0.999 && rate <= 1.001) return real;
     uint64_t t0r = atomic_load(&g_tw_t0_real_mach);
     uint64_t t0w = atomic_load(&g_tw_t0_warp_mach);
-    if (t0r == 0) return real;  // 还没初始化基准
-    if (real <= t0r) return t0w;
-    uint64_t delta = real - t0r;
-    uint64_t scaled = (uint64_t)((double)delta * rate);
-    return t0w + scaled;
+    if (t0r == 0 || (rate >= 0.999 && rate <= 1.001)) return real_mach;
+    if (real_mach <= t0r) return t0w;
+    return t0w + (uint64_t)((double)(real_mach - t0r) * rate);
+}
+static uint64_t _compute_warp_us(uint64_t real_us) {
+    double rate = tw_get_rate();
+    uint64_t t0r = atomic_load(&g_tw_t0_real_us);
+    uint64_t t0w = atomic_load(&g_tw_t0_warp_us);
+    if (t0r == 0 || (rate >= 0.999 && rate <= 1.001)) return real_us;
+    if (real_us <= t0r) return t0w;
+    return t0w + (uint64_t)((double)(real_us - t0r) * rate);
+}
+
+static uint64_t tw_mach_absolute_time(void) {
+    uint64_t real = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
+    atomic_fetch_add(&g_tw_mach_calls, 1);
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_mach);
+        return f ? f : real;
+    }
+    return _compute_warp_mach(real);
 }
 
 static int tw_gettimeofday(struct timeval *tv, void *tz) {
     if (!tv) return s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
     int r = s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
+    atomic_fetch_add(&g_tw_gtod_calls, 1);
     if (r != 0) return r;
-    double rate = tw_get_rate();
-    if (rate >= 0.999 && rate <= 1.001) return r;
     uint64_t real_us = (uint64_t)tv->tv_sec * 1000000ULL + (uint64_t)tv->tv_usec;
-    uint64_t t0r = atomic_load(&g_tw_t0_real_us);
-    uint64_t t0w = atomic_load(&g_tw_t0_warp_us);
-    if (t0r == 0) return r;
     uint64_t warp_us;
-    if (real_us <= t0r) warp_us = t0w;
-    else {
-        uint64_t delta = real_us - t0r;
-        warp_us = t0w + (uint64_t)((double)delta * rate);
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        warp_us = f ? f : real_us;
+    } else {
+        warp_us = _compute_warp_us(real_us);
     }
+    if (warp_us == real_us) return r; // 1.0x 直通
     tv->tv_sec  = (time_t)(warp_us / 1000000ULL);
     tv->tv_usec = (suseconds_t)(warp_us % 1000000ULL);
     return r;
 }
 
+// clock_gettime(CLOCK_MONOTONIC/UPTIME) → 纳秒级 timespec，cocos2d-x 新版可能用这个
+static int tw_clock_gettime(clockid_t clk, struct timespec *tp) {
+    int r = s_orig_clock_gettime ? s_orig_clock_gettime(clk, tp) : clock_gettime(clk, tp);
+    atomic_fetch_add(&g_tw_cgt_calls, 1);
+    if (r != 0 || !tp) return r;
+    // 只 warp 单调时钟（CLOCK_MONOTONIC=6, CLOCK_UPTIME_RAW=8）；CLOCK_REALTIME(0) 不动
+    if (clk != 6 && clk != 8 && clk != 4) return r;
+    uint64_t real_ns = (uint64_t)tp->tv_sec * 1000000000ULL + (uint64_t)tp->tv_nsec;
+    uint64_t real_us = real_ns / 1000ULL;
+    uint64_t warp_us;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        warp_us = f ? f : real_us;
+    } else {
+        warp_us = _compute_warp_us(real_us);
+    }
+    if (warp_us == real_us) return r;
+    uint64_t warp_ns = warp_us * 1000ULL + (real_ns % 1000ULL);
+    tp->tv_sec  = (time_t)(warp_ns / 1000000000ULL);
+    tp->tv_nsec = (long)(warp_ns % 1000000000ULL);
+    return r;
+}
+
+// clock_gettime_nsec_np → 直接返回纳秒，FMOD profiler / 部分 cocos 用这个
+static uint64_t tw_clock_gettime_nsec_np(clockid_t clk) {
+    uint64_t real_ns = s_orig_clock_gettime_nsec_np ? s_orig_clock_gettime_nsec_np(clk) : 0;
+    atomic_fetch_add(&g_tw_cgt_nsec_calls, 1);
+    if (real_ns == 0) return real_ns;
+    if (clk != 8 && clk != 6 && clk != 4) return real_ns; // 同上，只 warp 单调
+    uint64_t real_us = real_ns / 1000ULL;
+    uint64_t warp_us;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        warp_us = f ? f : real_us;
+    } else {
+        warp_us = _compute_warp_us(real_us);
+    }
+    if (warp_us == real_us) return real_ns;
+    return warp_us * 1000ULL + (real_ns % 1000ULL);
+}
+
+// 增加冻结计数（用户暂停 / 切后台 / seek 期间皆可调用）
+static void time_warp_freeze_inc(void) {
+    int32_t prev = atomic_fetch_add(&g_tw_freeze_count, 1);
+    if (prev == 0) {
+        // 第一次冻结：capture 当前 warp 时间作为冻结值
+        uint64_t real_mach = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
+        struct timeval tv = {0};
+        uint64_t real_us = 0;
+        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0) {
+            real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        } else if (gettimeofday(&tv, NULL) == 0) {
+            real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        }
+        atomic_store(&g_tw_frozen_mach, _compute_warp_mach(real_mach));
+        atomic_store(&g_tw_frozen_us,   _compute_warp_us(real_us));
+    }
+}
+
+static void time_warp_freeze_dec(void) {
+    int32_t prev = atomic_fetch_sub(&g_tw_freeze_count, 1);
+    if (prev <= 0) {
+        // 计数下溢，恢复 0
+        atomic_store(&g_tw_freeze_count, 0);
+        return;
+    }
+    if (prev == 1) {
+        // 完全解冻：rebase t0_*，让 warp 时间从冻结值无缝继续
+        uint64_t real_mach = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
+        struct timeval tv = {0};
+        uint64_t real_us = 0;
+        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0) {
+            real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        } else if (gettimeofday(&tv, NULL) == 0) {
+            real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        }
+        atomic_store(&g_tw_t0_real_mach, real_mach);
+        atomic_store(&g_tw_t0_warp_mach, atomic_load(&g_tw_frozen_mach) ? atomic_load(&g_tw_frozen_mach) : real_mach);
+        atomic_store(&g_tw_t0_real_us,   real_us);
+        atomic_store(&g_tw_t0_warp_us,   atomic_load(&g_tw_frozen_us)   ? atomic_load(&g_tw_frozen_us)   : real_us);
+    }
+}
+
 // 设置新倍率：先用「当前 warp 时间」做新基准 t0_warp，再把 t0_real 设为「当前真实时间」。
 // 这样 warp 时间在切换瞬间是连续的，不会跳变（避免谱面 note 突跳）。
+// 注意：冻结期间也允许换 rate，但只更新 rate，frozen_* 保持不变（unpause 后按新 rate 推进）。
 static void time_warp_set_rate(double rate) {
     if (rate <= 0.001) return;
-    // 1) 先算出当前 warp 时间（用旧 rate）
     uint64_t real_mach_now = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
-    struct timeval tv_now;
+    struct timeval tv_now = {0};
     int gtr = s_orig_gettod ? s_orig_gettod(&tv_now, NULL) : gettimeofday(&tv_now, NULL);
     uint64_t real_us_now = 0;
     if (gtr == 0) real_us_now = (uint64_t)tv_now.tv_sec * 1000000ULL + (uint64_t)tv_now.tv_usec;
 
-    double old_rate = tw_get_rate();
-    uint64_t t0r_m = atomic_load(&g_tw_t0_real_mach);
-    uint64_t t0w_m = atomic_load(&g_tw_t0_warp_mach);
-    uint64_t warp_mach_now;
-    if (t0r_m == 0 || (old_rate >= 0.999 && old_rate <= 1.001)) {
-        warp_mach_now = real_mach_now;
-    } else if (real_mach_now <= t0r_m) {
-        warp_mach_now = t0w_m;
-    } else {
-        warp_mach_now = t0w_m + (uint64_t)((double)(real_mach_now - t0r_m) * old_rate);
-    }
-    uint64_t t0r_u = atomic_load(&g_tw_t0_real_us);
-    uint64_t t0w_u = atomic_load(&g_tw_t0_warp_us);
-    uint64_t warp_us_now;
-    if (t0r_u == 0 || (old_rate >= 0.999 && old_rate <= 1.001)) {
-        warp_us_now = real_us_now;
-    } else if (real_us_now <= t0r_u) {
-        warp_us_now = t0w_u;
-    } else {
-        warp_us_now = t0w_u + (uint64_t)((double)(real_us_now - t0r_u) * old_rate);
-    }
+    // 先按旧 rate 算出当前 warp 时间作为新基准
+    uint64_t warp_mach_now = _compute_warp_mach(real_mach_now);
+    uint64_t warp_us_now   = _compute_warp_us(real_us_now);
 
-    // 2) 重置基准
     atomic_store(&g_tw_t0_real_mach, real_mach_now);
     atomic_store(&g_tw_t0_warp_mach, warp_mach_now);
     atomic_store(&g_tw_t0_real_us,   real_us_now);
@@ -348,13 +411,16 @@ static void time_warp_set_rate(double rate) {
 static void time_warp_install(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        struct rebinding rs[2] = {
-            { "mach_absolute_time", (void *)tw_mach_absolute_time, (void **)&s_orig_mach_abs },
-            { "gettimeofday",       (void *)tw_gettimeofday,       (void **)&s_orig_gettod   },
+        struct rebinding rs[4] = {
+            { "mach_absolute_time",     (void *)tw_mach_absolute_time,     (void **)&s_orig_mach_abs },
+            { "gettimeofday",           (void *)tw_gettimeofday,           (void **)&s_orig_gettod   },
+            { "clock_gettime",          (void *)tw_clock_gettime,          (void **)&s_orig_clock_gettime },
+            { "clock_gettime_nsec_np",  (void *)tw_clock_gettime_nsec_np,  (void **)&s_orig_clock_gettime_nsec_np },
         };
-        int r = rebind_symbols(rs, 2);
-        acc_flog(@"fishhook rebind_symbols ret=%d orig_mach=%p orig_gtod=%p",
-                 r, (void *)s_orig_mach_abs, (void *)s_orig_gettod);
+        int r = rebind_symbols(rs, 4);
+        acc_flog(@"fishhook rebind_symbols ret=%d mach=%p gtod=%p cgt=%p cgt_nsec=%p",
+                 r, (void *)s_orig_mach_abs, (void *)s_orig_gettod,
+                 (void *)s_orig_clock_gettime, (void *)s_orig_clock_gettime_nsec_np);
     });
 }
 
@@ -363,7 +429,11 @@ static void player_seek_ms(uint32_t ms) {
     if (!self) return;
     typedef void (*seek_fn)(void *, uint32_t, int);
     seek_fn fn = (seek_fn)_player_vt_slot(self, 0x40); // slot 8 = seekTo(this, ms, channel)
-    if (fn) fn(self, ms, 0);
+    if (!fn) return;
+    // seek 期间临时冻结 warp 时间，防止 game 在 vt[8] 内部读到 warp 时间产生中间态错位
+    time_warp_freeze_inc();
+    fn(self, ms, 0);
+    time_warp_freeze_dec();
     // seek 后重新应用倍率（FMOD seek 可能重置 channel 频率）
     apply_speed_to_all_channels();
 }
@@ -374,7 +444,16 @@ static void player_set_paused(BOOL paused) {
     // 修正：vtable[6] = setPaused(this, paused, channel)
     typedef void (*set_paused_fn)(void *, int, int);
     set_paused_fn fn = (set_paused_fn)_player_vt_slot(self, 0x30); // slot 6
-    if (fn) fn(self, paused ? 1 : 0, 0);
+    if (!fn) return;
+    if (paused) {
+        // 先冻结 warp 时间，再暂停 audio：保证 game 看到的时钟与 audio 同步停止
+        time_warp_freeze_inc();
+        fn(self, 1, 0);
+    } else {
+        // 先恢复 audio，再解冻 warp：unpause 瞬间 currentMs 从冻结值平滑继续，不会跳过任何 note
+        fn(self, 0, 0);
+        time_warp_freeze_dec();
+    }
 }
 
 static uint32_t player_get_position_ms_cached(void) {
@@ -401,7 +480,6 @@ static NSMutableDictionary *loadPrefDict(void) {
         p[@"speed-4"] = @1.25;
         p[@"speed-5"] = @1.50;
     }
-    if (!p[@"mode"])          p[@"mode"]          = @(kModeClockGetTime);
     if (!p[@"buttonEnabled"]) p[@"buttonEnabled"] = @YES;
     if (!p[@"toast"])         p[@"toast"]         = @YES;
     return p;
@@ -417,7 +495,6 @@ static void loadPref(void) {
     NSMutableDictionary *prefs = loadPrefDict();
     toast         = [prefs[@"toast"] boolValue];
     buttonEnabled = [prefs[@"buttonEnabled"] boolValue];
-    mode          = (AccMode)[prefs[@"mode"] intValue];
 
     NSArray *speedKeys = prefs[@"speedKeys"];
     rate_count = speedKeys.count;
@@ -428,74 +505,6 @@ static void loadPref(void) {
     if (rate_i >= rate_count) rate_i = 0;
 
     if (button) [button setHidden:!buttonEnabled];
-}
-
-#pragma mark - hook: gettimeofday
-
-%group gettimeofday
-%hookf(int, gettimeofday, struct timeval *tv, struct timezone *tz) {
-    int ret = %orig(tv, tz);
-    if (!ret) {
-        if (!pre_sec) {
-            pre_sec = tv->tv_sec; true_pre_sec = tv->tv_sec;
-            pre_usec = tv->tv_usec; true_pre_usec = tv->tv_usec;
-        } else {
-            int64_t cur = tv->tv_sec * USec_Scale + tv->tv_usec;
-            int64_t prv = true_pre_sec * USec_Scale + true_pre_usec;
-            int64_t invl = (int64_t)((cur - prv) * rates[rate_i]);
-            int64_t out = pre_sec * USec_Scale + pre_usec + invl;
-            true_pre_sec = tv->tv_sec; true_pre_usec = tv->tv_usec;
-            tv->tv_sec  = out / USec_Scale;
-            tv->tv_usec = out % USec_Scale;
-            pre_sec = tv->tv_sec; pre_usec = tv->tv_usec;
-        }
-    }
-    return ret;
-}
-%end
-
-static void hook_gettimeofday(void) {
-    void *libSystem = dlopen("/usr/lib/libSystem.dylib", RTLD_NOLOAD);
-    void *fn = dlsym(libSystem, "gettimeofday");
-    %init(gettimeofday, gettimeofday = fn);
-}
-
-#pragma mark - hook: clock_gettime
-
-%group clock_gettime
-%hookf(int, clock_gettime, clockid_t clk_id, struct timespec *tp) {
-    int ret = %orig(clk_id, tp);
-    if (!ret) {
-        if (!pre_sec) {
-            pre_sec = tp->tv_sec; true_pre_sec = tp->tv_sec;
-            pre_usec = tp->tv_nsec; true_pre_usec = tp->tv_nsec;
-        } else {
-            int64_t cur = tp->tv_sec * NSec_Scale + tp->tv_nsec;
-            int64_t prv = true_pre_sec * NSec_Scale + true_pre_usec;
-            int64_t invl = (int64_t)((cur - prv) * rates[rate_i]);
-            int64_t out = pre_sec * NSec_Scale + pre_usec + invl;
-            true_pre_sec = tp->tv_sec; true_pre_usec = tp->tv_nsec;
-            tp->tv_sec  = out / NSec_Scale;
-            tp->tv_nsec = out % NSec_Scale;
-            pre_sec = tp->tv_sec; pre_usec = tp->tv_nsec;
-        }
-    }
-    return ret;
-}
-%end
-
-static void hook_clock_gettime(void) {
-    void *libSystem = dlopen("/usr/lib/libSystem.dylib", RTLD_NOLOAD);
-    void *fn = dlsym(libSystem, "clock_gettime");
-    %init(clock_gettime, clock_gettime = fn);
-}
-
-static void initHook(void) {
-    switch (mode) {
-        case kModeGetTimeOfDay: hook_gettimeofday(); break;
-        case kModeClockGetTime:
-        default:                hook_clock_gettime(); break;
-    }
 }
 
 #pragma mark - UI overlay (NSBundle / UIWindow keep-on-top)
@@ -799,22 +808,15 @@ static void initHook(void) {
         if (!sl.enabled && get_player_or_resolve()) sl.enabled = YES;
     }
     if (lbl) {
-        lbl.text = [NSString stringWithFormat:@"%u.%03us / %u.%03us",
-                    cur / 1000u, cur % 1000u,
-                    maxMs / 1000u, maxMs % 1000u];
+        uint32_t cs = cur / 1000u, ms = cur % 1000u;
+        uint32_t ts = maxMs / 1000u;
+        lbl.text = [NSString stringWithFormat:@"%02u:%02u.%03u / %02u:%02u",
+                    cs / 60u, cs % 60u, ms,
+                    ts / 60u, ts % 60u];
     }
     if (self.pauseSwitch && !self.pauseSwitch.enabled && get_player_or_resolve()) {
         self.pauseSwitch.enabled = YES;
     }
-}
-
-- (void)modeChanged:(UISegmentedControl *)s {
-    NSMutableDictionary *p = loadPrefDict();
-    p[@"mode"] = @(s.selectedSegmentIndex);
-    savePrefDict(p);
-    loadPref();
-    // 注意：模�?hook 只在 ctor 安装一次，运行期切换需重启游戏
-    if (toast) [WHToast showMessage:@"Restart app for mode change" duration:1.5 finishHandler:^{}];
 }
 
 - (void)toastChanged:(UISwitch *)s {
@@ -990,10 +992,35 @@ static void doBootstrap(void) {
             apply_speed_to_all_channels();
             // 兜底捕获歌曲总时长（之前依赖 getPositionMs hook，现已删除）
             void *p = get_player_or_resolve();
+            // 切歌检测：player 指针没变但 channels 数组首地址变了 → 新一轮，清空缓存
+            static void *s_last_player = NULL;
+            static void *s_last_channels = NULL;
+            static uint64_t s_diag_tick = 0;
+            void *channels_base_chk = p ? *(void **)((char *)p + ARC_PLAYER_CHANNELS_OFFSET) : NULL;
+            if (p != s_last_player || channels_base_chk != s_last_channels) {
+                // 新歌：清 base_freq 缓存 + 清歌曲长度，重新捕获
+                for (int i = 0; i < ARC_MAX_CHANNELS; i++) atomic_store(&g_base_freq[i], 0);
+                atomic_store(&g_song_length_ms, 0);
+                atomic_store(&g_max_seen_ms, 0);
+                atomic_store(&g_last_pos_ms, 0);
+                s_last_player = p;
+                s_last_channels = channels_base_chk;
+                acc_flog(@"new song detected: player=%p channels=%p", p, channels_base_chk);
+            }
+            // 每 5 秒（每 10 个 tick）打印一次诊断计数 → 可看出 fishhook 是否被实际调用
+            if ((s_diag_tick++ % 10) == 0) {
+                acc_flog(@"twcalls mach=%llu gtod=%llu cgt=%llu cgt_ns=%llu rate=%.3f freeze=%d",
+                         (unsigned long long)atomic_load(&g_tw_mach_calls),
+                         (unsigned long long)atomic_load(&g_tw_gtod_calls),
+                         (unsigned long long)atomic_load(&g_tw_cgt_calls),
+                         (unsigned long long)atomic_load(&g_tw_cgt_nsec_calls),
+                         tw_get_rate(),
+                         atomic_load(&g_tw_freeze_count));
+            }
             if (p) try_capture_song_length(p);
             // 兜底维护 last_pos_ms / max_seen_ms（用于进度条显示）
             if (p && g_ch_get_position) {
-                void *channels_base = *(void **)((char *)p + ARC_PLAYER_CHANNELS_OFFSET);
+                void *channels_base = channels_base_chk;
                 if (channels_base) {
                     void *ch0 = *(void **)((char *)channels_base + ARC_CHANNEL_ENTRY_PTR_OFF);
                     uint32_t pos = 0;
@@ -1007,6 +1034,21 @@ static void doBootstrap(void) {
         }];
         acc_flog(@"doBootstrap done");
     });
+}
+
+static void onAppDidEnterBackground(CFNotificationCenterRef center, void *observer,
+                                    CFStringRef name, const void *object,
+                                    CFDictionaryRef userInfo) {
+    // 切后台：冻结 warp 时间，防止回前台时 currentTimeMs 跳变 = 后台时长 * rate
+    time_warp_freeze_inc();
+    acc_flog(@"app -> background, warp frozen (count=%d)", atomic_load(&g_tw_freeze_count));
+}
+
+static void onAppWillEnterForeground(CFNotificationCenterRef center, void *observer,
+                                     CFStringRef name, const void *object,
+                                     CFDictionaryRef userInfo) {
+    time_warp_freeze_dec();
+    acc_flog(@"app -> foreground, warp unfrozen (count=%d)", atomic_load(&g_tw_freeze_count));
 }
 
 static void onAppLaunched(CFNotificationCenterRef center, void *observer,
@@ -1023,6 +1065,14 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL,
         onAppLaunched,
         (CFStringRef)UIApplicationDidFinishLaunchingNotification,
+        NULL, CFNotificationSuspensionBehaviorCoalesce);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL,
+        onAppDidEnterBackground,
+        (CFStringRef)UIApplicationDidEnterBackgroundNotification,
+        NULL, CFNotificationSuspensionBehaviorCoalesce);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL,
+        onAppWillEnterForeground,
+        (CFStringRef)UIApplicationWillEnterForegroundNotification,
         NULL, CFNotificationSuspensionBehaviorCoalesce);
     // 兜底：如果 ctor 在 UIApplicationDidFinishLaunching 之后才跑（理论上不会，但
     // 注入工具如果用 LC_LOAD_WEAK_DYLIB / 延迟加载可能错过通知），3 秒后强制走一次
