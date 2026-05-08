@@ -568,14 +568,43 @@ static uint64_t tw_dispatch_walltime(const struct timespec *when, int64_t delta)
 #define ARC_OFF_PU_MONO_FN  (0x9E0FE8ULL)
 #define ARC_OFF_PI_GTOD_FN  (0xAE9A94ULL)
 #define ARC_OFF_PI_MACH_FN  (0xAE9AE4ULL)
+// MultiTrackPlayer vtable @ 0x101312860 (devlog confirmed); slot 7 = getPositionMs (sub_100846950)
+// 这是"chart 是否读 audio 位置"的最直接探针：每帧若被调说明 chart 跟 audio 同步
+#define ARC_OFF_MTP_VTABLE  (0x1312860ULL)
+#define ARC_OFF_MTP_GETPOS  (0x846950ULL)
 
 typedef uint64_t (*orig_pu_ms_fn)(void *self);
+// MTP::getPositionMs(this, channel) -> uint32_t (实际是 unsigned int 返回值)
+typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 
 // 保存的原始 fn ptr (PAC 已 strip,可直接调用)
 static orig_pu_ms_fn s_orig_pu_rt   = NULL;
 static orig_pu_ms_fn s_orig_pu_mono = NULL;
 static orig_pu_ms_fn s_orig_pi_gtod = NULL;
 static orig_pu_ms_fn s_orig_pi_mach = NULL;
+static orig_mtp_getpos_fn s_orig_mtp_getpos = NULL;
+static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
+static _Atomic(int) g_tw_en_mtp_getpos = 0;  // 默认 OFF：开了会让 chart 跟 audio 走 (但 audio 已 setFreq 同步，开这个会双倍 warp，慎用)
+// MTP getPos 自动捕获 player 同时记录 caller — 帮我们识别"谁在每帧读音频位置"
+static uint32_t tw_mtp_getpos(void *self, int channel) {
+    uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
+    uint64_t cnt = atomic_fetch_add(&g_tw_mtp_getpos_calls, 1);
+    if (channel == 0) {
+        atomic_store(&g_bgmPlayer, self);
+        atomic_store(&g_last_pos_ms, raw);
+        if (raw > atomic_load(&g_max_seen_ms)) atomic_store(&g_max_seen_ms, raw);
+    }
+    if ((cnt & 0xFF) == 0) {
+        void *ra = __builtin_return_address(0);
+        uint64_t base = arc_image_base();
+        uint64_t off = (uint64_t)ra - base;
+        acc_flog(@"[diag] mtp.getPos caller ra=%p (image+0x%llx) ch=%d raw=%u cnt=%llu",
+                 ra, (unsigned long long)off, channel, raw, (unsigned long long)cnt);
+    }
+    if (!atomic_load(&g_tw_en_mtp_getpos)) return raw;
+    // 开关启用时:把 raw_ms 当 "real us / 1000" 走 warp 锚
+    return (uint32_t)_warp_ms_via_us((uint64_t)raw);
+}
 
 // 各 wrapper:先调原函数拿 raw_ms,然后按 us 锚 warp 后返回 (PlatformUtils 都返回 ms)
 static uint64_t _warp_ms_via_us(uint64_t raw_ms) {
@@ -685,6 +714,9 @@ static void install_vtable_swizzles(void) {
                                  (void *)tw_pi_gtod_ms,      (void **)&s_orig_pi_gtod);
         swizzle_vtable_find_swap(base + ARC_OFF_PI_VTABLE, ARC_OFF_PI_MACH_FN,
                                  (void *)tw_pi_mach_ms,      (void **)&s_orig_pi_mach);
+        // MTP::getPositionMs — 默认装上 hook (即使开关 OFF, 也能走计数 + caller 诊断)
+        swizzle_vtable_find_swap(base + ARC_OFF_MTP_VTABLE, ARC_OFF_MTP_GETPOS,
+                                 (void *)tw_mtp_getpos,      (void **)&s_orig_mtp_getpos);
     });
 }
 
@@ -1148,6 +1180,7 @@ static void loadPref(void) {
         { "[vt]PlatformUtils.monotonic_ms",    &g_tw_en_pu_mono,        &g_tw_pu_mono_calls       },
         { "[vt]PlatformUtilsIOS.gtod_ms",      &g_tw_en_pi_gtod,        &g_tw_pi_gtod_calls       },
         { "[vt]PlatformUtilsIOS.mach_ms",      &g_tw_en_pi_mach,        &g_tw_pi_mach_calls       },
+        { "[vt]MTP.getPositionMs",             &g_tw_en_mtp_getpos,     &g_tw_mtp_getpos_calls    },
     };
     int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
     for (int i = 0; i < nClocks; i++) {
@@ -1281,6 +1314,7 @@ static void loadPref(void) {
         &g_tw_ca_cmt_calls, &g_tw_cf_abs_calls,
         &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
         &g_tw_pu_rt_calls, &g_tw_pu_mono_calls, &g_tw_pi_gtod_calls, &g_tw_pi_mach_calls,
+        &g_tw_mtp_getpos_calls,
     };
     int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
     for (int i = 0; i < n; i++) {
@@ -1307,6 +1341,7 @@ static void loadPref(void) {
         &g_tw_en_ca_cmt, &g_tw_en_cf_abs,
         &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
         &g_tw_en_pu_rt, &g_tw_en_pu_mono, &g_tw_en_pi_gtod, &g_tw_en_pi_mach,
+        &g_tw_en_mtp_getpos,
     };
     const char *names[] = {
         "mach_abs", "gtod", "cgt", "cgt_nsec",
@@ -1314,6 +1349,7 @@ static void loadPref(void) {
         "ca_cmt", "cf_abs",
         "time", "dispatch_time", "dispatch_walltime",
         "[vt]pu_rt", "[vt]pu_mono", "[vt]pi_gtod", "[vt]pi_mach",
+        "[vt]MTP.getPos",
     };
     int n = (int)(sizeof(flags) / sizeof(flags[0]));
     if (idx < 0 || idx >= n) return;
