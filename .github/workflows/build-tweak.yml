@@ -72,7 +72,10 @@ jobs:
           make
           find .theos -name '*.dylib' -ls
           mkdir -p out
-          cp .theos/obj/libAccDemoArcaea.dylib out/
+          # theos LIBRARY 输出实际在 .theos/obj/debug/AccDemoArcaea.dylib（无 lib 前缀，merged fat）
+          DYLIB="$(find .theos/obj -maxdepth 2 -name 'AccDemoArcaea.dylib' -not -path '*.dSYM*' | head -n1)"
+          if [ -z "$DYLIB" ]; then echo "AccDemoArcaea.dylib not found"; exit 1; fi
+          cp "$DYLIB" out/libAccDemoArcaea.dylib
           ldid -S out/libAccDemoArcaea.dylib
           file out/libAccDemoArcaea.dylib
           lipo -info out/libAccDemoArcaea.dylib
