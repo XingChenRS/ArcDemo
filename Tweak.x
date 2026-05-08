@@ -18,6 +18,9 @@ extern UIApplication *UIApp;
 #import "SuspendView/WQSuspendView.h"
 #import "WHToast/WHToast.h"
 
+// forward decl: 文件末尾定义，但中部诊断需要用
+static void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+
 typedef NS_ENUM(NSInteger, AccMode) {
     kModeClockGetTime = 0,   // Arcaea 默认（cocos2d-x 时基�?
     kModeGetTimeOfDay = 1,   // 备用
@@ -387,7 +390,18 @@ static void initHook(void) {
 
 - (void)show {
     UIWindow *w = [self keyWindow];
-    if (!w) return;
+    acc_flog(@"show: keyWindow=%p windows.count=%lu", w, (unsigned long)UIApp.windows.count);
+    if (!w) {
+        // cocos2d-x 场景下 keyWindow 可能为 nil，手动拉一个
+        for (UIWindow *win in UIApp.windows) {
+            acc_flog(@"  win=%p key=%d level=%f hidden=%d", win, win.isKeyWindow, win.windowLevel, win.hidden);
+            if (!win.hidden) { w = win; break; }
+        }
+    }
+    if (!w) {
+        acc_flog(@"show: NO USABLE WINDOW, abort");
+        return;
+    }
     if (menuView) [menuView removeFromSuperview];
     menuView = [[UIView alloc] initWithFrame:w.bounds];
     menuView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
@@ -397,6 +411,7 @@ static void initHook(void) {
     [menuView addGestureRecognizer:tap];
     [w addSubview:menuView];
     [w bringSubviewToFront:menuView];
+    acc_flog(@"show: added menuView to %p, bounds=%@", w, NSStringFromCGRect(w.bounds));
     [self rebuild];
 }
 
@@ -699,10 +714,11 @@ static void initHook(void) {
 static void initButton(void) {
     [WHToast setShowMask:NO];
     [WQSuspendView showWithType:WQSuspendViewTypeNone tapBlock:^{
+        // 单击：切换倍率（低频动作）
         if (rate_count <= 0) return;
         rate_i = (rate_i + 1) % rate_count;
         if (toast) {
-            [WHToast showMessage:[NSString stringWithFormat:@"%.3fx", rates[rate_i]]
+            [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (tap2x=menu)", rates[rate_i]]
                                    duration:0.5 finishHandler:^{}];
         }
     }];
@@ -720,11 +736,16 @@ static void initButton(void) {
     label.textAlignment = NSTextAlignmentCenter;
     [button addSubview:label];
 
-    // 长按浮窗 �?弹菜�?
+    // 长按浮窗 开菜单
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[AccMenuController shared] action:@selector(handleLongPress:)];
     lp.minimumPressDuration = 0.45;
     [button addGestureRecognizer:lp];
+    // 双击浮窗 开菜单（陪绑）
+    UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
+        initWithTarget:[AccMenuController shared] action:@selector(handleDoubleTap:)];
+    dt.numberOfTapsRequired = 2;
+    [button addGestureRecognizer:dt];
 
     UIWindow *w = [[AccMenuController shared] keyWindow];
     if (w && !button.superview) {
@@ -737,7 +758,14 @@ static void initButton(void) {
 @interface AccMenuController (LongPress) @end
 @implementation AccMenuController (LongPress)
 - (void)handleLongPress:(UILongPressGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan) [self show];
+    if (g.state == UIGestureRecognizerStateBegan) {
+        acc_flog(@"longPress fired -> show");
+        [self show];
+    }
+}
+- (void)handleDoubleTap:(UITapGestureRecognizer *)g {
+    acc_flog(@"doubleTap fired -> show");
+    [self show];
 }
 @end
 
