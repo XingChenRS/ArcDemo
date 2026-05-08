@@ -47,17 +47,22 @@ static UIView        *menuView = nil;
 //
 // 已知偏移（来自 IDA 6.13.10 分析）：
 //   sub_100846950 (vtable[7] of MultiTrackPlayer) = getPositionMs(this, channel)
-//                                                 → 用于自动捕获 player this 指针
-//   vtable slot 6 = setPaused, slot 7 = getPositionMs, slot 8 = seekTo
+//   sub_100846914 (vtable[6])                     = setPaused(this, paused, channel)
+//   sub_10084699C (vtable[8])                     = seekTo(this, ms, channel)
+//   sub_100C9D718                                 = getRegistry()    → 全局单例
+//   *(getRegistry() + 8)                          = MultiTrackPlayer
 //
-// 运行时地址 = arcaea_base + (offset - 0x100000000)
-#define ARC_BASE_VA               (0x100000000ULL)
-#define ARC_OFF_GET_POSITION_MS   (0x846950ULL)   // sub_100846950
+// 运行时地址 = arcaea_base + offset
+#define ARC_OFF_GET_POSITION_MS   (0x846950ULL)   // 仍保留 hook 用于时间注入观测 + 兜底
+#define ARC_OFF_GET_REGISTRY      (0xC9D718ULL)   // sub_100C9D718()
+#define ARC_REG_PLAYER_OFFSET     (8)            // [reg + 8] = MTP
 
 typedef uint32_t (*get_position_ms_fn)(void *self, int channel);
+typedef void *   (*get_registry_fn)(void);
 static get_position_ms_fn  orig_get_position_ms = NULL;
+static get_registry_fn     g_get_registry = NULL;
 
-// 由 hook 自动捕获 —— 所有进度条 / 暂停 / seek 操作都用它
+// 由 hook 兜底捕获 + 主动通过 registry 获取
 static _Atomic(void *) g_bgmPlayer = NULL;
 static _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
@@ -65,13 +70,28 @@ static _Atomic(uint32_t) g_max_seen_ms = 0;
 static uint32_t hooked_get_position_ms(void *self, int channel) {
     uint32_t ret = orig_get_position_ms(self, channel);
     if (channel == 0) {
-        // BGM 主轨：缓存 player + 当前位置
         atomic_store(&g_bgmPlayer, self);
         atomic_store(&g_last_pos_ms, ret);
         uint32_t prev = atomic_load(&g_max_seen_ms);
         if (ret > prev) atomic_store(&g_max_seen_ms, ret);
     }
     return ret;
+}
+
+// 主动通过 registry 拿 MTP（不需要等 hook 触发）
+static void *resolve_player_via_registry(void) {
+    if (!g_get_registry) return NULL;
+    void *reg = g_get_registry();
+    if (!reg) return NULL;
+    void *mtp = *(void **)((char *)reg + ARC_REG_PLAYER_OFFSET);
+    if (mtp) atomic_store(&g_bgmPlayer, mtp);
+    return mtp;
+}
+
+static inline void *get_player_or_resolve(void) {
+    void *p = atomic_load(&g_bgmPlayer);
+    if (p) return p;
+    return resolve_player_via_registry();
 }
 
 // 取 Arc-mobile 主二进制基址
@@ -106,6 +126,11 @@ static void install_arc_hooks(void) {
                        (void *)hooked_get_position_ms,
                        (void **)&orig_get_position_ms);
     NSLog(@"[AccDemoArcaea] DobbyHook getPositionMs @ %p rc=%d", target, rc);
+
+    g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
+    NSLog(@"[AccDemoArcaea] registry getter @ %p", (void *)g_get_registry);
+    void *mtp = resolve_player_via_registry();
+    NSLog(@"[AccDemoArcaea] initial MTP via registry = %p", mtp);
 }
 
 // 通过 player vtable 调用对应槽位
@@ -117,19 +142,20 @@ static inline void *_player_vt_slot(void *self, size_t byte_off) {
 }
 
 static void player_seek_ms(uint32_t ms) {
-    void *self = atomic_load(&g_bgmPlayer);
+    void *self = get_player_or_resolve();
     if (!self) return;
     typedef void (*seek_fn)(void *, uint32_t, int);
-    seek_fn fn = (seek_fn)_player_vt_slot(self, 0x40); // slot 8
+    seek_fn fn = (seek_fn)_player_vt_slot(self, 0x40); // slot 8 = seekTo(this, ms, channel)
     if (fn) fn(self, ms, 0);
 }
 
 static void player_set_paused(BOOL paused) {
-    void *self = atomic_load(&g_bgmPlayer);
+    void *self = get_player_or_resolve();
     if (!self) return;
-    typedef void (*set_paused_fn)(void *, int);
+    // 修正：vtable[6] = setPaused(this, paused, channel)
+    typedef void (*set_paused_fn)(void *, int, int);
     set_paused_fn fn = (set_paused_fn)_player_vt_slot(self, 0x30); // slot 6
-    if (fn) fn(self, paused ? 1 : 0);
+    if (fn) fn(self, paused ? 1 : 0, 0);
 }
 
 static uint32_t player_get_position_ms_cached(void) {
@@ -392,7 +418,7 @@ static void initHook(void) {
     y += 36;
 
     // ---- BGM player live controls (only meaningful while playing) ----
-    BOOL playerReady = (atomic_load(&g_bgmPlayer) != NULL);
+    BOOL playerReady = (get_player_or_resolve() != NULL);
 
     UILabel *playerHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
     playerHdr.text = playerReady ? @"BGM (live)" : @"BGM (waiting for playback…)";
@@ -539,14 +565,14 @@ static void initHook(void) {
     if (sl) {
         if (sl.maximumValue < (float)maxMs) sl.maximumValue = (float)maxMs;
         if (!self.userDraggingSlider) sl.value = (float)cur;
-        if (!sl.enabled && atomic_load(&g_bgmPlayer)) sl.enabled = YES;
+        if (!sl.enabled && get_player_or_resolve()) sl.enabled = YES;
     }
     if (lbl) {
         lbl.text = [NSString stringWithFormat:@"%u.%03us / %u.%03us",
                     cur / 1000u, cur % 1000u,
                     maxMs / 1000u, maxMs % 1000u];
     }
-    if (self.pauseSwitch && !self.pauseSwitch.enabled && atomic_load(&g_bgmPlayer)) {
+    if (self.pauseSwitch && !self.pauseSwitch.enabled && get_player_or_resolve()) {
         self.pauseSwitch.enabled = YES;
     }
 }
