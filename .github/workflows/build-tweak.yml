@@ -53,7 +53,7 @@ jobs:
               -DBUILD_SHARED_LIBS=OFF \
               -DDOBBY_BUILD_EXAMPLE=OFF \
               -DDOBBY_BUILD_TEST=OFF
-            make -j$(sysctl -n hw.ncpu) dobby
+            make -j$(sysctl -n hw.ncpu) dobby_static
             popd > /dev/null
             ls -la "dobby-src/build-$ARCH" | grep -i dobby || true
           done

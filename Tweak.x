@@ -51,21 +51,52 @@ static UIView        *menuView = nil;
 //   sub_10084699C (vtable[8])                     = seekTo(this, ms, channel)
 //   sub_100C9D718                                 = getRegistry()    → 全局单例
 //   *(getRegistry() + 8)                          = MultiTrackPlayer
+//   sub_100EC094C                                 = Channel::getCurrentSound(ch, Sound**)
+//   sub_100F2BB64                                 = Sound::getLength(snd, uint32_t*, unit=1)
+//   sub_100EC069C                                 = Channel::setFrequency(ch, float)   — 备用
+// 
+// MTP 内部布局：通道数组 channels[i] @ player+0x38 起，步长 16，每条 +8 = Channel*。
+//   ch0 = *(*(player+0x38) + 8)
 //
 // 运行时地址 = arcaea_base + offset
-#define ARC_OFF_GET_POSITION_MS   (0x846950ULL)   // 仍保留 hook 用于时间注入观测 + 兜底
-#define ARC_OFF_GET_REGISTRY      (0xC9D718ULL)   // sub_100C9D718()
-#define ARC_REG_PLAYER_OFFSET     (8)            // [reg + 8] = MTP
+#define ARC_OFF_GET_POSITION_MS    (0x846950ULL)
+#define ARC_OFF_GET_REGISTRY       (0xC9D718ULL)
+#define ARC_OFF_GET_CURRENT_SOUND  (0xEC094CULL)
+#define ARC_OFF_GET_SOUND_LENGTH   (0xF2BB64ULL)
+#define ARC_REG_PLAYER_OFFSET      (8)
+#define ARC_PLAYER_CHANNELS_OFFSET (0x38)
+#define ARC_CHANNEL_ENTRY_PTR_OFF  (8)
 
 typedef uint32_t (*get_position_ms_fn)(void *self, int channel);
 typedef void *   (*get_registry_fn)(void);
-static get_position_ms_fn  orig_get_position_ms = NULL;
-static get_registry_fn     g_get_registry = NULL;
+typedef int      (*get_current_sound_fn)(void *channel, void **outSound);
+typedef int      (*get_sound_length_fn)(void *sound, uint32_t *outLen, int unit);
+static get_position_ms_fn   orig_get_position_ms = NULL;
+static get_registry_fn      g_get_registry = NULL;
+static get_current_sound_fn g_get_current_sound = NULL;
+static get_sound_length_fn  g_get_sound_length = NULL;
 
 // 由 hook 兜底捕获 + 主动通过 registry 获取
-static _Atomic(void *) g_bgmPlayer = NULL;
+static _Atomic(void *)   g_bgmPlayer = NULL;
 static _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
+static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
+
+// 尝试从 player 主轨拿 Sound 总长
+static void try_capture_song_length(void *player) {
+    if (!player || !g_get_current_sound || !g_get_sound_length) return;
+    if (atomic_load(&g_song_length_ms) != 0) return;
+    void *channels_base = *(void **)((char *)player + ARC_PLAYER_CHANNELS_OFFSET);
+    if (!channels_base) return;
+    void *ch0 = *(void **)((char *)channels_base + ARC_CHANNEL_ENTRY_PTR_OFF);
+    if (!ch0) return;
+    void *snd = NULL;
+    if (g_get_current_sound(ch0, &snd) != 0 || !snd) return;
+    uint32_t len = 0;
+    if (g_get_sound_length(snd, &len, 1) == 0 && len > 0 && len < 0x7FFFFFFFu) {
+        atomic_store(&g_song_length_ms, len);
+    }
+}
 
 static uint32_t hooked_get_position_ms(void *self, int channel) {
     uint32_t ret = orig_get_position_ms(self, channel);
@@ -74,6 +105,7 @@ static uint32_t hooked_get_position_ms(void *self, int channel) {
         atomic_store(&g_last_pos_ms, ret);
         uint32_t prev = atomic_load(&g_max_seen_ms);
         if (ret > prev) atomic_store(&g_max_seen_ms, ret);
+        try_capture_song_length(self);
     }
     return ret;
 }
@@ -128,9 +160,13 @@ static void install_arc_hooks(void) {
     NSLog(@"[AccDemoArcaea] DobbyHook getPositionMs @ %p rc=%d", target, rc);
 
     g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
-    NSLog(@"[AccDemoArcaea] registry getter @ %p", (void *)g_get_registry);
+    g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
+    g_get_sound_length  = (get_sound_length_fn) (base + ARC_OFF_GET_SOUND_LENGTH);
+    NSLog(@"[AccDemoArcaea] registry=%p getCurrentSound=%p getLength=%p",
+          (void *)g_get_registry, (void *)g_get_current_sound, (void *)g_get_sound_length);
     void *mtp = resolve_player_via_registry();
     NSLog(@"[AccDemoArcaea] initial MTP via registry = %p", mtp);
+    if (mtp) try_capture_song_length(mtp);
 }
 
 // 通过 player vtable 调用对应槽位
@@ -163,6 +199,13 @@ static uint32_t player_get_position_ms_cached(void) {
 }
 
 static uint32_t player_get_max_seen_ms(void) {
+    return atomic_load(&g_max_seen_ms);
+}
+
+// 调用者需要的最大进度值：优先 FMOD 拿到的真实总长，其次是运行中看到过的最大 ms
+static uint32_t player_get_progress_max_ms(void) {
+    uint32_t len = atomic_load(&g_song_length_ms);
+    if (len > 0) return len;
     return atomic_load(&g_max_seen_ms);
 }
 
@@ -429,7 +472,7 @@ static void initHook(void) {
 
     UISlider *sl = [[UISlider alloc] initWithFrame:CGRectMake(12, y, innerW, 28)];
     sl.minimumValue = 0;
-    uint32_t maxMs = MAX(player_get_max_seen_ms(), (uint32_t)1000);
+    uint32_t maxMs = MAX(player_get_progress_max_ms(), (uint32_t)1000);
     sl.maximumValue = (float)maxMs;
     sl.value = (float)player_get_position_ms_cached();
     sl.continuous = YES;
@@ -559,7 +602,7 @@ static void initHook(void) {
 - (void)progressTick:(NSTimer *)t {
     if (!menuView) { [t invalidate]; self.progressTimer = nil; return; }
     uint32_t cur = player_get_position_ms_cached();
-    uint32_t maxMs = MAX(player_get_max_seen_ms(), (uint32_t)1000);
+    uint32_t maxMs = MAX(player_get_progress_max_ms(), (uint32_t)1000);
     UISlider *sl = self.progressSlider;
     UILabel *lbl = self.progressLabel;
     if (sl) {

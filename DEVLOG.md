@@ -395,3 +395,51 @@ xrefs 验证：AppController applicationDidBecomeActive、RootViewController didRota
 - bgmPlayer @ GameScene+0x2F0 与 registry MTP 的关系：如果 hook 触发了但 self != registry MTP，说明谱面层用的是另一个 player，那进度/暂停目标也得改成那个对象。
 
 ---
+
+---
+
+## Step 14 — Sound::getLength 接入 + dylib 构建路径修正
+
+### 1. 找全 FMOD 链：MTP → Channel → Sound → Length
+- Channel::getCurrentSound(ch, Sound**) = `sub_100EC094C` (offset `0xEC094C`)
+- Sound::getLength(snd, uint32_t*, unit=1ms) = `sub_100F2BB64` (offset `0xF2BB64`)
+- 来源：grep "Channel::getCurrentSound" "Sound::getLength" 命中常量字符串 → 反查 xref 到 profiler 包装函数。
+
+### 2. 通道数组结构 (复核 `sub_10084699C`)
+`
+v9 = a1[7];                                        // = player + 0x38 = channels_base
+ch = *(_QWORD *)(v9 + 16LL * idx + 8);             // channels[idx].ptr
+`
+所以：
+`c
+channels_base = *(player + 0x38);
+ch0 = *(channels_base + 8);
+`
+
+### 3. Tweak.x 改造
+- 新增三个 fn ptr：`g_get_current_sound`, `g_get_sound_length`, `g_get_registry`。
+- `try_capture_song_length(player)`：从 player 拿 ch0，再 getCurrentSound→getLength，缓存到 `g_song_length_ms`。
+- `hooked_get_position_ms` 第一次触发 / install 阶段都会调用，不阻塞。
+- 进度条最大值 `player_get_progress_max_ms()`：优先 FMOD 总长，没有就退回 `g_max_seen_ms`（防止还没拿到 length 时进度条卡住）。
+
+### 4. CI 第二次失败原因
+日志显示：Linking CXX shared library libdobby.dylib，然后 lipo 找不到 `libdobby.a`。
+
+**原因**：Dobby 的 `CMakeLists.txt` 同时定义两个 target：
+`cmake
+add_library(dobby SHARED )
+add_library(dobby_static STATIC )
+set_target_properties(dobby_static PROPERTIES OUTPUT_NAME "dobby")
+`
+`BUILD_SHARED_LIBS` 没用，因为 Dobby 显式指定 SHARED/STATIC。要的是 `dobby_static` target —— 改 `make dobby` → `make dobby_static`。产物 `libdobby.a`（由于 OUTPUT_NAME="dobby" 命名一致）。
+
+### 5. 仓库瘦身
+- 删除 `Tweak.x.orig`、`AccDemoArcaea.plist`（dylib 注入不需要 bundle filter）。
+- `control`（dpkg metadata）实际也不需要——TODO 下次清理。
+- README 还引用越狱安装方式——TODO 改为 sideload 说明。
+
+### 6. 待验证
+- `[reg+8]` 真的是 chart 用的 MTP？hook 触发后会自动覆盖，所以无所谓；但若 hook 永远不触发说明 chart 用的根本不是 MTP——届时回到对 `GameScene+0x2F0` 的探索。
+- `Sound::getLength` 单位 1 = ms 假设源自 FMOD 文档（`FMOD_TIMEUNIT_MS = 1`）。如果取出的值离谱（比如=PCM 采样数）则改 unit。
+
+---
