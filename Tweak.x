@@ -400,13 +400,16 @@ static void initHook(void) {
 %hook UIWindow
 - (void)bringSubviewToFront:(UIView *)view {
     %orig;
-    if (button && view != button) [self bringSubviewToFront:button];
-    if (menuView && view != menuView) [self bringSubviewToFront:menuView];
+    // 防递归：当外部把 button/menuView 自己置顶时，不要再递归置顶它们
+    if (view == button || view == menuView) return;
+    if (button) %orig(button);
+    if (menuView) %orig(menuView);
 }
 - (void)addSubview:(UIView *)view {
     %orig;
-    if (button && view != button) [self bringSubviewToFront:button];
-    if (menuView && view != menuView) [self bringSubviewToFront:menuView];
+    if (view == button || view == menuView) return;
+    if (button) [self bringSubviewToFront:button];
+    if (menuView) [self bringSubviewToFront:menuView];
 }
 %end
 
