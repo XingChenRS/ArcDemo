@@ -1,0 +1,12 @@
+﻿#ifdef __OBJC__
+
+// Arcaea 沙箱内 prefs 路径（仅同进程 dylib 访问）
+// NSHomeDirectory() = /var/mobile/Containers/Data/Application/<UUID>/
+#define kPrefPath ([NSString stringWithFormat:@"%@/Library/Preferences/moe.low.arc.accdemoarcaea.plist", NSHomeDirectory()])
+
+#if DEBUG
+#else
+#define NSLog(FORMAT, ...)
+#endif
+
+#endif //__OBJC__
