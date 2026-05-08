@@ -742,26 +742,61 @@ static void initButton(void) {
 
 #pragma mark - bootstrap
 
+// 文件日志：sideload 下没法接 Console，写到 app Documents/AccDemoArcaea.log
+// 用户可通过 iTunes 文件共享 / iMazing / 3uTools 取出
+static void acc_flog(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[AccDemoArcaea] %@", line);
+    @try {
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (!docs) return;
+        NSString *path = [docs stringByAppendingPathComponent:@"AccDemoArcaea.log"];
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+        NSString *out = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], line];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [fh seekToEndOfFile];
+            [fh writeData:[out dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        }
+    } @catch (NSException *e) {}
+}
+
+static void doBootstrap(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        acc_flog(@"doBootstrap begin");
+        @try { initButton(); }       @catch (NSException *e) { acc_flog(@"initButton EX: %@", e); }
+        @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
+        acc_flog(@"doBootstrap done");
+    });
+}
+
 static void onAppLaunched(CFNotificationCenterRef center, void *observer,
                           CFStringRef name, const void *object,
                           CFDictionaryRef userInfo) {
-    initButton();
-    // 暂时禁用 gettimeofday/clock_gettime 全局 hook：
-    //   1) iOS16 arm64e PAC 严格校验，patch libsystem_c 函数会让 Crashlytics
-    //      等早期线程跨进未签名 trampoline 时触发 Permission fault (Instruction Abort)
-    //   2) 全局时间偏移会导致谱面/音乐/判定/网络心跳全部错位，与用户「不希望
-    //      时间轴错位」需求冲突。变速 / seek / pause 通过 player+channel 精确
-    //      hook 实现（getPositionMs / setFrequency / seekTo / setPaused）。
-    // initHook();
-    install_arc_hooks();
+    acc_flog(@"onAppLaunched notification fired");
+    doBootstrap();
 }
 
 %ctor {
-    NSLog(@"[AccDemoArcaea] ctor");
-    %init(ui);
-    loadPref();
+    acc_flog(@"ctor entered (dylib loaded ok)");
+    @try { %init(ui); }   @catch (NSException *e) { acc_flog(@"%%init(ui) EX: %@", e); }
+    @try { loadPref(); }  @catch (NSException *e) { acc_flog(@"loadPref EX: %@", e); }
     CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL,
         onAppLaunched,
         (CFStringRef)UIApplicationDidFinishLaunchingNotification,
         NULL, CFNotificationSuspensionBehaviorCoalesce);
+    // 兜底：如果 ctor 在 UIApplicationDidFinishLaunching 之后才跑（理论上不会，但
+    // 注入工具如果用 LC_LOAD_WEAK_DYLIB / 延迟加载可能错过通知），3 秒后强制走一次
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        acc_flog(@"3s fallback bootstrap");
+        doBootstrap();
+    });
 }
