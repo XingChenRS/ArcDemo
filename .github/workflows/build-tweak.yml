@@ -18,7 +18,7 @@ jobs:
 
       - name: Install build deps
         run: |
-          brew install ldid xz coreutils dpkg
+          brew install ldid xz coreutils
         shell: bash
 
       - name: Clone Theos
@@ -90,31 +90,42 @@ jobs:
           lipo -info out/libAccDemoArcaea.dylib
         shell: bash
 
-      - name: Fetch ellekit (sideload runtime substrate replacement)
+      - name: Build ellekit (sideload runtime substrate replacement)
         run: |
           cd "${{ github.workspace }}"
-          # 通过 GitHub API 找 latest release 里的 .deb（不固定版本号）
-          ASSET=$(curl -s https://api.github.com/repos/evelyneee/ellekit/releases/latest \
-            | grep browser_download_url | grep '\.deb' | grep -i 'iphoneos-arm' \
-            | head -n1 | cut -d'"' -f4)
-          echo "ellekit asset: $ASSET"
-          if [ -z "$ASSET" ]; then
-            # 兜底：所有 release 里抓第一个 deb
-            ASSET=$(curl -s https://api.github.com/repos/evelyneee/ellekit/releases \
-              | grep browser_download_url | grep '\.deb' | head -n1 | cut -d'"' -f4)
-            echo "fallback asset: $ASSET"
-          fi
-          curl -fL -o /tmp/ellekit.deb "$ASSET"
-          ls -la /tmp/ellekit.deb
-          mkdir -p /tmp/ek-extract
-          dpkg-deb -x /tmp/ellekit.deb /tmp/ek-extract
-          DYLIB=$(find /tmp/ek-extract -name 'libellekit.dylib' | head -n1)
+          git clone --depth 1 https://github.com/tealbathingsuit/ellekit.git ek-src
+          cd ek-src
+          # 用 xcodebuild 编 iOS framework target，输出 dylib
+          set +e
+          xcodebuild -project ellekit.xcodeproj -list 2>&1 | head -50
+          # 尝试编 ellekit framework target
+          xcodebuild \
+            -project ellekit.xcodeproj \
+            -target ellekit \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 -arch arm64e \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=14.0 \
+            build SYMROOT=$PWD/build 2>&1 | tail -40
+          set -e
+          # 找 framework 内的二进制（dylib）
+          find build -name 'ellekit*' -type f
+          DYLIB=$(find build -path '*ellekit.framework/ellekit' | head -n1)
           if [ -z "$DYLIB" ]; then
-            echo "libellekit.dylib not found in deb!"
-            find /tmp/ek-extract
+            DYLIB=$(find build -name 'ellekit' -type f | head -n1)
+          fi
+          if [ -z "$DYLIB" ]; then
+            echo "ellekit binary not found"
+            find build
             exit 1
           fi
-          cp "$DYLIB" out/libellekit.dylib
+          cd "${{ github.workspace }}"
+          cp "ek-src/$DYLIB" out/libellekit.dylib
+          install_name_tool -id @rpath/libellekit.dylib out/libellekit.dylib
           ldid -S out/libellekit.dylib
           file out/libellekit.dylib
           lipo -info out/libellekit.dylib
