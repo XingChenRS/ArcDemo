@@ -18,7 +18,7 @@ jobs:
 
       - name: Install build deps
         run: |
-          brew install ldid xz coreutils
+          brew install ldid xz coreutils dpkg
         shell: bash
 
       - name: Clone Theos
@@ -93,19 +93,21 @@ jobs:
       - name: Fetch ellekit (sideload runtime substrate replacement)
         run: |
           cd "${{ github.workspace }}"
-          # ellekit release 提供 .deb，里面含 libellekit.dylib
-          EK_VER="1.2.0"
-          curl -L -o /tmp/ellekit.deb "https://github.com/evelyneee/ellekit/releases/download/${EK_VER}/ellekit_${EK_VER}_iphoneos-arm.deb" || true
-          if [ ! -s /tmp/ellekit.deb ]; then
-            # fallback: latest release asset
-            ASSET=$(curl -s https://api.github.com/repos/evelyneee/ellekit/releases/latest \
-              | grep browser_download_url | grep iphoneos-arm.deb | head -n1 | cut -d'"' -f4)
+          # 通过 GitHub API 找 latest release 里的 .deb（不固定版本号）
+          ASSET=$(curl -s https://api.github.com/repos/evelyneee/ellekit/releases/latest \
+            | grep browser_download_url | grep '\.deb' | grep -i 'iphoneos-arm' \
+            | head -n1 | cut -d'"' -f4)
+          echo "ellekit asset: $ASSET"
+          if [ -z "$ASSET" ]; then
+            # 兜底：所有 release 里抓第一个 deb
+            ASSET=$(curl -s https://api.github.com/repos/evelyneee/ellekit/releases \
+              | grep browser_download_url | grep '\.deb' | head -n1 | cut -d'"' -f4)
             echo "fallback asset: $ASSET"
-            curl -L -o /tmp/ellekit.deb "$ASSET"
           fi
+          curl -fL -o /tmp/ellekit.deb "$ASSET"
+          ls -la /tmp/ellekit.deb
           mkdir -p /tmp/ek-extract
           dpkg-deb -x /tmp/ellekit.deb /tmp/ek-extract
-          # ellekit 把 libellekit.dylib 放在 /usr/lib/ 或 rootless /var/jb/usr/lib/
           DYLIB=$(find /tmp/ek-extract -name 'libellekit.dylib' | head -n1)
           if [ -z "$DYLIB" ]; then
             echo "libellekit.dylib not found in deb!"
