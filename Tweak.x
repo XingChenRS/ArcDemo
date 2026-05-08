@@ -153,11 +153,12 @@ static void install_arc_hooks(void) {
         NSLog(@"[AccDemoArcaea] arc_image_base() = 0, abort");
         return;
     }
-    void *target = (void *)(base + ARC_OFF_GET_POSITION_MS);
-    int rc = DobbyHook(target,
-                       (void *)hooked_get_position_ms,
-                       (void **)&orig_get_position_ms);
-    NSLog(@"[AccDemoArcaea] DobbyHook getPositionMs @ %p rc=%d", target, rc);
+    // iOS 16 sideload: 不要给主二进制 __TEXT 打 DobbyHook 补丁。
+    // mprotect(rwx) 会破坏 amfi/CoreTrust 的 text page seal，
+    // 其它线程跑该页时触发 EXC_BAD_ACCESS / Permission fault (Instruction Abort)。
+    // 改为只读取函数指针，不修改函数实现。
+    orig_get_position_ms = (get_position_ms_fn)(base + ARC_OFF_GET_POSITION_MS);
+    NSLog(@"[AccDemoArcaea] getPositionMs (read-only) @ %p", (void *)orig_get_position_ms);
 
     g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
     g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
