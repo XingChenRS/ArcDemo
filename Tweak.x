@@ -518,32 +518,26 @@ static void initHook(void) {
 
     // 标题
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 24)];
-    title.text = @"AccDemoArcaea";
+    title.text = @"AccDemo Arcaea 控制台";
     title.font = [UIFont boldSystemFontOfSize:18];
     title.textColor = [UIColor blackColor];
     [card addSubview:title];
-    y += 30;
+    y += 28;
 
-    // mode
-    UILabel *modeLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    modeLbl.text = @"Time Source";
-    modeLbl.font = [UIFont systemFontOfSize:13];
-    modeLbl.textColor = [UIColor darkGrayColor];
-    [card addSubview:modeLbl];
-    y += 20;
-
-    UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"clock_gettime", @"gettimeofday"]];
-    seg.frame = CGRectMake(12, y, innerW, 28);
-    seg.selectedSegmentIndex = mode;
-    [seg addTarget:self action:@selector(modeChanged:) forControlEvents:UIControlEventValueChanged];
-    [card addSubview:seg];
-    y += 36;
+    // 重要说明：只能改音频，谱面不跟随
+    UILabel *warn = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
+    warn.text = @"⚠️ 仅改变音频倍速；Arcaea 谱面/判定使用独立时钟，不受影响。谱面似乎不跟随是正常现象。";
+    warn.font = [UIFont systemFontOfSize:11];
+    warn.textColor = [UIColor colorWithRed:0.8 green:0.4 blue:0.0 alpha:1.0];
+    warn.numberOfLines = 0;
+    [card addSubview:warn];
+    y += 38;
 
     // ---- BGM player live controls (only meaningful while playing) ----
     BOOL playerReady = (get_player_or_resolve() != NULL);
 
     UILabel *playerHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    playerHdr.text = playerReady ? @"BGM (live)" : @"BGM (waiting for playback...)";
+    playerHdr.text = playerReady ? @"BGM 实时控制" : @"BGM（等待歌曲加载中…）";
     playerHdr.font = [UIFont systemFontOfSize:13];
     playerHdr.textColor = [UIColor darkGrayColor];
     [card addSubview:playerHdr];
@@ -572,7 +566,7 @@ static void initHook(void) {
     y += 22;
 
     UILabel *pauseLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    pauseLbl.text = @"Pause BGM";
+    pauseLbl.text = @"暂停 BGM";
     pauseLbl.font = [UIFont systemFontOfSize:14];
     pauseLbl.textColor = [UIColor blackColor];
     [card addSubview:pauseLbl];
@@ -595,7 +589,7 @@ static void initHook(void) {
 
     // toast switch
     UILabel *toastLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    toastLbl.text = @"Toast on switch";
+    toastLbl.text = @"切倍率时显示提示";
     toastLbl.font = [UIFont systemFontOfSize:14];
     toastLbl.textColor = [UIColor blackColor];
     [card addSubview:toastLbl];
@@ -609,7 +603,7 @@ static void initHook(void) {
 
     // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    speedHdr.text = @"Speeds (tap row to select; long-press to delete)";
+    speedHdr.text = @"倍率列表（点击选中，长按删除）";
     speedHdr.font = [UIFont systemFontOfSize:12];
     speedHdr.textColor = [UIColor darkGrayColor];
     speedHdr.numberOfLines = 0;
@@ -651,14 +645,14 @@ static void initHook(void) {
 
     UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     addBtn.frame = CGRectMake(12, y, innerW, 32);
-    [addBtn setTitle:@"+ Add Speed" forState:UIControlStateNormal];
+    [addBtn setTitle:@"+ 添加倍率" forState:UIControlStateNormal];
     [addBtn addTarget:self action:@selector(addSpeed) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:addBtn];
     y += 40;
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     closeBtn.frame = CGRectMake(12, y, innerW, 32);
-    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"关闭" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:closeBtn];
@@ -876,6 +870,22 @@ static void doBootstrap(void) {
         // FMOD 频率，所以这里也要兜底重新 apply。
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             apply_speed_to_all_channels();
+            // 兜底捕获歌曲总时长（之前依赖 getPositionMs hook，现已删除）
+            void *p = get_player_or_resolve();
+            if (p) try_capture_song_length(p);
+            // 兜底维护 last_pos_ms / max_seen_ms（用于进度条显示）
+            if (p && g_ch_get_position) {
+                void *channels_base = *(void **)((char *)p + ARC_PLAYER_CHANNELS_OFFSET);
+                if (channels_base) {
+                    void *ch0 = *(void **)((char *)channels_base + ARC_CHANNEL_ENTRY_PTR_OFF);
+                    uint32_t pos = 0;
+                    if (ch0 && g_ch_get_position(ch0, &pos, 1) == 0) {
+                        atomic_store(&g_last_pos_ms, pos);
+                        uint32_t prev = atomic_load(&g_max_seen_ms);
+                        if (pos > prev) atomic_store(&g_max_seen_ms, pos);
+                    }
+                }
+            }
         }];
         acc_flog(@"doBootstrap done");
     });
