@@ -2,3 +2,6 @@
 .theos/
 packages/
 AppIcons/
+
+.ida-mcp/
+
