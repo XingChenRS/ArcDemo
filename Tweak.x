@@ -351,7 +351,14 @@ static uint64_t tw_mach_absolute_time(void) {
 static int tw_gettimeofday(struct timeval *tv, void *tz) {
     if (!tv) return s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
     int r = s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
-    atomic_fetch_add(&g_tw_gtod_calls, 1);
+    uint32_t cnt = atomic_fetch_add(&g_tw_gtod_calls, 1);
+    // 诊断: 每 256 次记录一次 caller (return address), 帮我们识别是不是 cocos2d 在调
+    if ((cnt & 0xFF) == 0) {
+        void *ra = __builtin_return_address(0);
+        uint64_t base = arc_image_base();
+        uint64_t off = (uint64_t)ra - base;
+        acc_flog(@"[diag] gtod caller ra=%p (image+0x%llx) cnt=%u", ra, (unsigned long long)off, cnt);
+    }
     if (r != 0) return r;
     if (!atomic_load(&g_tw_en_gtod)) return r;
     uint64_t real_us = (uint64_t)tv->tv_sec * 1000000ULL + (uint64_t)tv->tv_usec;
