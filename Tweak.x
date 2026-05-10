@@ -899,6 +899,34 @@ static void install_displaylink_swizzles(void) {
     });
 }
 
+// UI 开关对应的 hook 是否已真正装上（非空原函数/已安装标记）。
+static int clock_hook_ready_for_idx(int idx) {
+    switch (idx) {
+        case 0:  return s_orig_mach_abs != NULL;
+        case 1:  return s_orig_gettod != NULL;
+        case 2:  return s_orig_clock_gettime != NULL;
+        case 3:  return s_orig_clock_gettime_nsec_np != NULL;
+        case 4:  return s_orig_mach_cont != NULL;
+        case 5:  return s_orig_mach_appx != NULL;
+        case 6:  return s_orig_mach_cont_appx != NULL;
+        case 7:  return s_orig_ca_cmt != NULL;
+        case 8:  return s_orig_cf_abs != NULL;
+        case 9:  return s_orig_time != NULL;
+        case 10: return s_orig_dispatch_time != NULL;
+        case 11: return s_orig_dispatch_walltime != NULL;
+        case 12: return s_orig_pu_rt != NULL;
+        case 13: return s_orig_pu_mono != NULL;
+        case 14: return s_orig_pi_gtod != NULL;
+        case 15: return s_orig_pi_mach != NULL;
+        case 16: return s_orig_mtp_getpos != NULL;
+        case 17: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
+        case 18: return s_orig_dl_ts != NULL;
+        case 19: return s_orig_dl_target != NULL;
+        case 20: return s_orig_dl_dur != NULL;
+        default: return 0;
+    }
+}
+
 // 增加冻结计数（用户暂停 / 切后台 / seek 期间皆可调用）
 static void time_warp_freeze_inc(void) {
     int32_t prev = atomic_fetch_add(&g_tw_freeze_count, 1);
@@ -1504,6 +1532,16 @@ static void loadPref(void) {
     };
     int n = (int)(sizeof(flags) / sizeof(flags[0]));
     if (idx < 0 || idx >= n) return;
+    if (sw.on && !clock_hook_ready_for_idx(idx)) {
+        sw.on = NO;
+        atomic_store(flags[idx], 0);
+        acc_flog(@"clock toggle reject: %s ON requested but hook not ready", names[idx]);
+        if (toast) {
+            [WHToast showMessage:[NSString stringWithFormat:@"%s 未就绪", names[idx]]
+                        duration:0.6 finishHandler:^{}];
+        }
+        return;
+    }
     atomic_store(flags[idx], sw.on ? 1 : 0);
     acc_flog(@"clock toggle: %s = %d", names[idx], sw.on ? 1 : 0);
     if (toast) {
