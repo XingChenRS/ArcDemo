@@ -15,6 +15,8 @@
 #import <errno.h>
 #import <limits.h>
 #import <mach/vm_map.h>
+#import <mach/mach_vm.h>
+#import <mach/vm_region.h>
 #import <mach/mach_init.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -133,6 +135,36 @@ static inline void *get_player_or_resolve(void) {
     return resolve_player_via_registry();
 }
 
+// 防止读到野指针：先做用户态地址粗筛，再做 vm region 可读性确认。
+static inline bool ptr_plausible(const void *p) {
+    uintptr_t v = (uintptr_t)p;
+    if (v < 0x100000000ULL) return false;
+    if ((v & 0x7ULL) != 0) return false;
+    return true;
+}
+
+static bool addr_readable(const void *p, size_t len) {
+    if (!p || len == 0) return false;
+    uintptr_t start_u = (uintptr_t)p;
+    uintptr_t end_u = start_u + len;
+    if (end_u < start_u) return false;
+    mach_vm_address_t region_addr = (mach_vm_address_t)start_u;
+    mach_vm_size_t region_size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr = mach_vm_region_recurse(mach_task_self(),
+                                              &region_addr,
+                                              &region_size,
+                                              &depth,
+                                              (vm_region_recurse_info_t)&info,
+                                              &count);
+    if (kr != KERN_SUCCESS) return false;
+    if (start_u < (uintptr_t)region_addr) return false;
+    if (end_u > (uintptr_t)(region_addr + region_size)) return false;
+    return (info.protection & VM_PROT_READ) != 0;
+}
+
 // �?Arc-mobile 主二进制基址
 static uint64_t arc_image_base(void) {
     static uint64_t cached = 0;
@@ -191,14 +223,22 @@ static inline void *_player_vt_slot(void *self, size_t byte_off) {
 static int player_collect_channels(void **outChs, int outCap) {
     void *self = get_player_or_resolve();
     if (!self) return 0;
+    if (!ptr_plausible(self)) return 0;
+    if (!addr_readable((char *)self + ARC_PLAYER_CHANNELS_OFFSET, 16)) return 0;
     void *channels_base = *(void **)((char *)self + ARC_PLAYER_CHANNELS_OFFSET);
     void *channels_end  = *(void **)((char *)self + ARC_PLAYER_CHANNELS_OFFSET + 8);
+    if (!ptr_plausible(channels_base) || !ptr_plausible(channels_end)) return 0;
     if (!channels_base || !channels_end || channels_end < channels_base) return 0;
-    size_t n = ((size_t)((char *)channels_end - (char *)channels_base)) / ARC_CHANNEL_ENTRY_STRIDE;
+    size_t span = (size_t)((char *)channels_end - (char *)channels_base);
+    if (span > (size_t)ARC_CHANNEL_ENTRY_STRIDE * 256U) return 0;
+    if (!addr_readable(channels_base, span ? span : ARC_CHANNEL_ENTRY_STRIDE)) return 0;
+    size_t n = span / ARC_CHANNEL_ENTRY_STRIDE;
     if (n > (size_t)outCap) n = (size_t)outCap;
     int got = 0;
     for (size_t i = 0; i < n; i++) {
-        void *ch = *(void **)((char *)channels_base + ARC_CHANNEL_ENTRY_STRIDE * i + ARC_CHANNEL_ENTRY_PTR_OFF);
+        void *entry = (char *)channels_base + ARC_CHANNEL_ENTRY_STRIDE * i + ARC_CHANNEL_ENTRY_PTR_OFF;
+        if (!addr_readable(entry, sizeof(void *))) continue;
+        void *ch = *(void **)entry;
         if (ch) outChs[got++] = ch;
     }
     return got;
@@ -768,6 +808,12 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
     if (!base) return INT_MIN;
     uint64_t target = base + orig_fn_off;
     void **vt = (void **)vtable_addr;
+    if (!ptr_plausible(vt)) return INT_MIN;
+    if ((uintptr_t)vt < (uintptr_t)(4 * sizeof(void *))) return INT_MIN;
+    if (!addr_readable((void *)((uintptr_t)vt - 4 * sizeof(void *)), 68 * sizeof(void *))) {
+        acc_flog(@"swizzle: vtable unreadable @ %p", vt);
+        return INT_MIN;
+    }
     for (int i = -4; i < 64; i++) {
         void *cur = vt[i];
         if (!cur) continue;
@@ -846,9 +892,9 @@ static void try_install_channel_vtable_swizzle(void) {
     if (n <= 0) return;
     for (int i = 0; i < n; i++) {
         void *ch = chs[i];
-        if (!ch) continue;
+        if (!ch || !ptr_plausible(ch) || !addr_readable(ch, sizeof(void *))) continue;
         void **vt = *(void ***)ch;
-        if (!vt) continue;
+        if (!vt || !ptr_plausible(vt)) continue;
         int slot = swizzle_vtable_find_swap((uint64_t)vt, ARC_OFF_CH_GET_POSITION,
                                             (void *)tw_ch_getpos_vt,
                                             (void **)&s_orig_ch_getpos_vt);
