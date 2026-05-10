@@ -408,28 +408,9 @@ static void _gp_retime_logic_clock(void *logic) {
 // forward decl (defined after time_warp_install)
 static int32_t _read_chart_clock_ms(void *clk);
 
-// 音画漂移校正: 比较谱面时间与音频位置, 超过阈值则微调 clock[40]
-static void _gp_drift_correct(void *logic) {
-    if (!logic || !addr_readable((char *)logic + 56, sizeof(void *))) return;
-    void *clk = *(void **)((char *)logic + 48);
-    if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return;
-    uint32_t audio_ms = atomic_load(&g_last_pos_ms);
-    if (audio_ms < 100) return;
-    int32_t chart_ms = _read_chart_clock_ms(clk);
-    if (chart_ms < 0) return;
-    int32_t drift = chart_ms - (int32_t)audio_ms;
-    if (drift > 50 || drift < -50) {
-        int32_t correction = drift / 2;
-        if (correction == 0) correction = (drift > 0) ? 1 : -1;
-        int32_t *base_off = (int32_t *)((char *)clk + 40);
-        *base_off += correction;
-    }
-}
-
 // Gameplay.update vtable hook:
 //   1. 缓存 Gameplay 实例 (seek/reset 需要)
 //   2. _gp_retime_logic_clock 变速谱面
-//   3. _gp_drift_correct 校正音画漂移
 static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     atomic_fetch_add(&g_tw_gp_update_calls, 1);
     if (self) {
@@ -437,10 +418,8 @@ static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, u
         void *logic = NULL;
         if (addr_readable((char *)self + 936, sizeof(void *)))
             logic = *(void **)((char *)self + 928);
-        if (logic && ptr_plausible(logic)) {
+        if (logic && ptr_plausible(logic))
             _gp_retime_logic_clock(logic);
-            _gp_drift_correct(logic);
-        }
     }
     return s_orig_gp_update ? s_orig_gp_update(self, a2, a3, a4, a5) : 0;
 }
@@ -635,9 +614,31 @@ static void player_seek_ms(uint32_t ms) {
                          cur_ms, ms, delta, *base_off);
             }
 
-            // 3. 重置谱面事件状态: 重新激活所有音轨, 允许音符重新渲染
-            //    LogicChart+40 -> chart_data -> +80/+88 = tracks vector
-            //    每个 track 的 byte[0] = 1 表示活跃
+            // 3. 重置谱面事件状态:
+            //    a) 清空活跃音符列表 (+160/+168), 让空间索引下帧重新填充
+            //    b) 重新激活所有音轨 (chart_data+80 tracks byte[0])
+            //    c) 清空事件队列 (+288/+296)
+            //    d) 清除结束标志 (+313..+316)
+
+            // a) 清空活跃音符: release 每个引用, 然后截断列表
+            //    sub_100DB1A28 = release(refcount-1, destroy if 0)
+            typedef void (*release_fn)(void *);
+            uint64_t base = arc_image_base();
+            if (base && addr_readable((char *)logic + 168, 8)) {
+                void **notes_begin = *(void ***)((char *)logic + 160);
+                void **notes_end   = *(void ***)((char *)logic + 168);
+                if (notes_begin && notes_end && notes_end > notes_begin) {
+                    release_fn rel = (release_fn)(base + 0xDB1A28ULL);
+                    int n_notes = (int)(notes_end - notes_begin);
+                    for (int ni = 0; ni < n_notes; ni++) {
+                        if (notes_begin[ni]) rel(notes_begin[ni]);
+                    }
+                    *(void ***)((char *)logic + 168) = notes_begin; // truncate
+                    acc_flog(@"[seek] cleared %d active notes", n_notes);
+                }
+            }
+
+            // b) 重新激活所有音轨
             void *chart_data = *(void **)((char *)logic + 40);
             if (chart_data && ptr_plausible(chart_data) && addr_readable((char *)chart_data + 96, 8)) {
                 void **tracks_begin = *(void ***)((char *)chart_data + 80);
@@ -646,24 +647,28 @@ static void player_seek_ms(uint32_t ms) {
                     int n_reactivated = 0;
                     for (void **t = tracks_begin; t < tracks_end; t++) {
                         if (*t && ptr_plausible(*t) && addr_readable(*t, 8)) {
-                            if (*(uint8_t *)(*t) != 1) {
-                                *(uint8_t *)(*t) = 1;
-                                n_reactivated++;
-                            }
+                            *(uint8_t *)(*t) = 1;
+                            n_reactivated++;
                         }
                     }
                     acc_flog(@"[seek] reactivated %d tracks", n_reactivated);
                 }
             }
 
-            // 4. 清除 "已结束" 标志, 允许谱面继续处理
-            //    LogicChart + 312: chart active, +313: finished, +314..+320: misc flags
+            // c) 清空事件队列 (40-byte elements)
+            if (addr_readable((char *)logic + 296, 8)) {
+                void *ev_begin = *(void **)((char *)logic + 288);
+                if (ev_begin)
+                    *(void **)((char *)logic + 296) = ev_begin; // truncate
+            }
+
+            // d) 清除结束标志
             if (addr_readable((char *)logic + 321, 1)) {
-                *(uint8_t *)((char *)logic + 313) = 0;  // finished → 0
+                *(uint8_t *)((char *)logic + 313) = 0;
                 *(uint8_t *)((char *)logic + 314) = 0;
                 *(uint8_t *)((char *)logic + 315) = 0;
                 *(uint8_t *)((char *)logic + 316) = 0;
-                acc_flog(@"[seek] chart finished flags reset");
+                acc_flog(@"[seek] chart flags reset");
             }
         }
     }
