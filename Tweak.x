@@ -635,12 +635,15 @@ static uint64_t tw_dispatch_walltime(const struct timespec *when, int64_t delta)
 // slot +0x38 = sub_100CE197C (main tick), slot +0x40 = sub_100CE1A5C (active flag path)
 #define ARC_OFF_CC_TICK_FN   (0xCE197CULL)
 #define ARC_OFF_CC_ACTIVE_FN (0xCE1A5CULL)
+#define ARC_OFF_GP_VTABLE    (0x136E1C0ULL)
+#define ARC_OFF_GP_UPDATE_FN (0xB3AD70ULL)
 
 typedef uint64_t (*orig_pu_ms_fn)(void *self);
 // MTP::getPositionMs(this, channel) -> uint32_t (实际是 unsigned int 返回值)
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 typedef void *(*orig_cc_tick_fn)(void *self);
 typedef int64_t (*orig_cc_active_fn)(void *self, uint8_t active);
+typedef int64_t (*orig_gp_update_fn)(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 
 // 前向声明 (tw_mtp_getpos 在 _warp_ms_via_us 之前用到)
 static uint64_t _warp_ms_via_us(uint64_t raw_ms);
@@ -654,17 +657,23 @@ static orig_mtp_getpos_fn s_orig_mtp_getpos = NULL;
 static ch_get_position_fn s_orig_ch_getpos_vt = NULL;
 static orig_cc_tick_fn s_orig_cc_tick = NULL;
 static orig_cc_active_fn s_orig_cc_active = NULL;
+static orig_gp_update_fn s_orig_gp_update = NULL;
 static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
 static _Atomic(uint64_t) g_tw_ch_getpos_vt_calls = 0;
 static _Atomic(uint64_t) g_tw_cc_tick_calls = 0;
 static _Atomic(uint64_t) g_tw_cc_active_calls = 0;
+static _Atomic(uint64_t) g_tw_gp_update_calls = 0;
 static _Atomic(int) g_tw_en_mtp_getpos = 0;  // 默认 OFF：开了会让 chart 跟 audio 走 (但 audio 已 setFreq 同步，开这个会双倍 warp，慎用)
 static _Atomic(int) g_tw_en_ch_getpos_vt = 0;
 static _Atomic(int) g_tw_ch_getpos_vt_installed = 0;
 static _Atomic(int) g_tw_en_cc_tick = 0;
 static _Atomic(int) g_tw_en_cc_active = 0;
+static _Atomic(int) g_tw_en_gp_update = 1;
 static _Atomic(int) g_tw_cc_tick_installed = 0;
 static _Atomic(int) g_tw_cc_active_installed = 0;
+static _Atomic(int) g_tw_gp_update_installed = 0;
+static void *s_gp_last_clock = NULL;
+static uint64_t s_gp_last_real_us = 0;
 // MTP getPos 自动捕获 player 同时记录 caller — 帮我们识别"谁在每帧读音频位置"
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
@@ -718,6 +727,40 @@ static uint64_t _real_now_us_unwarped(void) {
     return 0;
 }
 
+// 逻辑链预调：通过移动 LogicClock.start_ms，让本帧逻辑时钟增量近似按 rate 缩放。
+static void _gp_retime_logic_clock(void *logic) {
+    if (!logic) return;
+    if (atomic_load(&g_tw_freeze_count) > 0) return;
+    if (!addr_readable((char *)logic + 56, sizeof(void *))) return;
+    void *clk = *(void **)((char *)logic + 48);
+    if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return;
+
+    uint64_t now_us = _real_now_us_unwarped();
+    if (!now_us) return;
+    if (clk != s_gp_last_clock || s_gp_last_real_us == 0 || now_us <= s_gp_last_real_us) {
+        s_gp_last_clock = clk;
+        s_gp_last_real_us = now_us;
+        return;
+    }
+
+    uint64_t delta_us = now_us - s_gp_last_real_us;
+    if (delta_us > 200000ULL) delta_us = 200000ULL;
+    s_gp_last_real_us = now_us;
+    int32_t delta_ms = (int32_t)(delta_us / 1000ULL);
+    if (delta_ms <= 0) return;
+
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) return;
+    int32_t adjust = (int32_t)(((1.0 - rate) * (double)delta_ms));
+    if (adjust == 0) return;
+
+    int32_t *start_ms = (int32_t *)((char *)clk + 16);
+    int64_t after = (int64_t)(*start_ms) + (int64_t)adjust;
+    if (after > INT_MAX) after = INT_MAX;
+    if (after < INT_MIN) after = INT_MIN;
+    *start_ms = (int32_t)after;
+}
+
 // 通过调整 CCDirector 单例里的 last timeval，让 sub_100CE0518 本帧算出的 delta 变为 delta*rate。
 static void _ccdirector_retime_prev_tv(void *self) {
     if (!self) return;
@@ -766,6 +809,9 @@ static void *tw_cc_tick(void *self) {
 
 static int64_t tw_cc_active(void *self, uint8_t active) {
     uint64_t cnt = atomic_fetch_add(&g_tw_cc_active_calls, 1);
+    if (atomic_load(&g_tw_en_cc_active) && active) {
+        _ccdirector_retime_prev_tv(self);
+    }
     if ((cnt & 0xFF) == 0) {
         void *ra = __builtin_return_address(0);
         uint64_t base = arc_image_base();
@@ -774,6 +820,27 @@ static int64_t tw_cc_active(void *self, uint8_t active) {
                  ra, (unsigned long long)off, (int)active, (unsigned long long)cnt);
     }
     return s_orig_cc_active ? s_orig_cc_active(self, active) : 0;
+}
+
+static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    uint64_t cnt = atomic_fetch_add(&g_tw_gp_update_calls, 1);
+    if (atomic_load(&g_tw_en_gp_update) && self) {
+        void *logic = NULL;
+        if (addr_readable((char *)self + 936, sizeof(void *))) {
+            logic = *(void **)((char *)self + 928);
+        }
+        if (logic && ptr_plausible(logic)) {
+            _gp_retime_logic_clock(logic);
+        }
+    }
+    if ((cnt & 0xFF) == 0) {
+        void *ra = __builtin_return_address(0);
+        uint64_t base = arc_image_base();
+        uint64_t off = (uint64_t)ra - base;
+        acc_flog(@"[diag] gp.update caller ra=%p (image+0x%llx) rate=%.3f cnt=%llu",
+                 ra, (unsigned long long)off, tw_get_rate(), (unsigned long long)cnt);
+    }
+    return s_orig_gp_update ? s_orig_gp_update(self, a2, a3, a4, a5) : 0;
 }
 
 // 各 wrapper:先调原函数拿 raw_ms,然后按 us 锚 warp 后返回 (PlatformUtils 都返回 ms)
@@ -893,6 +960,13 @@ static void install_vtable_swizzles(void) {
         // MTP::getPositionMs — 默认装上 hook (即使开关 OFF, 也能走计数 + caller 诊断)
         swizzle_vtable_find_swap(base + ARC_OFF_MTP_VTABLE, ARC_OFF_MTP_GETPOS,
                                  (void *)tw_mtp_getpos,      (void **)&s_orig_mtp_getpos);
+        int gp_slot = swizzle_vtable_find_swap(base + ARC_OFF_GP_VTABLE, ARC_OFF_GP_UPDATE_FN,
+                                               (void *)tw_gp_update,     (void **)&s_orig_gp_update);
+        if (gp_slot != INT_MIN && s_orig_gp_update) {
+            atomic_store(&g_tw_gp_update_installed, 1);
+            acc_flog(@"gp.update vtable installed vt=%p slot=%d orig=%p",
+                     (void *)(base + ARC_OFF_GP_VTABLE), gp_slot, (void *)s_orig_gp_update);
+        }
     });
 }
 
@@ -1101,12 +1175,13 @@ static int clock_hook_ready_for_idx(int idx) {
         case 15: return s_orig_pi_gtod != NULL;
         case 16: return s_orig_pi_mach != NULL;
         case 17: return s_orig_mtp_getpos != NULL;
-        case 18: return atomic_load(&g_tw_cc_tick_installed) && s_orig_cc_tick != NULL;
-        case 19: return atomic_load(&g_tw_cc_active_installed) && s_orig_cc_active != NULL;
-        case 20: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
-        case 21: return s_orig_dl_ts != NULL;
-        case 22: return s_orig_dl_target != NULL;
-        case 23: return s_orig_dl_dur != NULL;
+        case 18: return atomic_load(&g_tw_gp_update_installed) && s_orig_gp_update != NULL;
+        case 19: return atomic_load(&g_tw_cc_tick_installed) && s_orig_cc_tick != NULL;
+        case 20: return atomic_load(&g_tw_cc_active_installed) && s_orig_cc_active != NULL;
+        case 21: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
+        case 22: return s_orig_dl_ts != NULL;
+        case 23: return s_orig_dl_target != NULL;
+        case 24: return s_orig_dl_dur != NULL;
         default: return 0;
     }
 }
@@ -1537,6 +1612,7 @@ static void loadPref(void) {
         { "[vt]PlatformUtilsIOS.gtod_ms",      &g_tw_en_pi_gtod,        &g_tw_pi_gtod_calls       },
         { "[vt]PlatformUtilsIOS.mach_ms",      &g_tw_en_pi_mach,        &g_tw_pi_mach_calls       },
         { "[vt]MTP.getPositionMs",             &g_tw_en_mtp_getpos,     &g_tw_mtp_getpos_calls    },
+        { "[vt]Gameplay.update",               &g_tw_en_gp_update,      &g_tw_gp_update_calls     },
         { "[vt]CCDirector.tick",               &g_tw_en_cc_tick,        &g_tw_cc_tick_calls       },
         { "[vt]CCDirector.active",             &g_tw_en_cc_active,      &g_tw_cc_active_calls     },
         { "[vt]Channel.getPosition",           &g_tw_en_ch_getpos_vt,   &g_tw_ch_getpos_vt_calls  },
@@ -1678,6 +1754,7 @@ static void loadPref(void) {
         &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
         &g_tw_pu_rt_calls, &g_tw_pu_mono_calls, &g_tw_pi_gtod_calls, &g_tw_pi_mach_calls,
         &g_tw_mtp_getpos_calls,
+        &g_tw_gp_update_calls,
         &g_tw_cc_tick_calls, &g_tw_cc_active_calls,
         &g_tw_ch_getpos_vt_calls,
         &g_tw_dl_ts_calls, &g_tw_dl_target_calls, &g_tw_dl_dur_calls,
@@ -1709,6 +1786,7 @@ static void loadPref(void) {
         &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
         &g_tw_en_pu_rt, &g_tw_en_pu_mono, &g_tw_en_pi_gtod, &g_tw_en_pi_mach,
         &g_tw_en_mtp_getpos,
+        &g_tw_en_gp_update,
         &g_tw_en_cc_tick, &g_tw_en_cc_active,
         &g_tw_en_ch_getpos_vt,
         &g_tw_en_dl_ts, &g_tw_en_dl_target, &g_tw_en_dl_dur,
@@ -1721,6 +1799,7 @@ static void loadPref(void) {
         "time", "dispatch_time", "dispatch_walltime",
         "[vt]pu_rt", "[vt]pu_mono", "[vt]pi_gtod", "[vt]pi_mach",
         "[vt]MTP.getPos",
+        "[vt]GP.update",
         "[vt]CC.tick", "[vt]CC.active",
         "[vt]CH.getPos",
         "[obj]dl.ts", "[obj]dl.target", "[obj]dl.dur",
