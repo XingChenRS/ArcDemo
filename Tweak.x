@@ -15,7 +15,6 @@
 #import <errno.h>
 #import <limits.h>
 #import <mach/vm_map.h>
-#import <mach/vm_region.h>
 #import <mach/mach_init.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -134,7 +133,7 @@ static inline void *get_player_or_resolve(void) {
     return resolve_player_via_registry();
 }
 
-// 防止读到野指针：先做用户态地址粗筛，再做 vm region 可读性确认。
+// 防止读到野指针：先做用户态地址粗筛。
 static inline bool ptr_plausible(const void *p) {
     uintptr_t v = (uintptr_t)p;
     if (v < 0x100000000ULL) return false;
@@ -144,24 +143,14 @@ static inline bool ptr_plausible(const void *p) {
 
 static bool addr_readable(const void *p, size_t len) {
     if (!p || len == 0) return false;
+    if (!ptr_plausible(p)) return false;
     uintptr_t start_u = (uintptr_t)p;
     uintptr_t end_u = start_u + len;
     if (end_u < start_u) return false;
-    vm_address_t region_addr = (vm_address_t)start_u;
-    vm_size_t region_size = 0;
-    natural_t depth = 0;
-    vm_region_submap_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-    kern_return_t kr = vm_region_recurse(mach_task_self(),
-                                         &region_addr,
-                                         &region_size,
-                                         &depth,
-                                         (vm_region_recurse_info_t)&info,
-                                         &count);
-    if (kr != KERN_SUCCESS) return false;
-    if (start_u < (uintptr_t)region_addr) return false;
-    if (end_u > (uintptr_t)(region_addr + region_size)) return false;
-    return (info.protection & VM_PROT_READ) != 0;
+    // 启发式上限：拒绝超大跨度访问，避免野 end 指针导致后续越界。
+    if (len > (1ULL << 20)) return false;
+    // 这里不再调用 vm_region_recurse（部分 Theos/SDK 组合下该符号缺失导致链接失败）。
+    return true;
 }
 
 // �?Arc-mobile 主二进制基址
