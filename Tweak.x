@@ -63,6 +63,7 @@ static UIView        *menuView = nil;
 // 运行时地址 = arcaea_base + offset
 #define ARC_OFF_GET_POSITION_MS    (0x846950ULL)
 #define ARC_OFF_GET_REGISTRY       (0xC9D718ULL)
+#define ARC_OFF_CC_SINGLETON_GETTER (0xCDF358ULL)
 #define ARC_OFF_GET_CURRENT_SOUND  (0xEC094CULL)
 #define ARC_OFF_GET_SOUND_LENGTH   (0xF2BB64ULL)
 // 直接 FMOD Channel API，绕开 MTP 包装。
@@ -82,12 +83,14 @@ typedef int      (*get_sound_length_fn)(void *sound, uint32_t *outLen, int unit)
 typedef int      (*ch_get_position_fn)(void *channel, uint32_t *out_ms, int unit);
 typedef int      (*ch_set_frequency_fn)(void *channel, float hz);
 typedef int      (*ch_get_frequency_fn)(void *channel, float *out_hz);
+typedef void *   (*get_cc_singleton_fn)(void);
 static get_registry_fn      g_get_registry = NULL;
 static get_current_sound_fn g_get_current_sound = NULL;
 static get_sound_length_fn  g_get_sound_length = NULL;
 static ch_get_position_fn   g_ch_get_position = NULL;
 static ch_set_frequency_fn  g_ch_set_frequency = NULL;
 static ch_get_frequency_fn  g_ch_get_frequency = NULL;
+static get_cc_singleton_fn  g_get_cc_singleton = NULL;
 // 缓存每个 channel 的「初始基准频率」，第一次 setFrequency 前用 getFrequency 抓
 #define ARC_MAX_CHANNELS  (8)
 static _Atomic(float) g_base_freq[ARC_MAX_CHANNELS];   // 0 = 未捕获
@@ -162,13 +165,14 @@ static void install_arc_hooks(void) {
     // 其它线程跑该页时触发 EXC_BAD_ACCESS / Permission fault (Instruction Abort)。
     // 改为只读取函数指针，不修改函数实现。
     g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
+    g_get_cc_singleton = (get_cc_singleton_fn)(base + ARC_OFF_CC_SINGLETON_GETTER);
     g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
     g_get_sound_length  = (get_sound_length_fn) (base + ARC_OFF_GET_SOUND_LENGTH);
     g_ch_get_position   = (ch_get_position_fn) (base + ARC_OFF_CH_GET_POSITION);
     g_ch_set_frequency  = (ch_set_frequency_fn)(base + ARC_OFF_CH_SET_FREQUENCY);
     g_ch_get_frequency  = (ch_get_frequency_fn)(base + ARC_OFF_CH_GET_FREQUENCY);
-    NSLog(@"[AccDemoArcaea] registry=%p getCurrentSound=%p getLength=%p setFreq=%p",
-          (void *)g_get_registry, (void *)g_get_current_sound,
+        NSLog(@"[AccDemoArcaea] registry=%p ccGetter=%p getCurrentSound=%p getLength=%p setFreq=%p",
+            (void *)g_get_registry, (void *)g_get_cc_singleton, (void *)g_get_current_sound,
           (void *)g_get_sound_length, (void *)g_ch_set_frequency);
     void *mtp = resolve_player_via_registry();
     NSLog(@"[AccDemoArcaea] initial MTP via registry = %p", mtp);
@@ -574,10 +578,16 @@ static uint64_t tw_dispatch_walltime(const struct timespec *when, int64_t delta)
 // 这是"chart 是否读 audio 位置"的最直接探针：每帧若被调说明 chart 跟 audio 同步
 #define ARC_OFF_MTP_VTABLE  (0x1312860ULL)
 #define ARC_OFF_MTP_GETPOS  (0x846950ULL)
+// CCDirector singleton vtable slots called by CCDirectorCaller.doCaller
+// slot +0x38 = sub_100CE197C (main tick), slot +0x40 = sub_100CE1A5C (active flag path)
+#define ARC_OFF_CC_TICK_FN   (0xCE197CULL)
+#define ARC_OFF_CC_ACTIVE_FN (0xCE1A5CULL)
 
 typedef uint64_t (*orig_pu_ms_fn)(void *self);
 // MTP::getPositionMs(this, channel) -> uint32_t (实际是 unsigned int 返回值)
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
+typedef void *(*orig_cc_tick_fn)(void *self);
+typedef int64_t (*orig_cc_active_fn)(void *self, uint8_t active);
 
 // 前向声明 (tw_mtp_getpos 在 _warp_ms_via_us 之前用到)
 static uint64_t _warp_ms_via_us(uint64_t raw_ms);
@@ -589,11 +599,19 @@ static orig_pu_ms_fn s_orig_pi_gtod = NULL;
 static orig_pu_ms_fn s_orig_pi_mach = NULL;
 static orig_mtp_getpos_fn s_orig_mtp_getpos = NULL;
 static ch_get_position_fn s_orig_ch_getpos_vt = NULL;
+static orig_cc_tick_fn s_orig_cc_tick = NULL;
+static orig_cc_active_fn s_orig_cc_active = NULL;
 static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
 static _Atomic(uint64_t) g_tw_ch_getpos_vt_calls = 0;
+static _Atomic(uint64_t) g_tw_cc_tick_calls = 0;
+static _Atomic(uint64_t) g_tw_cc_active_calls = 0;
 static _Atomic(int) g_tw_en_mtp_getpos = 0;  // 默认 OFF：开了会让 chart 跟 audio 走 (但 audio 已 setFreq 同步，开这个会双倍 warp，慎用)
 static _Atomic(int) g_tw_en_ch_getpos_vt = 0;
 static _Atomic(int) g_tw_ch_getpos_vt_installed = 0;
+static _Atomic(int) g_tw_en_cc_tick = 0;
+static _Atomic(int) g_tw_en_cc_active = 0;
+static _Atomic(int) g_tw_cc_tick_installed = 0;
+static _Atomic(int) g_tw_cc_active_installed = 0;
 // MTP getPos 自动捕获 player 同时记录 caller — 帮我们识别"谁在每帧读音频位置"
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
@@ -635,6 +653,74 @@ static int tw_ch_getpos_vt(void *channel, uint32_t *out_ms, int unit) {
         *out_ms = (uint32_t)_warp_ms_via_us((uint64_t)(*out_ms));
     }
     return ret;
+}
+
+static uint64_t _real_now_us_unwarped(void) {
+    struct timeval tv = {0};
+    if (s_orig_gettod) {
+        if (s_orig_gettod(&tv, NULL) == 0) return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        return 0;
+    }
+    if (gettimeofday(&tv, NULL) == 0) return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+    return 0;
+}
+
+// 通过调整 CCDirector 单例里的 last timeval，让 sub_100CE0518 本帧算出的 delta 变为 delta*rate。
+static void _ccdirector_retime_prev_tv(void *self) {
+    if (!self) return;
+    struct timeval *prev = *(struct timeval **)((char *)self + 368);
+    if (!prev) return;
+    uint64_t now_us = _real_now_us_unwarped();
+    if (!now_us) return;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        prev->tv_sec = (time_t)(now_us / 1000000ULL);
+        prev->tv_usec = (suseconds_t)(now_us % 1000000ULL);
+        return;
+    }
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) return;
+    uint64_t prev_us = (uint64_t)prev->tv_sec * 1000000ULL + (uint64_t)prev->tv_usec;
+    if (!prev_us || now_us <= prev_us) {
+        prev->tv_sec = (time_t)(now_us / 1000000ULL);
+        prev->tv_usec = (suseconds_t)(now_us % 1000000ULL);
+        return;
+    }
+    uint64_t delta = now_us - prev_us;
+    if (delta > 200000ULL) delta = 200000ULL;
+    uint64_t scaled = (uint64_t)((double)delta * rate);
+    if (scaled > 500000ULL) scaled = 500000ULL;
+    uint64_t warped_prev = (now_us > scaled) ? (now_us - scaled) : 0;
+    prev->tv_sec = (time_t)(warped_prev / 1000000ULL);
+    prev->tv_usec = (suseconds_t)(warped_prev % 1000000ULL);
+}
+
+static void *tw_cc_tick(void *self) {
+    uint64_t cnt = atomic_fetch_add(&g_tw_cc_tick_calls, 1);
+    if (atomic_load(&g_tw_en_cc_tick)) {
+        _ccdirector_retime_prev_tv(self);
+    }
+    void *ret = s_orig_cc_tick ? s_orig_cc_tick(self) : self;
+    if ((cnt & 0xFF) == 0) {
+        void *ra = __builtin_return_address(0);
+        uint64_t base = arc_image_base();
+        uint64_t off = (uint64_t)ra - base;
+        float dt = self ? *(float *)((char *)self + 232) : 0.0f;
+        acc_flog(@"[diag] cc.tick caller ra=%p (image+0x%llx) dt=%.6f cnt=%llu",
+                 ra, (unsigned long long)off, dt, (unsigned long long)cnt);
+    }
+    return ret;
+}
+
+static int64_t tw_cc_active(void *self, uint8_t active) {
+    uint64_t cnt = atomic_fetch_add(&g_tw_cc_active_calls, 1);
+    if ((cnt & 0xFF) == 0) {
+        void *ra = __builtin_return_address(0);
+        uint64_t base = arc_image_base();
+        uint64_t off = (uint64_t)ra - base;
+        acc_flog(@"[diag] cc.active caller ra=%p (image+0x%llx) active=%d cnt=%llu",
+                 ra, (unsigned long long)off, (int)active, (unsigned long long)cnt);
+    }
+    return s_orig_cc_active ? s_orig_cc_active(self, active) : 0;
 }
 
 // 各 wrapper:先调原函数拿 raw_ms,然后按 us 锚 warp 后返回 (PlatformUtils 都返回 ms)
@@ -775,6 +861,32 @@ static void try_install_channel_vtable_swizzle(void) {
     }
 }
 
+static void try_install_ccdirector_vtable_swizzle(void) {
+    if (!g_get_cc_singleton) return;
+    void *cc = g_get_cc_singleton();
+    if (!cc) return;
+    void **vt = *(void ***)cc;
+    if (!vt) return;
+    if (!atomic_load(&g_tw_cc_tick_installed)) {
+        int slot = swizzle_vtable_find_swap((uint64_t)vt, ARC_OFF_CC_TICK_FN,
+                                            (void *)tw_cc_tick, (void **)&s_orig_cc_tick);
+        if (slot != INT_MIN && s_orig_cc_tick) {
+            atomic_store(&g_tw_cc_tick_installed, 1);
+            acc_flog(@"ccdirector vtable tick installed cc=%p vt=%p slot=%d orig=%p",
+                     cc, vt, slot, (void *)s_orig_cc_tick);
+        }
+    }
+    if (!atomic_load(&g_tw_cc_active_installed)) {
+        int slot = swizzle_vtable_find_swap((uint64_t)vt, ARC_OFF_CC_ACTIVE_FN,
+                                            (void *)tw_cc_active, (void **)&s_orig_cc_active);
+        if (slot != INT_MIN && s_orig_cc_active) {
+            atomic_store(&g_tw_cc_active_installed, 1);
+            acc_flog(@"ccdirector vtable active installed cc=%p vt=%p slot=%d orig=%p",
+                     cc, vt, slot, (void *)s_orig_cc_active);
+        }
+    }
+}
+
 // 自检:直接调原函数 (我们保存的 stripped ptr) + 调 vtable 上现在挂着的 wrapper,
 // 输出对比看 vtable swizzle 是否真的让调用走到我们这边。
 static void self_test_vtable(void) {
@@ -800,6 +912,16 @@ static void self_test_vtable(void) {
              atomic_load(&g_tw_ch_getpos_vt_calls),
              atomic_load(&g_tw_en_ch_getpos_vt),
              atomic_load(&g_tw_ch_getpos_vt_installed));
+    acc_flog(@"  CC  tick(vt):  orig_saved=%p  calls=%llu en=%d installed=%d",
+             (void *)s_orig_cc_tick,
+             atomic_load(&g_tw_cc_tick_calls),
+             atomic_load(&g_tw_en_cc_tick),
+             atomic_load(&g_tw_cc_tick_installed));
+    acc_flog(@"  CC  active(vt):orig_saved=%p  calls=%llu en=%d installed=%d",
+             (void *)s_orig_cc_active,
+             atomic_load(&g_tw_cc_active_calls),
+             atomic_load(&g_tw_en_cc_active),
+             atomic_load(&g_tw_cc_active_installed));
     // 直接读 vtable 当前内容,对比是否被替换
     void **pu = (void **)pu_vt;
     void **pi = (void **)pi_vt;
@@ -919,10 +1041,12 @@ static int clock_hook_ready_for_idx(int idx) {
         case 14: return s_orig_pi_gtod != NULL;
         case 15: return s_orig_pi_mach != NULL;
         case 16: return s_orig_mtp_getpos != NULL;
-        case 17: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
-        case 18: return s_orig_dl_ts != NULL;
-        case 19: return s_orig_dl_target != NULL;
-        case 20: return s_orig_dl_dur != NULL;
+        case 17: return atomic_load(&g_tw_cc_tick_installed) && s_orig_cc_tick != NULL;
+        case 18: return atomic_load(&g_tw_cc_active_installed) && s_orig_cc_active != NULL;
+        case 19: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
+        case 20: return s_orig_dl_ts != NULL;
+        case 21: return s_orig_dl_target != NULL;
+        case 22: return s_orig_dl_dur != NULL;
         default: return 0;
     }
 }
@@ -1350,6 +1474,8 @@ static void loadPref(void) {
         { "[vt]PlatformUtilsIOS.gtod_ms",      &g_tw_en_pi_gtod,        &g_tw_pi_gtod_calls       },
         { "[vt]PlatformUtilsIOS.mach_ms",      &g_tw_en_pi_mach,        &g_tw_pi_mach_calls       },
         { "[vt]MTP.getPositionMs",             &g_tw_en_mtp_getpos,     &g_tw_mtp_getpos_calls    },
+        { "[vt]CCDirector.tick",               &g_tw_en_cc_tick,        &g_tw_cc_tick_calls       },
+        { "[vt]CCDirector.active",             &g_tw_en_cc_active,      &g_tw_cc_active_calls     },
         { "[vt]Channel.getPosition",           &g_tw_en_ch_getpos_vt,   &g_tw_ch_getpos_vt_calls  },
         { "[obj]CADisplayLink.timestamp",       &g_tw_en_dl_ts,          &g_tw_dl_ts_calls         },
         { "[obj]CADisplayLink.targetTimestamp", &g_tw_en_dl_target,      &g_tw_dl_target_calls     },
@@ -1488,6 +1614,7 @@ static void loadPref(void) {
         &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
         &g_tw_pu_rt_calls, &g_tw_pu_mono_calls, &g_tw_pi_gtod_calls, &g_tw_pi_mach_calls,
         &g_tw_mtp_getpos_calls,
+        &g_tw_cc_tick_calls, &g_tw_cc_active_calls,
         &g_tw_ch_getpos_vt_calls,
         &g_tw_dl_ts_calls, &g_tw_dl_target_calls, &g_tw_dl_dur_calls,
     };
@@ -1517,6 +1644,7 @@ static void loadPref(void) {
         &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
         &g_tw_en_pu_rt, &g_tw_en_pu_mono, &g_tw_en_pi_gtod, &g_tw_en_pi_mach,
         &g_tw_en_mtp_getpos,
+        &g_tw_en_cc_tick, &g_tw_en_cc_active,
         &g_tw_en_ch_getpos_vt,
         &g_tw_en_dl_ts, &g_tw_en_dl_target, &g_tw_en_dl_dur,
     };
@@ -1527,6 +1655,7 @@ static void loadPref(void) {
         "time", "dispatch_time", "dispatch_walltime",
         "[vt]pu_rt", "[vt]pu_mono", "[vt]pi_gtod", "[vt]pi_mach",
         "[vt]MTP.getPos",
+        "[vt]CC.tick", "[vt]CC.active",
         "[vt]CH.getPos",
         "[obj]dl.ts", "[obj]dl.target", "[obj]dl.dur",
     };
@@ -1724,6 +1853,8 @@ static void doBootstrap(void) {
         // FMOD 频率，所以这里也要兜底重新 apply。
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             apply_speed_to_all_channels();
+            // CCDirector 单例就绪后安装主循环位点，命中后可直接控制本帧 deltaTime。
+            try_install_ccdirector_vtable_swizzle();
             // channel 出现后再做运行时 vtable 替换，覆盖 MTP->Channel 的真实读取路径。
             try_install_channel_vtable_swizzle();
             // 兜底捕获歌曲总时长（之前依赖 getPositionMs hook，现已删除）
@@ -1756,6 +1887,11 @@ static void doBootstrap(void) {
                          (unsigned long long)atomic_load(&g_tw_mtp_getpos_calls),
                          (unsigned long long)atomic_load(&g_tw_ch_getpos_vt_calls),
                          atomic_load(&g_tw_ch_getpos_vt_installed));
+                acc_flog(@"twcalls cc_tick=%llu cc_active=%llu cc_tick_installed=%d cc_active_installed=%d",
+                         (unsigned long long)atomic_load(&g_tw_cc_tick_calls),
+                         (unsigned long long)atomic_load(&g_tw_cc_active_calls),
+                         atomic_load(&g_tw_cc_tick_installed),
+                         atomic_load(&g_tw_cc_active_installed));
             }
             if (p) try_capture_song_length(p);
             // 兜底维护 last_pos_ms / max_seen_ms（用于进度条显示）
