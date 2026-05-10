@@ -588,8 +588,12 @@ static orig_pu_ms_fn s_orig_pu_mono = NULL;
 static orig_pu_ms_fn s_orig_pi_gtod = NULL;
 static orig_pu_ms_fn s_orig_pi_mach = NULL;
 static orig_mtp_getpos_fn s_orig_mtp_getpos = NULL;
+static ch_get_position_fn s_orig_ch_getpos_vt = NULL;
 static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
+static _Atomic(uint64_t) g_tw_ch_getpos_vt_calls = 0;
 static _Atomic(int) g_tw_en_mtp_getpos = 0;  // 默认 OFF：开了会让 chart 跟 audio 走 (但 audio 已 setFreq 同步，开这个会双倍 warp，慎用)
+static _Atomic(int) g_tw_en_ch_getpos_vt = 0;
+static _Atomic(int) g_tw_ch_getpos_vt_installed = 0;
 // MTP getPos 自动捕获 player 同时记录 caller — 帮我们识别"谁在每帧读音频位置"
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
@@ -609,6 +613,28 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
     if (!atomic_load(&g_tw_en_mtp_getpos)) return raw;
     // 开关启用时:把 raw_ms 当 "real us / 1000" 走 warp 锚
     return (uint32_t)_warp_ms_via_us((uint64_t)raw);
+}
+
+// Channel::getPosition(channel, out_ms, unit) 的 vtable 包装。
+// 这是 MTP.getPositionMs 最终落点，命中它意味着我们确实拦到了音频位置读取。
+static int tw_ch_getpos_vt(void *channel, uint32_t *out_ms, int unit) {
+    int ret = s_orig_ch_getpos_vt ? s_orig_ch_getpos_vt(channel, out_ms, unit) : 0;
+    uint64_t cnt = atomic_fetch_add(&g_tw_ch_getpos_vt_calls, 1);
+    if ((cnt & 0xFF) == 0) {
+        void *ra = __builtin_return_address(0);
+        uint64_t base = arc_image_base();
+        uint64_t off = (uint64_t)ra - base;
+        acc_flog(@"[diag] ch.getPos caller ra=%p (image+0x%llx) unit=%d ret=%d ms=%u cnt=%llu",
+                 ra, (unsigned long long)off, unit, ret,
+                 out_ms ? *out_ms : 0,
+                 (unsigned long long)cnt);
+    }
+    if (ret != 0 || !out_ms || !atomic_load(&g_tw_en_ch_getpos_vt)) return ret;
+    // getPositionMs 传 unit=1，out_ms 是毫秒；只对毫秒路径做 warp。
+    if (unit & 1) {
+        *out_ms = (uint32_t)_warp_ms_via_us((uint64_t)(*out_ms));
+    }
+    return ret;
 }
 
 // 各 wrapper:先调原函数拿 raw_ms,然后按 us 锚 warp 后返回 (PlatformUtils 都返回 ms)
@@ -725,6 +751,30 @@ static void install_vtable_swizzles(void) {
     });
 }
 
+// 运行时从真实 channel 实例读取 vtable 并替换 Channel::getPosition。
+// 不能用静态偏移，因为具体 vtable 地址可能受构建/链接布局影响。
+static void try_install_channel_vtable_swizzle(void) {
+    if (atomic_load(&g_tw_ch_getpos_vt_installed)) return;
+    void *chs[ARC_MAX_CHANNELS] = {0};
+    int n = player_collect_channels(chs, ARC_MAX_CHANNELS);
+    if (n <= 0) return;
+    for (int i = 0; i < n; i++) {
+        void *ch = chs[i];
+        if (!ch) continue;
+        void **vt = *(void ***)ch;
+        if (!vt) continue;
+        int slot = swizzle_vtable_find_swap((uint64_t)vt, ARC_OFF_CH_GET_POSITION,
+                                            (void *)tw_ch_getpos_vt,
+                                            (void **)&s_orig_ch_getpos_vt);
+        if (slot != INT_MIN && s_orig_ch_getpos_vt) {
+            atomic_store(&g_tw_ch_getpos_vt_installed, 1);
+            acc_flog(@"channel vtable swizzle installed on ch[%d]=%p vt=%p slot=%d orig=%p",
+                     i, ch, vt, slot, (void *)s_orig_ch_getpos_vt);
+            return;
+        }
+    }
+}
+
 // 自检:直接调原函数 (我们保存的 stripped ptr) + 调 vtable 上现在挂着的 wrapper,
 // 输出对比看 vtable swizzle 是否真的让调用走到我们这边。
 static void self_test_vtable(void) {
@@ -745,6 +795,11 @@ static void self_test_vtable(void) {
     acc_flog(@"  PI  mach: orig_saved=%p  pi_mach_calls=%llu en=%d",
              (void *)s_orig_pi_mach, atomic_load(&g_tw_pi_mach_calls),
              atomic_load(&g_tw_en_pi_mach));
+    acc_flog(@"  CH  getPos(vt): orig_saved=%p  calls=%llu en=%d installed=%d",
+             (void *)s_orig_ch_getpos_vt,
+             atomic_load(&g_tw_ch_getpos_vt_calls),
+             atomic_load(&g_tw_en_ch_getpos_vt),
+             atomic_load(&g_tw_ch_getpos_vt_installed));
     // 直接读 vtable 当前内容,对比是否被替换
     void **pu = (void **)pu_vt;
     void **pi = (void **)pi_vt;
@@ -1267,6 +1322,7 @@ static void loadPref(void) {
         { "[vt]PlatformUtilsIOS.gtod_ms",      &g_tw_en_pi_gtod,        &g_tw_pi_gtod_calls       },
         { "[vt]PlatformUtilsIOS.mach_ms",      &g_tw_en_pi_mach,        &g_tw_pi_mach_calls       },
         { "[vt]MTP.getPositionMs",             &g_tw_en_mtp_getpos,     &g_tw_mtp_getpos_calls    },
+        { "[vt]Channel.getPosition",           &g_tw_en_ch_getpos_vt,   &g_tw_ch_getpos_vt_calls  },
         { "[obj]CADisplayLink.timestamp",       &g_tw_en_dl_ts,          &g_tw_dl_ts_calls         },
         { "[obj]CADisplayLink.targetTimestamp", &g_tw_en_dl_target,      &g_tw_dl_target_calls     },
         { "[obj]CADisplayLink.duration",        &g_tw_en_dl_dur,         &g_tw_dl_dur_calls        },
@@ -1404,6 +1460,7 @@ static void loadPref(void) {
         &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
         &g_tw_pu_rt_calls, &g_tw_pu_mono_calls, &g_tw_pi_gtod_calls, &g_tw_pi_mach_calls,
         &g_tw_mtp_getpos_calls,
+        &g_tw_ch_getpos_vt_calls,
         &g_tw_dl_ts_calls, &g_tw_dl_target_calls, &g_tw_dl_dur_calls,
     };
     int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
@@ -1432,6 +1489,7 @@ static void loadPref(void) {
         &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
         &g_tw_en_pu_rt, &g_tw_en_pu_mono, &g_tw_en_pi_gtod, &g_tw_en_pi_mach,
         &g_tw_en_mtp_getpos,
+        &g_tw_en_ch_getpos_vt,
         &g_tw_en_dl_ts, &g_tw_en_dl_target, &g_tw_en_dl_dur,
     };
     const char *names[] = {
@@ -1441,6 +1499,7 @@ static void loadPref(void) {
         "time", "dispatch_time", "dispatch_walltime",
         "[vt]pu_rt", "[vt]pu_mono", "[vt]pi_gtod", "[vt]pi_mach",
         "[vt]MTP.getPos",
+        "[vt]CH.getPos",
         "[obj]dl.ts", "[obj]dl.target", "[obj]dl.dur",
     };
     int n = (int)(sizeof(flags) / sizeof(flags[0]));
@@ -1627,6 +1686,8 @@ static void doBootstrap(void) {
         // FMOD 频率，所以这里也要兜底重新 apply。
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             apply_speed_to_all_channels();
+            // channel 出现后再做运行时 vtable 替换，覆盖 MTP->Channel 的真实读取路径。
+            try_install_channel_vtable_swizzle();
             // 兜底捕获歌曲总时长（之前依赖 getPositionMs hook，现已删除）
             void *p = get_player_or_resolve();
             // 切歌检测：player 指针没变但 channels 数组首地址变了 → 新一轮，清空缓存
@@ -1653,6 +1714,10 @@ static void doBootstrap(void) {
                          (unsigned long long)atomic_load(&g_tw_cgt_nsec_calls),
                          tw_get_rate(),
                          atomic_load(&g_tw_freeze_count));
+                acc_flog(@"twcalls mtp=%llu ch_vt=%llu ch_vt_installed=%d",
+                         (unsigned long long)atomic_load(&g_tw_mtp_getpos_calls),
+                         (unsigned long long)atomic_load(&g_tw_ch_getpos_vt_calls),
+                         atomic_load(&g_tw_ch_getpos_vt_installed));
             }
             if (p) try_capture_song_length(p);
             // 兜底维护 last_pos_ms / max_seen_ms（用于进度条显示）
