@@ -271,6 +271,7 @@ typedef uint64_t (*orig_mach_abs_t)(void);
 typedef int      (*orig_gettod_t)(struct timeval *tv, void *tz);
 typedef int      (*orig_clock_gettime_t)(clockid_t clk, struct timespec *tp);
 typedef uint64_t (*orig_clock_gettime_nsec_np_t)(clockid_t clk);
+typedef int64_t  (*orig_steady_now_t)(void);
 typedef uint64_t (*orig_mach_cont_t)(void);
 typedef uint64_t (*orig_mach_appx_t)(void);
 typedef double   (*orig_ca_cmt_t)(void);
@@ -282,6 +283,7 @@ static orig_mach_abs_t              s_orig_mach_abs = NULL;
 static orig_gettod_t                s_orig_gettod   = NULL;
 static orig_clock_gettime_t         s_orig_clock_gettime = NULL;
 static orig_clock_gettime_nsec_np_t s_orig_clock_gettime_nsec_np = NULL;
+static orig_steady_now_t            s_orig_steady_now = NULL;
 static orig_mach_cont_t             s_orig_mach_cont = NULL;
 static orig_mach_appx_t             s_orig_mach_appx = NULL;
 static orig_mach_cont_t             s_orig_mach_cont_appx = NULL;
@@ -308,6 +310,7 @@ static _Atomic(uint64_t) g_tw_mach_calls = 0;
 static _Atomic(uint64_t) g_tw_gtod_calls = 0;
 static _Atomic(uint64_t) g_tw_cgt_calls  = 0;
 static _Atomic(uint64_t) g_tw_cgt_nsec_calls = 0;
+static _Atomic(uint64_t) g_tw_steady_now_calls = 0;
 static _Atomic(uint64_t) g_tw_mach_cont_calls = 0;
 static _Atomic(uint64_t) g_tw_mach_appx_calls = 0;
 static _Atomic(uint64_t) g_tw_mach_cont_appx_calls = 0;
@@ -329,6 +332,7 @@ static _Atomic(int) g_tw_en_mach          = 1;
 static _Atomic(int) g_tw_en_gtod          = 1;
 static _Atomic(int) g_tw_en_cgt           = 1;
 static _Atomic(int) g_tw_en_cgt_nsec      = 0; // 默认 OFF：会影响 FMOD profiler，先别碰
+static _Atomic(int) g_tw_en_steady_now    = 1; // 关键：LogicChart 时基使用 steady_clock::now
 static _Atomic(int) g_tw_en_mach_cont     = 1;
 static _Atomic(int) g_tw_en_mach_appx     = 1;
 static _Atomic(int) g_tw_en_mach_cont_appx= 1;
@@ -450,6 +454,27 @@ static uint64_t tw_clock_gettime_nsec_np(clockid_t clk) {
     }
     if (warp_us == real_us) return real_ns;
     return warp_us * 1000ULL + (real_ns % 1000ULL);
+}
+
+// std::chrono::steady_clock::now(): 返回 steady ns。
+// Arcaea 的 LogicClock 更新链会调用该符号（A5D2D0 -> steady_clock::now / 1e6）。
+static int64_t tw_steady_clock_now(void) {
+    int64_t real_ns_s = s_orig_steady_now ? s_orig_steady_now() : 0;
+    atomic_fetch_add(&g_tw_steady_now_calls, 1);
+    if (real_ns_s <= 0) return real_ns_s;
+    if (!atomic_load(&g_tw_en_steady_now)) return real_ns_s;
+
+    uint64_t real_ns = (uint64_t)real_ns_s;
+    uint64_t real_us = real_ns / 1000ULL;
+    uint64_t warp_us;
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        warp_us = f ? f : real_us;
+    } else {
+        warp_us = _compute_warp_us(real_us);
+    }
+    if (warp_us == real_us) return real_ns_s;
+    return (int64_t)(warp_us * 1000ULL + (real_ns % 1000ULL));
 }
 
 // mach_continuous_time: 含睡眠的单调时钟。音游可能用它当主时钟。
@@ -1062,25 +1087,26 @@ static int clock_hook_ready_for_idx(int idx) {
         case 1:  return s_orig_gettod != NULL;
         case 2:  return s_orig_clock_gettime != NULL;
         case 3:  return s_orig_clock_gettime_nsec_np != NULL;
-        case 4:  return s_orig_mach_cont != NULL;
-        case 5:  return s_orig_mach_appx != NULL;
-        case 6:  return s_orig_mach_cont_appx != NULL;
-        case 7:  return s_orig_ca_cmt != NULL;
-        case 8:  return s_orig_cf_abs != NULL;
-        case 9:  return s_orig_time != NULL;
-        case 10: return s_orig_dispatch_time != NULL;
-        case 11: return s_orig_dispatch_walltime != NULL;
-        case 12: return s_orig_pu_rt != NULL;
-        case 13: return s_orig_pu_mono != NULL;
-        case 14: return s_orig_pi_gtod != NULL;
-        case 15: return s_orig_pi_mach != NULL;
-        case 16: return s_orig_mtp_getpos != NULL;
-        case 17: return atomic_load(&g_tw_cc_tick_installed) && s_orig_cc_tick != NULL;
-        case 18: return atomic_load(&g_tw_cc_active_installed) && s_orig_cc_active != NULL;
-        case 19: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
-        case 20: return s_orig_dl_ts != NULL;
-        case 21: return s_orig_dl_target != NULL;
-        case 22: return s_orig_dl_dur != NULL;
+        case 4:  return s_orig_steady_now != NULL;
+        case 5:  return s_orig_mach_cont != NULL;
+        case 6:  return s_orig_mach_appx != NULL;
+        case 7:  return s_orig_mach_cont_appx != NULL;
+        case 8:  return s_orig_ca_cmt != NULL;
+        case 9:  return s_orig_cf_abs != NULL;
+        case 10: return s_orig_time != NULL;
+        case 11: return s_orig_dispatch_time != NULL;
+        case 12: return s_orig_dispatch_walltime != NULL;
+        case 13: return s_orig_pu_rt != NULL;
+        case 14: return s_orig_pu_mono != NULL;
+        case 15: return s_orig_pi_gtod != NULL;
+        case 16: return s_orig_pi_mach != NULL;
+        case 17: return s_orig_mtp_getpos != NULL;
+        case 18: return atomic_load(&g_tw_cc_tick_installed) && s_orig_cc_tick != NULL;
+        case 19: return atomic_load(&g_tw_cc_active_installed) && s_orig_cc_active != NULL;
+        case 20: return atomic_load(&g_tw_ch_getpos_vt_installed) && s_orig_ch_getpos_vt != NULL;
+        case 21: return s_orig_dl_ts != NULL;
+        case 22: return s_orig_dl_target != NULL;
+        case 23: return s_orig_dl_dur != NULL;
         default: return 0;
     }
 }
@@ -1152,11 +1178,12 @@ static void time_warp_set_rate(double rate) {
 static void time_warp_install(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        struct rebinding rs[12] = {
+        struct rebinding rs[13] = {
             { "mach_absolute_time",                (void *)tw_mach_absolute_time,                (void **)&s_orig_mach_abs },
             { "gettimeofday",                      (void *)tw_gettimeofday,                      (void **)&s_orig_gettod   },
             { "clock_gettime",                     (void *)tw_clock_gettime,                     (void **)&s_orig_clock_gettime },
             { "clock_gettime_nsec_np",             (void *)tw_clock_gettime_nsec_np,             (void **)&s_orig_clock_gettime_nsec_np },
+            { "__ZNSt3__16chrono12steady_clock3nowEv", (void *)tw_steady_clock_now,              (void **)&s_orig_steady_now },
             { "mach_continuous_time",              (void *)tw_mach_continuous_time,              (void **)&s_orig_mach_cont },
             { "mach_approximate_time",             (void *)tw_mach_approximate_time,             (void **)&s_orig_mach_appx },
             { "mach_continuous_approximate_time",  (void *)tw_mach_continuous_approximate_time,  (void **)&s_orig_mach_cont_appx },
@@ -1166,12 +1193,13 @@ static void time_warp_install(void) {
             { "dispatch_time",                     (void *)tw_dispatch_time,                     (void **)&s_orig_dispatch_time },
             { "dispatch_walltime",                 (void *)tw_dispatch_walltime,                 (void **)&s_orig_dispatch_walltime },
         };
-        int r = rebind_symbols(rs, 12);
+        int r = rebind_symbols(rs, 13);
         ensure_timebase();
-        acc_flog(@"fishhook ret=%d mach=%p gtod=%p cgt=%p cgt_ns=%p mcont=%p mappx=%p mcappx=%p ca_cmt=%p cf_abs=%p time=%p dt=%p dwt=%p tb=%u/%u",
+        acc_flog(@"fishhook ret=%d mach=%p gtod=%p cgt=%p cgt_ns=%p steady_now=%p mcont=%p mappx=%p mcappx=%p ca_cmt=%p cf_abs=%p time=%p dt=%p dwt=%p tb=%u/%u",
                  r,
                  (void *)s_orig_mach_abs, (void *)s_orig_gettod,
                  (void *)s_orig_clock_gettime, (void *)s_orig_clock_gettime_nsec_np,
+                 (void *)s_orig_steady_now,
                  (void *)s_orig_mach_cont, (void *)s_orig_mach_appx,
                  (void *)s_orig_mach_cont_appx, (void *)s_orig_ca_cmt, (void *)s_orig_cf_abs,
                  (void *)s_orig_time, (void *)s_orig_dispatch_time, (void *)s_orig_dispatch_walltime,
@@ -1495,6 +1523,7 @@ static void loadPref(void) {
         { "gettimeofday",                      &g_tw_en_gtod,           &g_tw_gtod_calls          },
         { "clock_gettime",                     &g_tw_en_cgt,            &g_tw_cgt_calls           },
         { "clock_gettime_nsec_np",             &g_tw_en_cgt_nsec,       &g_tw_cgt_nsec_calls      },
+        { "steady_clock::now",                 &g_tw_en_steady_now,     &g_tw_steady_now_calls    },
         { "mach_continuous_time",              &g_tw_en_mach_cont,      &g_tw_mach_cont_calls     },
         { "mach_approximate_time",             &g_tw_en_mach_appx,      &g_tw_mach_appx_calls     },
         { "mach_continuous_approximate_time",  &g_tw_en_mach_cont_appx, &g_tw_mach_cont_appx_calls},
@@ -1643,6 +1672,7 @@ static void loadPref(void) {
     // 刷新时钟通道计数 label
     _Atomic(uint64_t) *cnts[] = {
         &g_tw_mach_calls, &g_tw_gtod_calls, &g_tw_cgt_calls, &g_tw_cgt_nsec_calls,
+        &g_tw_steady_now_calls,
         &g_tw_mach_cont_calls, &g_tw_mach_appx_calls, &g_tw_mach_cont_appx_calls,
         &g_tw_ca_cmt_calls, &g_tw_cf_abs_calls,
         &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
@@ -1673,6 +1703,7 @@ static void loadPref(void) {
     int idx = (int)(sw.tag - 3100);
     _Atomic(int) *flags[] = {
         &g_tw_en_mach, &g_tw_en_gtod, &g_tw_en_cgt, &g_tw_en_cgt_nsec,
+        &g_tw_en_steady_now,
         &g_tw_en_mach_cont, &g_tw_en_mach_appx, &g_tw_en_mach_cont_appx,
         &g_tw_en_ca_cmt, &g_tw_en_cf_abs,
         &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
@@ -1684,6 +1715,7 @@ static void loadPref(void) {
     };
     const char *names[] = {
         "mach_abs", "gtod", "cgt", "cgt_nsec",
+        "steady_now",
         "mach_cont", "mach_appx", "mach_cont_appx",
         "ca_cmt", "cf_abs",
         "time", "dispatch_time", "dispatch_walltime",
