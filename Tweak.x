@@ -17,6 +17,8 @@
 #import <mach/vm_map.h>
 #import <mach/mach_init.h>
 #import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 #if __has_include(<ptrauth.h>)
 #  import <ptrauth.h>
 #endif
@@ -577,6 +579,9 @@ typedef uint64_t (*orig_pu_ms_fn)(void *self);
 // MTP::getPositionMs(this, channel) -> uint32_t (实际是 unsigned int 返回值)
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 
+// 前向声明 (tw_mtp_getpos 在 _warp_ms_via_us 之前用到)
+static uint64_t _warp_ms_via_us(uint64_t raw_ms);
+
 // 保存的原始 fn ptr (PAC 已 strip,可直接调用)
 static orig_pu_ms_fn s_orig_pu_rt   = NULL;
 static orig_pu_ms_fn s_orig_pu_mono = NULL;
@@ -756,6 +761,87 @@ static void self_test_vtable(void) {
             acc_flog(@"  PU mono(NULL) EX: %@", e);
         }
     }
+}
+
+#pragma mark - CADisplayLink ObjC swizzle (盲区补充)
+//
+// fishhook 拦不到 QuartzCore.framework 内部用 commpage 拿 host time。
+// 但 CADisplayLink 把这个 host time 通过 -[CADisplayLink timestamp] / -targetTimestamp / -duration
+// 暴露给业务代码 (NSNumber double, 单位秒)。
+// → swizzle 这三个 ObjC accessor, 让 *任何* caller (包括 QuartzCore 自己 selector dispatch
+//   到业务回调里) 拿到的都是 warp 时间, 等价于在调度链路最末端做注入。
+//
+// 注意:
+// 1. 这只影响"读 displayLink.timestamp 的代码", 不影响 displayLink 自己的 firing rate。
+// 2. 计数器分别为 dl_ts / dl_target / dl_dur, 默认全 OFF。
+// 3. CADisplayLink.timestamp 是 CFTimeInterval (= double 秒)。我们按 _compute_warp_us 锚算。
+
+static _Atomic(uint64_t) g_tw_dl_ts_calls     = 0;
+static _Atomic(uint64_t) g_tw_dl_target_calls = 0;
+static _Atomic(uint64_t) g_tw_dl_dur_calls    = 0;
+static _Atomic(int) g_tw_en_dl_ts     = 0;
+static _Atomic(int) g_tw_en_dl_target = 0;
+static _Atomic(int) g_tw_en_dl_dur    = 0;
+
+typedef CFTimeInterval (*dl_getter_imp)(id, SEL);
+static dl_getter_imp s_orig_dl_ts     = NULL;
+static dl_getter_imp s_orig_dl_target = NULL;
+static dl_getter_imp s_orig_dl_dur    = NULL;
+
+// 把"秒"按 us 锚 warp,返回新的"秒"
+static CFTimeInterval _warp_seconds(CFTimeInterval real_sec) {
+    if (real_sec <= 0.0) return real_sec;
+    uint64_t real_us = (uint64_t)(real_sec * 1000000.0);
+    if (atomic_load(&g_tw_freeze_count) > 0) {
+        uint64_t f = atomic_load(&g_tw_frozen_us);
+        if (f) return (CFTimeInterval)f / 1000000.0;
+        return real_sec;
+    }
+    uint64_t warp_us = _compute_warp_us(real_us);
+    return (CFTimeInterval)warp_us / 1000000.0;
+}
+
+static CFTimeInterval tw_dl_timestamp(id self, SEL _cmd) {
+    CFTimeInterval raw = s_orig_dl_ts ? s_orig_dl_ts(self, _cmd) : 0.0;
+    atomic_fetch_add(&g_tw_dl_ts_calls, 1);
+    if (!atomic_load(&g_tw_en_dl_ts)) return raw;
+    return _warp_seconds(raw);
+}
+static CFTimeInterval tw_dl_targetTimestamp(id self, SEL _cmd) {
+    CFTimeInterval raw = s_orig_dl_target ? s_orig_dl_target(self, _cmd) : 0.0;
+    atomic_fetch_add(&g_tw_dl_target_calls, 1);
+    if (!atomic_load(&g_tw_en_dl_target)) return raw;
+    return _warp_seconds(raw);
+}
+static CFTimeInterval tw_dl_duration(id self, SEL _cmd) {
+    CFTimeInterval raw = s_orig_dl_dur ? s_orig_dl_dur(self, _cmd) : 0.0;
+    atomic_fetch_add(&g_tw_dl_dur_calls, 1);
+    if (!atomic_load(&g_tw_en_dl_dur)) return raw;
+    // duration 是帧间隔, 不是绝对时间;按 rate 缩放
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) return raw;
+    return raw * rate;
+}
+
+static void install_displaylink_swizzles(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("CADisplayLink");
+        if (!cls) { acc_flog(@"displaylink swizzle: CADisplayLink class missing"); return; }
+        struct { SEL sel; IMP new_imp; IMP *out_orig; const char *name; } items[] = {
+            { @selector(timestamp),       (IMP)tw_dl_timestamp,        (IMP *)&s_orig_dl_ts,     "timestamp"       },
+            { @selector(targetTimestamp), (IMP)tw_dl_targetTimestamp,  (IMP *)&s_orig_dl_target, "targetTimestamp" },
+            { @selector(duration),        (IMP)tw_dl_duration,         (IMP *)&s_orig_dl_dur,    "duration"        },
+        };
+        for (int i = 0; i < (int)(sizeof(items)/sizeof(items[0])); i++) {
+            Method m = class_getInstanceMethod(cls, items[i].sel);
+            if (!m) { acc_flog(@"displaylink swizzle: %s method missing", items[i].name); continue; }
+            IMP old = method_setImplementation(m, items[i].new_imp);
+            *items[i].out_orig = old;
+            acc_flog(@"displaylink swizzle OK: -[CADisplayLink %s] orig=%p -> new=%p",
+                     items[i].name, (void *)old, (void *)items[i].new_imp);
+        }
+    });
 }
 
 // 增加冻结计数（用户暂停 / 切后台 / seek 期间皆可调用）
@@ -1181,6 +1267,9 @@ static void loadPref(void) {
         { "[vt]PlatformUtilsIOS.gtod_ms",      &g_tw_en_pi_gtod,        &g_tw_pi_gtod_calls       },
         { "[vt]PlatformUtilsIOS.mach_ms",      &g_tw_en_pi_mach,        &g_tw_pi_mach_calls       },
         { "[vt]MTP.getPositionMs",             &g_tw_en_mtp_getpos,     &g_tw_mtp_getpos_calls    },
+        { "[obj]CADisplayLink.timestamp",       &g_tw_en_dl_ts,          &g_tw_dl_ts_calls         },
+        { "[obj]CADisplayLink.targetTimestamp", &g_tw_en_dl_target,      &g_tw_dl_target_calls     },
+        { "[obj]CADisplayLink.duration",        &g_tw_en_dl_dur,         &g_tw_dl_dur_calls        },
     };
     int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
     for (int i = 0; i < nClocks; i++) {
@@ -1315,6 +1404,7 @@ static void loadPref(void) {
         &g_tw_time_calls, &g_tw_dt_calls, &g_tw_dwt_calls,
         &g_tw_pu_rt_calls, &g_tw_pu_mono_calls, &g_tw_pi_gtod_calls, &g_tw_pi_mach_calls,
         &g_tw_mtp_getpos_calls,
+        &g_tw_dl_ts_calls, &g_tw_dl_target_calls, &g_tw_dl_dur_calls,
     };
     int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
     for (int i = 0; i < n; i++) {
@@ -1342,6 +1432,7 @@ static void loadPref(void) {
         &g_tw_en_time, &g_tw_en_dt, &g_tw_en_dwt,
         &g_tw_en_pu_rt, &g_tw_en_pu_mono, &g_tw_en_pi_gtod, &g_tw_en_pi_mach,
         &g_tw_en_mtp_getpos,
+        &g_tw_en_dl_ts, &g_tw_en_dl_target, &g_tw_en_dl_dur,
     };
     const char *names[] = {
         "mach_abs", "gtod", "cgt", "cgt_nsec",
@@ -1350,6 +1441,7 @@ static void loadPref(void) {
         "time", "dispatch_time", "dispatch_walltime",
         "[vt]pu_rt", "[vt]pu_mono", "[vt]pi_gtod", "[vt]pi_mach",
         "[vt]MTP.getPos",
+        "[obj]dl.ts", "[obj]dl.target", "[obj]dl.dur",
     };
     int n = (int)(sizeof(flags) / sizeof(flags[0]));
     if (idx < 0 || idx >= n) return;
@@ -1529,6 +1621,7 @@ static void doBootstrap(void) {
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
         @try { time_warp_install(); } @catch (NSException *e) { acc_flog(@"time_warp_install EX: %@", e); }
         @try { install_vtable_swizzles(); } @catch (NSException *e) { acc_flog(@"install_vtable_swizzles EX: %@", e); }
+        @try { install_displaylink_swizzles(); } @catch (NSException *e) { acc_flog(@"install_displaylink_swizzles EX: %@", e); }
         // 后台轮询：不断给 channel 应用当前倍率（安全：setFrequency 是 FMOD 公开 API，不写 text）
         // 第一次进歌曲时会自动捕获 base_freq；之后每次倍率切换由 UI 触发，但 seek/重启歌曲会重置
         // FMOD 频率，所以这里也要兜底重新 apply。
