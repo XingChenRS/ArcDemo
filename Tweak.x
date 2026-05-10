@@ -614,16 +614,53 @@ static void player_seek_ms(uint32_t ms) {
                          cur_ms, ms, delta, *base_off);
             }
 
-            // 3. 重置谱面事件状态:
-            //    a) 清空活跃音符列表 (+160/+168), 让空间索引下帧重新填充
-            //    b) 重新激活所有音轨 (chart_data+80 tracks byte[0])
-            //    c) 清空事件队列 (+288/+296)
-            //    d) 清除结束标志 (+313..+316)
+            // 3. 重置谱面状态, 让所有音符可以重新出现:
+            //
+            //    关键发现 (IDA 逆向):
+            //    - LogicTapNote::isCompleted() (vtable+40) 检查 byte[13] 和 byte[12]
+            //    - byte[13] = 判定标志 (sub_10014172C: return *(a1+13))
+            //    - byte[12] = 命中标志 (sub_100118A80: return *(a1+12))
+            //    - 一旦 isCompleted()=1, sub_10086EE70 的空间查询不会将该音符
+            //      重新添加到活跃列表: ((v82^1|v83)&1)==0 对 TapNote 失败
+            //    - 修复: 遍历全量音符主列表 (LogicChart+32/+40), 重置 byte[12]=0, byte[13]=0
+            //
+            //    a) 重置所有音符的 isCompleted 标志 (主列表 +32/+40)
+            //    b) 清空活跃音符列表 (+160/+168), release 引用后截断
+            //    c) 重新激活所有音轨 (chart_data+80 tracks byte[0])
+            //    d) 清空事件队列 (+288/+296)
+            //    e) 清除结束标志 (+313..+316)
 
-            // a) 清空活跃音符: release 每个引用, 然后截断列表
-            //    sub_100DB1A28 = release(refcount-1, destroy if 0)
             typedef void (*release_fn)(void *);
             uint64_t base = arc_image_base();
+
+            // a) 遍历全量音符主列表, 重置判定标志
+            //    LogicChart+32 = notes vector begin, +40 = notes vector end
+            if (addr_readable((char *)logic + 40, 8)) {
+                void **all_begin = *(void ***)((char *)logic + 32);
+                void **all_end   = *(void ***)((char *)logic + 40);
+                ptrdiff_t all_count = (all_begin && all_end && all_end > all_begin)
+                                     ? (all_end - all_begin) : 0;
+                if (all_count > 0 && all_count < 100000) {
+                    int n_reset = 0;
+                    for (ptrdiff_t ni = 0; ni < all_count; ni++) {
+                        void *note = all_begin[ni];
+                        if (!note || !ptr_plausible(note)) continue;
+                        if (!addr_readable((char *)note + 14, 1)) continue;
+                        uint8_t b12 = *(uint8_t *)((char *)note + 12);
+                        uint8_t b13 = *(uint8_t *)((char *)note + 13);
+                        if (b12 || b13) {
+                            *(uint8_t *)((char *)note + 12) = 0;
+                            *(uint8_t *)((char *)note + 13) = 0;
+                            n_reset++;
+                        }
+                    }
+                    acc_flog(@"[seek] reset isCompleted flags on %d / %td notes", n_reset, all_count);
+                } else {
+                    acc_flog(@"[seek] master note list not found or empty (count=%td)", all_count);
+                }
+            }
+
+            // b) 清空活跃音符列表: release 每个引用, 然后截断
             if (base && addr_readable((char *)logic + 168, 8)) {
                 void **notes_begin = *(void ***)((char *)logic + 160);
                 void **notes_end   = *(void ***)((char *)logic + 168);
@@ -633,36 +670,38 @@ static void player_seek_ms(uint32_t ms) {
                     for (int ni = 0; ni < n_notes; ni++) {
                         if (notes_begin[ni]) rel(notes_begin[ni]);
                     }
-                    *(void ***)((char *)logic + 168) = notes_begin; // truncate
+                    *(void ***)((char *)logic + 168) = notes_begin;
                     acc_flog(@"[seek] cleared %d active notes", n_notes);
                 }
             }
 
-            // b) 重新激活所有音轨
-            void *chart_data = *(void **)((char *)logic + 40);
-            if (chart_data && ptr_plausible(chart_data) && addr_readable((char *)chart_data + 96, 8)) {
-                void **tracks_begin = *(void ***)((char *)chart_data + 80);
-                void **tracks_end   = *(void ***)((char *)chart_data + 88);
-                if (tracks_begin && tracks_end && tracks_end > tracks_begin) {
-                    int n_reactivated = 0;
-                    for (void **t = tracks_begin; t < tracks_end; t++) {
-                        if (*t && ptr_plausible(*t) && addr_readable(*t, 8)) {
-                            *(uint8_t *)(*t) = 1;
-                            n_reactivated++;
+            // c) 重新激活所有音轨
+            if (addr_readable((char *)logic + 40, 8)) {
+                void *cd = *(void **)((char *)logic + 40);
+                if (cd && ptr_plausible(cd) && addr_readable((char *)cd + 96, 8)) {
+                    void **tracks_begin = *(void ***)((char *)cd + 80);
+                    void **tracks_end   = *(void ***)((char *)cd + 88);
+                    if (tracks_begin && tracks_end && tracks_end > tracks_begin) {
+                        int n_reactivated = 0;
+                        for (void **t = tracks_begin; t < tracks_end; t++) {
+                            if (*t && ptr_plausible(*t) && addr_readable(*t, 8)) {
+                                *(uint8_t *)(*t) = 1;
+                                n_reactivated++;
+                            }
                         }
+                        acc_flog(@"[seek] reactivated %d tracks", n_reactivated);
                     }
-                    acc_flog(@"[seek] reactivated %d tracks", n_reactivated);
                 }
             }
 
-            // c) 清空事件队列 (40-byte elements)
+            // d) 清空事件队列
             if (addr_readable((char *)logic + 296, 8)) {
                 void *ev_begin = *(void **)((char *)logic + 288);
                 if (ev_begin)
-                    *(void **)((char *)logic + 296) = ev_begin; // truncate
+                    *(void **)((char *)logic + 296) = ev_begin;
             }
 
-            // d) 清除结束标志
+            // e) 清除结束标志
             if (addr_readable((char *)logic + 321, 1)) {
                 *(uint8_t *)((char *)logic + 313) = 0;
                 *(uint8_t *)((char *)logic + 314) = 0;
