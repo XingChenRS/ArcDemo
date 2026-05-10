@@ -46,17 +46,17 @@ Arcaea.app/Frameworks/AccDemoArcaea.framework/AccDemoArcaea
 
 ## 项目完成状态
 
-### 当前版本（6.13.10）- v2 架构 ✅
+### 当前版本（6.13.10）- v3 架构 ✅
 
 核心功能已实现：
 
 - **✅ 音频变速**：FMOD Channel::setFrequency(base × rate)
-- **✅ 谱面变速**：mach_absolute_time fishhook → steady_clock::now() 自动变速
+- **✅ 谱面变速**：Gameplay.update vtable hook → `_gp_retime_logic_clock` 修改 clock[16]
 - **✅ 视觉变速**：gettimeofday fishhook → CCDirector.tick deltaTime 自动变速
 - **✅ Seek功能**：MTP::seekTo(音频) + clock[40] 偏移(谱面) 双系统对齐
 - **✅ 进度条**：实时显示位置和总时长
-- **✅ 暂停/恢复**：freeze 机制保证时间连续
-- **✅ 代码精简**：~1200行，2 个 fishhook + 2 个 vtable hook
+- **✅ 暂停/恢复**：freeze 机制 + retime 基准重置保证时间连续
+- **✅ 代码精简**：~1400行，2 个 fishhook + 2 个 vtable hook
 
 ---
 
@@ -64,44 +64,55 @@ Arcaea.app/Frameworks/AccDemoArcaea.framework/AccDemoArcaea
 
 2026-05-08 ~ 2026-05-10：从盲目fishhook尝试逐步收敛。
 
-**被抛弃的方案**：PlatformUtils虚表hooks、MTP.getPositionMs诊断hook、CADisplayLink ObjC swizzles、`_gp_retime_logic_clock`（手动修改 LogicChart.start_ms）、CCDirector vtable hooks（`_ccdirector_retime_prev_tv`）。
+**被抛弃的方案**：PlatformUtils虚表hooks、MTP.getPositionMs诊断hook、CADisplayLink ObjC swizzles、CCDirector vtable hooks（`_ccdirector_retime_prev_tv`）。
 
-**v1 架构的致命缺陷**：mach_absolute_time fishhook + `_gp_retime_logic_clock` 对谱面时钟产生了 **rate² 双重 warp**（steady_clock 已被 fishhook 加速，再手动调 start_ms 又加速一次）。同理 gettimeofday fishhook + `_ccdirector_retime_prev_tv` 也对视觉帧时间双重 warp。实测 rate=0.5x 时谱面完全停止（0²=0），rate=2x 时谱面 3x 速度。
+**v1 架构的致命缺陷**：gettimeofday fishhook + `_ccdirector_retime_prev_tv` 对视觉帧时间双重 warp。
+
+**v2 架构的误判**：IDA分析判断 mach_absolute_time → steady_clock::now() → 谱面时钟，因此移除了 `_gp_retime_logic_clock`。但实测发现 `mach_absolute_time` 几乎不被调用，无法影响谱面速度（可能因 iOS 版本的 libc++ steady_clock 实现不经过 GOT rebinding 的 mach_absolute_time）。`_gp_retime_logic_clock` 是唯一能改变谱面速度的机制，且因为 fishhook 不影响 steady_clock，所以不存在"双重 warp"。
 
 ---
 
-## v2 架构详解 (2026-05-10)
+## v3 架构详解 (2026-05-10)
 
-### 核心发现：双重 warp 问题
+### 核心发现
 
-通过 IDA 反编译分析，确认了 Arcaea 时钟链条：
+1. **mach_absolute_time fishhook 无法影响谱面时钟**
+   - 实测发现 `mach_absolute_time` 几乎不被 Arcaea 主二进制调用
+   - 推测: iOS 版本的 libc++ `steady_clock::now()` 直接调用内核 commpage 或 `clock_gettime`，不经过 GOT rebinding 路径
+   - 因此 fishhook mach_absolute_time 无法改变 `clock[32]` 的推进速度
 
-1. **谱面时钟** (`sub_10086E69C`): `display_ms = clock[32] - clock[40]`
-   - `clock[32]` 由 `sub_1008C2FEC` 每帧通过 `steady_clock::now()` 计算
-   - `steady_clock::now()` 底层调用 `mach_absolute_time()`
-   - 因此 fishhook `mach_absolute_time` **已经自动让谱面变速**
-   - v1 的 `_gp_retime_logic_clock` 修改 `clock[16]` 额外加速 → 双重 warp!
+2. **`_gp_retime_logic_clock` 是唯一能改变谱面速度的机制**
+   - 通过 Gameplay.update vtable hook，每帧修改 `clock[16]` (start_ms)
+   - 公式: `adjust = (1 - rate) × real_delta_ms`，使谱面推进速度 = rate × real_speed
+   - 因为 steady_clock 不被 fishhook 影响，所以不存在"双重 warp"
 
-2. **视觉时钟** (`sub_100CE0518`): `delta = gettimeofday() - prev_timeval`
-   - CCDirector 每帧调用 gettimeofday 计算 deltaTime
-   - fishhook `gettimeofday` **已经自动让 CCDirector 看到 warped delta**
-   - v1 的 `_ccdirector_retime_prev_tv` 又修改 prev_timeval → 双重 warp!
+3. **gettimeofday fishhook 仍然有效驱动 CCDirector 视觉变速**
+   - CCDirector 通过 gettimeofday 计算帧间 delta，fishhook 直接生效
 
-### v2 变速架构（正确方案）
+### v3 变速架构
 
-| 组件 | 机制 | 自动程度 |
-| --- | --- | --- |
+| 组件 | 机制 | 说明 |
+|------|------|------|
 | 音频 | `Channel::setFrequency(base × rate)` | 需主动调用 |
-| 谱面 | `mach_absolute_time` fishhook → `steady_clock::now()` → `clock[32]` | 完全自动 |
+| 谱面 | `tw_gp_update` → `_gp_retime_logic_clock` 修改 `clock[16]` | 每帧调整 |
 | 视觉 | `gettimeofday` fishhook → CCDirector delta | 完全自动 |
+| misc | `mach_absolute_time` fishhook (保留，低开销) | 辅助 |
 
-**无需任何 vtable retime hook**。只需 2 个 fishhook + FMOD 频率调节。
-
-### Gameplay.update vtable hook（仅缓存实例）
+### Gameplay.update vtable hook
 
 vtable @ `base + 0x136E1C0`，函数 @ `base + 0xB3AD70`
 
-v2 中 `tw_gp_update()` 只做一件事：`atomic_store(&g_gameplay_instance, self)`。缓存 Gameplay 实例指针供 seek 使用。不做任何时间修改。
+`tw_gp_update()` 每帧执行两个任务：
+1. 缓存 Gameplay 实例指针 (`g_gameplay_instance`) 供 seek 使用
+2. 调用 `_gp_retime_logic_clock(logic)` 修改谱面时钟速度
+
+### retime 基准重置
+
+在以下状态转换时重置 `s_gp_last_real_us = 0`，防止首帧巨大 delta 导致跳变：
+- 切换倍率 (`time_warp_set_rate`)
+- seek 跳转 (`player_seek_ms`)
+- 暂停恢复 (`player_set_paused`)
+- 切回前台 (`onAppWillEnterForeground`)
 
 ### Seek 机制
 
@@ -117,6 +128,7 @@ seek to X ms:
 ```
 
 具体步骤：
+
 1. 冻结 warp 时间
 2. MTP::seekTo(ms, channel=0) → 音频跳转
 3. 重新应用频率（FMOD seek 可能重置频率）

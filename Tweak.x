@@ -1,8 +1,12 @@
 // xrc-arcdemo / Tweak.x
 // Arcaea iOS 变速/Seek 练习工具 (fork of brendonjkding/accDemo)
 // 单 dylib 注入，游戏内浮窗 UI
-// 变速架构：mach_absolute_time(谱面/steady_clock) + gettimeofday(CCDirector视觉) + FMOD频率(音频)
-// seek 架构：MTP::seekTo(音频) + clock[40] 偏移(谱面)
+//
+// 变速架构 (v3):
+//   谱面: Gameplay.update vtable hook -> _gp_retime_logic_clock 修改 clock[16]
+//   视觉: gettimeofday fishhook -> CCDirector.tick delta 自动变速
+//   音频: FMOD Channel::setFrequency(base * rate)
+// seek 架构: MTP::seekTo(音频) + clock[40] 偏移(谱面)
 
 #import <substrate.h>
 #import <time.h>
@@ -47,17 +51,17 @@ static WQSuspendView *button = nil;
 static UIView        *menuView = nil;
 #pragma mark - Arcaea binary hook (Dobby)
 //
-// 已知偏移（来�?IDA 6.13.10 分析）：
+// 已知偏移 (IDA 6.13.10 分析):
 //   sub_100846950 (vtable[7] of MultiTrackPlayer) = getPositionMs(this, channel)
 //   sub_100846914 (vtable[6])                     = setPaused(this, paused, channel)
 //   sub_10084699C (vtable[8])                     = seekTo(this, ms, channel)
-//   sub_100C9D718                                 = getRegistry()    �?全局单例
+//   sub_100C9D718                                 = getRegistry() - 全局单例
 //   *(getRegistry() + 8)                          = MultiTrackPlayer
 //   sub_100EC094C                                 = Channel::getCurrentSound(ch, Sound**)
 //   sub_100F2BB64                                 = Sound::getLength(snd, uint32_t*, unit=1)
-//   sub_100EC069C                                 = Channel::setFrequency(ch, float)   �?备用
+//   sub_100EC069C                                 = Channel::setFrequency(ch, float)
 // 
-// MTP 内部布局：通道数组 channels[i] @ player+0x38 起，步长 16，每�?+8 = Channel*�?
+// MTP 内部布局: 通道数组 channels[i] @ player+0x38, stride=16, 每项+8 = Channel*
 //   ch0 = *(*(player+0x38) + 8)
 //
 // 运行时地址 = arcaea_base + offset
@@ -93,13 +97,13 @@ static ch_get_frequency_fn  g_ch_get_frequency = NULL;
 #define ARC_MAX_CHANNELS  (8)
 static _Atomic(float) g_base_freq[ARC_MAX_CHANNELS];   // 0 = 未捕获
 
-// �?hook 兜底捕获 + 主动通过 registry 获取
+// hook 兜底捕获 + 主动通过 registry 获取
 static _Atomic(void *)   g_bgmPlayer = NULL;
 static _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
-static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时�?
+static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
 
-// 尝试�?player 主轨�?Sound 总长
+// 尝试从 player 主轨拿 Sound 总长
 static void try_capture_song_length(void *player) {
     if (!player || !g_get_current_sound || !g_get_sound_length) return;
     if (atomic_load(&g_song_length_ms) != 0) return;
@@ -151,7 +155,7 @@ static bool addr_readable(const void *p, size_t len) {
     return true;
 }
 
-// �?Arc-mobile 主二进制基址
+// 取 Arc-mobile 主二进制基址
 static uint64_t arc_image_base(void) {
     static uint64_t cached = 0;
     if (cached) return cached;
@@ -368,8 +372,12 @@ static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
 static _Atomic(uint64_t) g_tw_gp_update_calls = 0;
 static _Atomic(int) g_tw_gp_update_installed = 0;
 
-// 缓存 Gameplay 实例指针：用于 seek 时修改谱面时钟
+// 缓存 Gameplay 实例指针 (seek 需要访问谱面时钟)
 static _Atomic(void *) g_gameplay_instance = NULL;
+
+// retime 状态: 记录上一帧的真实时间和 clock 指针, 用于计算帧间 delta
+static void *s_gp_last_clock = NULL;
+static uint64_t s_gp_last_real_us = 0;
 // MTP getPos vtable wrapper：自动捕获 player 实例 + 位置追踪
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
@@ -387,13 +395,69 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
     return raw;
 }
 
-// Gameplay.update vtable hook: 仅缓存 Gameplay 实例（不做任何时间修改）
-// 谱面变速完全由 mach_absolute_time fishhook 驱动（steady_clock::now() → 谱面时钟自动变速）
-// 视觉变速完全由 gettimeofday fishhook 驱动（CCDirector::tick → delta 自动变速）
-// 不再需要手动 retime（之前 _gp_retime_logic_clock 和 _ccdirector_retime_prev_tv 导致 rate² 双重 warp）
+// 取未被 warp 的真实 microsecond 时间 (用于 retime delta 计算)
+static uint64_t _real_now_us_unwarped(void) {
+    struct timeval tv = {0};
+    if (s_orig_gettod) {
+        if (s_orig_gettod(&tv, NULL) == 0)
+            return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        return 0;
+    }
+    if (gettimeofday(&tv, NULL) == 0)
+        return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+    return 0;
+}
+
+// 谱面 retime: 每帧微调 clock[16] (start_ms), 使谱面时间按 rate 推进
+// clock[32] = steady_now - clock[16] + offset
+// 每帧 adjust = (1 - rate) * real_delta_ms -> clock[16] += adjust
+// 效果: 谱面推进速度 = real_delta + (rate-1)*real_delta = rate * real_delta
+static void _gp_retime_logic_clock(void *logic) {
+    if (!logic) return;
+    if (atomic_load(&g_tw_freeze_count) > 0) return;
+    if (!addr_readable((char *)logic + 56, sizeof(void *))) return;
+    void *clk = *(void **)((char *)logic + 48);
+    if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return;
+
+    uint64_t now_us = _real_now_us_unwarped();
+    if (!now_us) return;
+    if (clk != s_gp_last_clock || s_gp_last_real_us == 0 || now_us <= s_gp_last_real_us) {
+        s_gp_last_clock = clk;
+        s_gp_last_real_us = now_us;
+        return;
+    }
+
+    uint64_t delta_us = now_us - s_gp_last_real_us;
+    if (delta_us > 200000ULL) delta_us = 200000ULL;
+    s_gp_last_real_us = now_us;
+    int32_t delta_ms = (int32_t)(delta_us / 1000ULL);
+    if (delta_ms <= 0) return;
+
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) return;
+    int32_t adjust = (int32_t)((1.0 - rate) * (double)delta_ms);
+    if (adjust == 0) return;
+
+    int32_t *start_ms = (int32_t *)((char *)clk + 16);
+    int64_t after = (int64_t)(*start_ms) + (int64_t)adjust;
+    if (after > INT_MAX) after = INT_MAX;
+    if (after < INT_MIN) after = INT_MIN;
+    *start_ms = (int32_t)after;
+}
+
+// Gameplay.update vtable hook:
+//   1. 缓存 Gameplay 实例 (seek 需要)
+//   2. 调用 _gp_retime_logic_clock 变速谱面 (mach_absolute_time 无法影响谱面时钟)
 static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     atomic_fetch_add(&g_tw_gp_update_calls, 1);
-    if (self) atomic_store(&g_gameplay_instance, self);
+    if (self) {
+        atomic_store(&g_gameplay_instance, self);
+        void *logic = NULL;
+        if (addr_readable((char *)self + 936, sizeof(void *)))
+            logic = *(void **)((char *)self + 928);
+        if (logic && ptr_plausible(logic))
+            _gp_retime_logic_clock(logic);
+    }
     return s_orig_gp_update ? s_orig_gp_update(self, a2, a3, a4, a5) : 0;
 }
 
@@ -530,9 +594,7 @@ static void time_warp_freeze_dec(void) {
     }
 }
 
-// 设置新倍率：先用「当前 warp 时间」做新基准 t0_warp，再把 t0_real 设为「当前真实时间」。
-// warp 时间在切换瞬间保持连续，不会跳变。
-// 变速架构：mach_absolute_time(谱面) + gettimeofday(视觉) + FMOD频率(音频) 三路同步。
+// 设置新倍率: 先用当前 warp 时间做新基准, 保证时间连续不跳变
 static void time_warp_set_rate(double rate) {
     if (rate <= 0.001) return;
     uint64_t real_mach_now = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
@@ -551,13 +613,14 @@ static void time_warp_set_rate(double rate) {
     atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
 
     apply_speed_to_all_channels();
+    s_gp_last_real_us = 0;  // 强制 retime 下一帧重新建立基准
 }
 
 static void time_warp_install(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // 【优化】只保留三个核心hook：mach_absolute_time, gettimeofday用于时间warping基础
-        //        其他hooks用处不大，容易引入bug
+        // gettimeofday: CCDirector visual warp
+        // mach_absolute_time: kept for misc consumers (low call count, nearly free)
         struct rebinding rs[2] = {
             { "mach_absolute_time",                (void *)tw_mach_absolute_time,                (void **)&s_orig_mach_abs },
             { "gettimeofday",                      (void *)tw_gettimeofday,                      (void **)&s_orig_gettod   },
@@ -617,6 +680,8 @@ static void player_seek_ms(uint32_t ms) {
         }
     }
 
+    s_gp_last_real_us = 0;  // 强制 retime 下一帧重新建立基准
+
     time_warp_freeze_dec();
 }
 
@@ -628,12 +693,11 @@ static void player_set_paused(BOOL paused) {
     set_paused_fn fn = (set_paused_fn)_player_vt_slot(self, 0x30); // slot 6
     if (!fn) return;
     if (paused) {
-        // 先冻结 warp 时间，再暂停 audio：保证 game 看到的时钟与 audio 同步停止
         time_warp_freeze_inc();
         fn(self, 1, 0);
     } else {
-        // 先恢复 audio，再解冻 warp：unpause 瞬间 currentMs 从冻结值平滑继续，不会跳过任何 note
         fn(self, 0, 0);
+        s_gp_last_real_us = 0;  // 恢复后重建 retime 基准
         time_warp_freeze_dec();
     }
 }
@@ -695,7 +759,7 @@ static void loadPref(void) {
 %hook NSBundle
 + (NSBundle *)bundleForClass:(Class)aClass {
     if (aClass == [%c(WHToastView) class]) {
-        // WHToast 资源被打包进 dylib 同目录的 bundle；TrollStore 场景下我们用�?bundle 兜底�?
+        // WHToast 资源被打包进 dylib 同目录的 bundle; TrollStore 场景下用 mainBundle 兜底
         NSBundle *main = [NSBundle mainBundle];
         return main ?: %orig;
     }
@@ -824,15 +888,15 @@ static void loadPref(void) {
 
     // 标题
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 24)];
-    title.text = @"Arcaea 变速 (XRC)";
+    title.text = @"Arcaea Speed (XRC)";
     title.font = [UIFont boldSystemFontOfSize:18];
     title.textColor = [UIColor blackColor];
     [card addSubview:title];
     y += 28;
 
-    // 技术说明：音频+谱面+判定通过三个Hook完全同步变速
+    // architecture summary line
     UILabel *warn = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 48)];
-    warn.text = @"✓ 音频 (FMOD频率) ✓ 谱面 (mach_absolute_time→steady_clock) ✓ 视觉 (gettimeofday→CCDirector)";
+    warn.text = @"Audio: FMOD freq | Chart: GP.update retime | Visual: gettimeofday warp";
     warn.font = [UIFont systemFontOfSize:10];
     warn.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.2 alpha:1.0];
     warn.numberOfLines = 0;
@@ -843,7 +907,7 @@ static void loadPref(void) {
     BOOL playerReady = (get_player_or_resolve() != NULL);
 
     UILabel *playerHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    playerHdr.text = playerReady ? @"BGM 实时控制" : @"BGM（等待歌曲加载中…）";
+    playerHdr.text = playerReady ? @"BGM Control" : @"BGM (waiting...)";
     playerHdr.font = [UIFont systemFontOfSize:13];
     playerHdr.textColor = [UIColor darkGrayColor];
     [card addSubview:playerHdr];
@@ -872,7 +936,7 @@ static void loadPref(void) {
     y += 22;
 
     UILabel *pauseLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    pauseLbl.text = @"暂停 BGM";
+    pauseLbl.text = @"Pause BGM";
     pauseLbl.font = [UIFont systemFontOfSize:14];
     pauseLbl.textColor = [UIColor blackColor];
     [card addSubview:pauseLbl];
@@ -895,7 +959,7 @@ static void loadPref(void) {
 
     // toast switch
     UILabel *toastLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    toastLbl.text = @"切倍率时显示提示";
+    toastLbl.text = @"Show toast on rate change";
     toastLbl.font = [UIFont systemFontOfSize:14];
     toastLbl.textColor = [UIColor blackColor];
     [card addSubview:toastLbl];
@@ -907,20 +971,18 @@ static void loadPref(void) {
     [card addSubview:toastSw];
     y += MAX(28, swSize.height) + 8;
 
-    // ---- 时钟通道开关（实验：找出谱面用哪个时钟）----
+    // ---- hook toggles ----
     UILabel *clkHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
-    clkHdr.text = @"时钟通道（开=按 rate 加速；游戏内逐个切换可定位谱面用哪个）";
+    clkHdr.text = @"Hook (ON=warp at rate)";
     clkHdr.font = [UIFont systemFontOfSize:11];
     clkHdr.textColor = [UIColor darkGrayColor];
     clkHdr.numberOfLines = 0;
     [card addSubview:clkHdr];
     y += 36;
 
-    // 变速架构：mach_absolute_time(谱面/steady_clock) + gettimeofday(CCDirector视觉) + FMOD频率(音频)
-    // Gameplay.update vtable hook 仅用于缓存实例指针（seek 需要），不做时间修改
     struct { const char *label; _Atomic(int) *en; _Atomic(uint64_t) *cnt; } clocks[] = {
-        { "gettimeofday (视觉)",               &g_tw_en_gtod,           &g_tw_gtod_calls          },
-        { "mach_absolute_time (谱面)",          &g_tw_en_mach,           &g_tw_mach_calls          },
+        { "gettimeofday (visual)",             &g_tw_en_gtod,           &g_tw_gtod_calls          },
+        { "mach_absolute_time",                &g_tw_en_mach,           &g_tw_mach_calls          },
     };
     int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
     for (int i = 0; i < nClocks; i++) {
@@ -948,9 +1010,29 @@ static void loadPref(void) {
         y += MAX(36, sz.height) + 4;
     }
 
+    // GP.update (chart retime) - 只读显示, 始终启用
+    UILabel *gpLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 20)];
+    gpLbl.text = @"GP.update (chart retime)";
+    gpLbl.font = [UIFont systemFontOfSize:12];
+    gpLbl.textColor = [UIColor blackColor];
+    [card addSubview:gpLbl];
+    UILabel *gpCnt = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 18, innerW - 60, 14)];
+    gpCnt.text = [NSString stringWithFormat:@"%llu calls", (unsigned long long)atomic_load(&g_tw_gp_update_calls)];
+    gpCnt.font = [UIFont systemFontOfSize:10];
+    gpCnt.textColor = [UIColor grayColor];
+    gpCnt.tag = 3010;
+    [card addSubview:gpCnt];
+    UILabel *gpOn = [[UILabel alloc] initWithFrame:CGRectMake(W - 12 - 40, y + 4, 40, 20)];
+    gpOn.text = @"ON";
+    gpOn.font = [UIFont boldSystemFontOfSize:12];
+    gpOn.textColor = [UIColor colorWithRed:0.2 green:0.7 blue:0.2 alpha:1.0];
+    gpOn.textAlignment = NSTextAlignmentCenter;
+    [card addSubview:gpOn];
+    y += 40;
+
     // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    speedHdr.text = @"倍率列表（点击选中，长按删除）";
+    speedHdr.text = @"Speed (tap=select, hold=delete)";
     speedHdr.font = [UIFont systemFontOfSize:12];
     speedHdr.textColor = [UIColor darkGrayColor];
     speedHdr.numberOfLines = 0;
@@ -992,14 +1074,14 @@ static void loadPref(void) {
 
     UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     addBtn.frame = CGRectMake(12, y, innerW, 32);
-    [addBtn setTitle:@"+ 添加倍率" forState:UIControlStateNormal];
+    [addBtn setTitle:@"+ Add speed" forState:UIControlStateNormal];
     [addBtn addTarget:self action:@selector(addSpeed) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:addBtn];
     y += 40;
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     closeBtn.frame = CGRectMake(12, y, innerW, 32);
-    [closeBtn setTitle:@"关闭" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:closeBtn];
@@ -1053,6 +1135,12 @@ static void loadPref(void) {
                                    (unsigned long long)atomic_load(cnts[i])];
         }
     }
+    // GP.update 计数器
+    UIView *gpv = [card viewWithTag:3010];
+    if ([gpv isKindOfClass:[UILabel class]]) {
+        ((UILabel *)gpv).text = [NSString stringWithFormat:@"%llu calls",
+                                 (unsigned long long)atomic_load(&g_tw_gp_update_calls)];
+    }
 }
 
 - (void)toastChanged:(UISwitch *)s {
@@ -1078,8 +1166,8 @@ static void loadPref(void) {
         sw.on = NO;
         atomic_store(flags[idx], 0);
         if (toast) {
-            [WHToast showMessage:[NSString stringWithFormat:@"%s 未就绪", names[idx]]
-                        duration:0.6 finishHandler:^{}];
+        [WHToast showMessage:[NSString stringWithFormat:@"%s not ready", names[idx]]
+                    duration:0.6 finishHandler:^{}];
         }
         return;
     }
@@ -1109,7 +1197,7 @@ static void loadPref(void) {
     NSMutableDictionary *p = loadPrefDict();
     NSMutableArray *keys = [p[@"speedKeys"] mutableCopy];
     if (i >= (NSInteger)keys.count) return;
-    if (keys.count <= 1) return; // 至少留一�?
+    if (keys.count <= 1) return; // 至少留一个
     NSString *k = keys[i];
     [keys removeObjectAtIndex:i];
     [p removeObjectForKey:k];
@@ -1306,6 +1394,7 @@ static void onAppDidEnterBackground(CFNotificationCenterRef center, void *observ
 static void onAppWillEnterForeground(CFNotificationCenterRef center, void *observer,
                                      CFStringRef name, const void *object,
                                      CFDictionaryRef userInfo) {
+    s_gp_last_real_us = 0;  // 回前台后重建 retime 基准
     time_warp_freeze_dec();
     acc_flog(@"app -> foreground, warp unfrozen (count=%d)", atomic_load(&g_tw_freeze_count));
 }
