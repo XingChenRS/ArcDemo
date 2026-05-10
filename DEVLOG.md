@@ -77,38 +77,40 @@ Arcaea.app/Frameworks/AccDemoArcaea.framework/AccDemoArcaea
 ### 核心发现
 
 1. **mach_absolute_time fishhook 无法影响谱面时钟**
-   - 实测发现 `mach_absolute_time` 几乎不被 Arcaea 主二进制调用
-   - 推测: iOS 版本的 libc++ `steady_clock::now()` 直接调用内核 commpage 或 `clock_gettime`，不经过 GOT rebinding 路径
-   - 因此 fishhook mach_absolute_time 无法改变 `clock[32]` 的推进速度
-
-2. **`_gp_retime_logic_clock` 是唯一能改变谱面速度的机制**
-   - 通过 Gameplay.update vtable hook，每帧修改 `clock[16]` (start_ms)
-   - 公式: `adjust = (1 - rate) × real_delta_ms`，使谱面推进速度 = rate × real_speed
-   - 因为 steady_clock 不被 fishhook 影响，所以不存在"双重 warp"
-
+  - 实测发现 `mach_absolute_time` 几乎不被 Arcaea 主二进制调用
+  - 推测: iOS 版本的 libc++ `steady_clock::now()` 直接调用内核 commpage 或 `clock_gettime`，不经过 GOT rebinding 路径
+  - 因此 fishhook mach_absolute_time 无法改变 `clock[32]` 的推进速度
+2. `**_gp_retime_logic_clock` 是唯一能改变谱面速度的机制**
+  - 通过 Gameplay.update vtable hook，每帧修改 `clock[16]` (start_ms)
+  - 公式: `adjust = (1 - rate) × real_delta_ms`，使谱面推进速度 = rate × real_speed
+  - 因为 steady_clock 不被 fishhook 影响，所以不存在"双重 warp"
 3. **gettimeofday fishhook 仍然有效驱动 CCDirector 视觉变速**
-   - CCDirector 通过 gettimeofday 计算帧间 delta，fishhook 直接生效
+  - CCDirector 通过 gettimeofday 计算帧间 delta，fishhook 直接生效
 
 ### v3 变速架构
 
-| 组件 | 机制 | 说明 |
-|------|------|------|
-| 音频 | `Channel::setFrequency(base × rate)` | 需主动调用 |
-| 谱面 | `tw_gp_update` → `_gp_retime_logic_clock` 修改 `clock[16]` | 每帧调整 |
-| 视觉 | `gettimeofday` fishhook → CCDirector delta | 完全自动 |
-| misc | `mach_absolute_time` fishhook (保留，低开销) | 辅助 |
+
+| 组件   | 机制                                                       | 说明    |
+| ---- | -------------------------------------------------------- | ----- |
+| 音频   | `Channel::setFrequency(base × rate)`                     | 需主动调用 |
+| 谱面   | `tw_gp_update` → `_gp_retime_logic_clock` 修改 `clock[16]` | 每帧调整  |
+| 视觉   | `gettimeofday` fishhook → CCDirector delta               | 完全自动  |
+| misc | `mach_absolute_time` fishhook (保留，低开销)                   | 辅助    |
+
 
 ### Gameplay.update vtable hook
 
 vtable @ `base + 0x136E1C0`，函数 @ `base + 0xB3AD70`
 
 `tw_gp_update()` 每帧执行两个任务：
+
 1. 缓存 Gameplay 实例指针 (`g_gameplay_instance`) 供 seek 使用
 2. 调用 `_gp_retime_logic_clock(logic)` 修改谱面时钟速度
 
 ### retime 基准重置
 
 在以下状态转换时重置 `s_gp_last_real_us = 0`，防止首帧巨大 delta 导致跳变：
+
 - 切换倍率 (`time_warp_set_rate`)
 - seek 跳转 (`player_seek_ms`)
 - 暂停恢复 (`player_set_paused`)

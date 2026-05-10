@@ -2,11 +2,11 @@
 // Arcaea iOS 变速/Seek 练习工具 (fork of brendonjkding/accDemo)
 // 单 dylib 注入，游戏内浮窗 UI
 //
-// 变速架构 (v3):
-//   谱面: Gameplay.update vtable hook -> _gp_retime_logic_clock 修改 clock[16]
-//   视觉: gettimeofday fishhook -> CCDirector.tick delta 自动变速
+// 变速架构 (v4):
+//   谱面: GP.update vtable -> _gp_retime_logic_clock(clock[16]) + _gp_drift_correct(clock[40])
+//   视觉: gettimeofday fishhook -> CCDirector delta 自动变速
 //   音频: FMOD Channel::setFrequency(base * rate)
-// seek 架构: MTP::seekTo(音频) + clock[40] 偏移(谱面)
+// seek 架构: MTP::seekTo + clock[40] + track reactivation + finished flags reset
 
 #import <substrate.h>
 #import <time.h>
@@ -259,59 +259,30 @@ static void apply_speed_to_all_channels(void) {
     }
 }
 
-#pragma mark - Time Warp (fishhook 谱面同步变速)
+#pragma mark - Time Warp (gettimeofday fishhook for CCDirector visual speed)
 
-// 让游戏内部的 Clock::currentTimeMs (vtable @ 0x1013637e0) 看到的时间按 rate 加速。
-// 仅 rebind Arc-mobile 主二进制 GOT 的 mach_absolute_time + gettimeofday，
-// 不写任何 __TEXT 段，不影响 Firebase / 系统 framework，符合 iOS16 sideload 安全约束。
-//
-// 公式：t_warp(real) = t0_warp + (real - t0_real) * rate
-// 切倍率瞬间：t0_real = real_now; t0_warp = warp_now（保持连续，不跳变）
+// gettimeofday fishhook: CCDirector 用它计算帧间 delta, warp 后视觉动画按 rate 播放
+// 公式: t_warp(real) = t0_warp + (real - t0_real) * rate
+// 切倍率瞬间: t0_real = real_now; t0_warp = warp_now (保持连续, 不跳变)
 
-typedef uint64_t (*orig_mach_abs_t)(void);
-typedef int      (*orig_gettod_t)(struct timeval *tv, void *tz);
-static orig_mach_abs_t              s_orig_mach_abs = NULL;
-static orig_gettod_t                s_orig_gettod   = NULL;
+typedef int (*orig_gettod_t)(struct timeval *tv, void *tz);
+static orig_gettod_t s_orig_gettod = NULL;
 
-static _Atomic(uint64_t) g_tw_t0_real_mach = 0;  // 切换瞬间的真实 mach
-static _Atomic(uint64_t) g_tw_t0_warp_mach = 0;  // 切换瞬间的 warp mach
-static _Atomic(uint64_t) g_tw_t0_real_us   = 0;  // 切换瞬间的真实 microseconds (gettimeofday)
-static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;  // 切换瞬间的 warp microseconds
-static _Atomic(uint32_t) g_tw_rate_x1000   = 1000; // rate * 1000，整数避免原子 float 兼容性
+static _Atomic(uint64_t) g_tw_t0_real_us   = 0;
+static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;
+static _Atomic(uint32_t) g_tw_rate_x1000   = 1000;
 
-// 冻结机制：用户暂停 + 切后台 都会增加 freeze_count，归零才解冻。
-// 冻结时所有 tw_* 调用返回 frozen_*，不再随真实时间推进 → 防止 unpause/回前台时谱面飞过。
+// 冻结机制: 暂停 / 切后台 / seek 时冻结 warp 时间
 static _Atomic(int32_t)  g_tw_freeze_count = 0;
-static _Atomic(uint64_t) g_tw_frozen_mach  = 0;
 static _Atomic(uint64_t) g_tw_frozen_us    = 0;
 
-// 诊断计数器
-static _Atomic(uint64_t) g_tw_mach_calls = 0;
 static _Atomic(uint64_t) g_tw_gtod_calls = 0;
-
-// fishhook 开关（已验证生效，默认 ON）
-static _Atomic(int) g_tw_en_mach          = 1;
-static _Atomic(int) g_tw_en_gtod          = 1;
-
-// mach_timebase: 用于把 CACurrentMediaTime (秒) 转 mach 滴答以共享 _compute_warp_mach 锚
-static mach_timebase_info_data_t s_tb_info = {0, 0};
-static inline void ensure_timebase(void) {
-    if (s_tb_info.denom == 0) mach_timebase_info(&s_tb_info);
-}
+static _Atomic(int) g_tw_en_gtod = 1;
 
 static inline double tw_get_rate(void) {
     return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
 }
 
-// 仅根据 t0_*/rate 算 warp 时间（不考虑冻结，给 freeze 自己用）
-static uint64_t _compute_warp_mach(uint64_t real_mach) {
-    double rate = tw_get_rate();
-    uint64_t t0r = atomic_load(&g_tw_t0_real_mach);
-    uint64_t t0w = atomic_load(&g_tw_t0_warp_mach);
-    if (t0r == 0 || (rate >= 0.999 && rate <= 1.001)) return real_mach;
-    if (real_mach <= t0r) return t0w;
-    return t0w + (uint64_t)((double)(real_mach - t0r) * rate);
-}
 static uint64_t _compute_warp_us(uint64_t real_us) {
     double rate = tw_get_rate();
     uint64_t t0r = atomic_load(&g_tw_t0_real_us);
@@ -319,17 +290,6 @@ static uint64_t _compute_warp_us(uint64_t real_us) {
     if (t0r == 0 || (rate >= 0.999 && rate <= 1.001)) return real_us;
     if (real_us <= t0r) return t0w;
     return t0w + (uint64_t)((double)(real_us - t0r) * rate);
-}
-
-static uint64_t tw_mach_absolute_time(void) {
-    uint64_t real = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
-    atomic_fetch_add(&g_tw_mach_calls, 1);
-    if (!atomic_load(&g_tw_en_mach)) return real;
-    if (atomic_load(&g_tw_freeze_count) > 0) {
-        uint64_t f = atomic_load(&g_tw_frozen_mach);
-        return f ? f : real;
-    }
-    return _compute_warp_mach(real);
 }
 
 static int tw_gettimeofday(struct timeval *tv, void *tz) {
@@ -346,7 +306,7 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
     } else {
         warp_us = _compute_warp_us(real_us);
     }
-    if (warp_us == real_us) return r; // 1.0x 直通
+    if (warp_us == real_us) return r;
     tv->tv_sec  = (time_t)(warp_us / 1000000ULL);
     tv->tv_usec = (suseconds_t)(warp_us % 1000000ULL);
     return r;
@@ -445,9 +405,28 @@ static void _gp_retime_logic_clock(void *logic) {
     *start_ms = (int32_t)after;
 }
 
+// 音画漂移校正: 比较谱面时间与音频位置, 超过阈值则微调 clock[40]
+static void _gp_drift_correct(void *logic) {
+    if (!logic || !addr_readable((char *)logic + 56, sizeof(void *))) return;
+    void *clk = *(void **)((char *)logic + 48);
+    if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return;
+    uint32_t audio_ms = atomic_load(&g_last_pos_ms);
+    if (audio_ms < 100) return;
+    int32_t chart_ms = _read_chart_clock_ms(clk);
+    if (chart_ms < 0) return;
+    int32_t drift = chart_ms - (int32_t)audio_ms;
+    if (drift > 50 || drift < -50) {
+        int32_t correction = drift / 2;
+        if (correction == 0) correction = (drift > 0) ? 1 : -1;
+        int32_t *base_off = (int32_t *)((char *)clk + 40);
+        *base_off += correction;
+    }
+}
+
 // Gameplay.update vtable hook:
-//   1. 缓存 Gameplay 实例 (seek 需要)
-//   2. 调用 _gp_retime_logic_clock 变速谱面 (mach_absolute_time 无法影响谱面时钟)
+//   1. 缓存 Gameplay 实例 (seek/reset 需要)
+//   2. _gp_retime_logic_clock 变速谱面
+//   3. _gp_drift_correct 校正音画漂移
 static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     atomic_fetch_add(&g_tw_gp_update_calls, 1);
     if (self) {
@@ -455,8 +434,10 @@ static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, u
         void *logic = NULL;
         if (addr_readable((char *)self + 936, sizeof(void *)))
             logic = *(void **)((char *)self + 928);
-        if (logic && ptr_plausible(logic))
+        if (logic && ptr_plausible(logic)) {
             _gp_retime_logic_clock(logic);
+            _gp_drift_correct(logic);
+        }
     }
     return s_orig_gp_update ? s_orig_gp_update(self, a2, a3, a4, a5) : 0;
 }
@@ -543,93 +524,66 @@ static void install_vtable_swizzles(void) {
     });
 }
 
-// UI 开关对应的 hook 是否已真正装上
 static int clock_hook_ready_for_idx(int idx) {
-    switch (idx) {
-        case 0:  return s_orig_gettod != NULL;          // gettimeofday
-        case 1:  return s_orig_mach_abs != NULL;        // mach_absolute_time
-        default: return 0;
-    }
+    if (idx == 0) return s_orig_gettod != NULL;
+    return 0;
 }
 
-// 增加冻结计数（用户暂停 / 切后台 / seek 期间皆可调用）
 static void time_warp_freeze_inc(void) {
     int32_t prev = atomic_fetch_add(&g_tw_freeze_count, 1);
     if (prev == 0) {
-        // 第一次冻结：capture 当前 warp 时间作为冻结值
-        uint64_t real_mach = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
         struct timeval tv = {0};
         uint64_t real_us = 0;
-        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0) {
+        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0)
             real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-        } else if (gettimeofday(&tv, NULL) == 0) {
+        else if (gettimeofday(&tv, NULL) == 0)
             real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-        }
-        atomic_store(&g_tw_frozen_mach, _compute_warp_mach(real_mach));
-        atomic_store(&g_tw_frozen_us,   _compute_warp_us(real_us));
+        atomic_store(&g_tw_frozen_us, _compute_warp_us(real_us));
     }
 }
 
 static void time_warp_freeze_dec(void) {
     int32_t prev = atomic_fetch_sub(&g_tw_freeze_count, 1);
     if (prev <= 0) {
-        // 计数下溢，恢复 0
         atomic_store(&g_tw_freeze_count, 0);
         return;
     }
     if (prev == 1) {
-        // 完全解冻：rebase t0_*，让 warp 时间从冻结值无缝继续
-        uint64_t real_mach = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
         struct timeval tv = {0};
         uint64_t real_us = 0;
-        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0) {
+        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0)
             real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-        } else if (gettimeofday(&tv, NULL) == 0) {
+        else if (gettimeofday(&tv, NULL) == 0)
             real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-        }
-        atomic_store(&g_tw_t0_real_mach, real_mach);
-        atomic_store(&g_tw_t0_warp_mach, atomic_load(&g_tw_frozen_mach) ? atomic_load(&g_tw_frozen_mach) : real_mach);
-        atomic_store(&g_tw_t0_real_us,   real_us);
-        atomic_store(&g_tw_t0_warp_us,   atomic_load(&g_tw_frozen_us)   ? atomic_load(&g_tw_frozen_us)   : real_us);
+        atomic_store(&g_tw_t0_real_us, real_us);
+        atomic_store(&g_tw_t0_warp_us, atomic_load(&g_tw_frozen_us) ? atomic_load(&g_tw_frozen_us) : real_us);
     }
 }
 
-// 设置新倍率: 先用当前 warp 时间做新基准, 保证时间连续不跳变
 static void time_warp_set_rate(double rate) {
     if (rate <= 0.001) return;
-    uint64_t real_mach_now = s_orig_mach_abs ? s_orig_mach_abs() : mach_absolute_time();
     struct timeval tv_now = {0};
     int gtr = s_orig_gettod ? s_orig_gettod(&tv_now, NULL) : gettimeofday(&tv_now, NULL);
     uint64_t real_us_now = 0;
     if (gtr == 0) real_us_now = (uint64_t)tv_now.tv_sec * 1000000ULL + (uint64_t)tv_now.tv_usec;
 
-    uint64_t warp_mach_now = _compute_warp_mach(real_mach_now);
-    uint64_t warp_us_now   = _compute_warp_us(real_us_now);
-
-    atomic_store(&g_tw_t0_real_mach, real_mach_now);
-    atomic_store(&g_tw_t0_warp_mach, warp_mach_now);
-    atomic_store(&g_tw_t0_real_us,   real_us_now);
-    atomic_store(&g_tw_t0_warp_us,   warp_us_now);
+    uint64_t warp_us_now = _compute_warp_us(real_us_now);
+    atomic_store(&g_tw_t0_real_us, real_us_now);
+    atomic_store(&g_tw_t0_warp_us, warp_us_now);
     atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
 
     apply_speed_to_all_channels();
-    s_gp_last_real_us = 0;  // 强制 retime 下一帧重新建立基准
+    s_gp_last_real_us = 0;
 }
 
 static void time_warp_install(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // gettimeofday: CCDirector visual warp
-        // mach_absolute_time: kept for misc consumers (low call count, nearly free)
-        struct rebinding rs[2] = {
-            { "mach_absolute_time",                (void *)tw_mach_absolute_time,                (void **)&s_orig_mach_abs },
-            { "gettimeofday",                      (void *)tw_gettimeofday,                      (void **)&s_orig_gettod   },
+        struct rebinding rs[1] = {
+            { "gettimeofday", (void *)tw_gettimeofday, (void **)&s_orig_gettod },
         };
-        int r = rebind_symbols(rs, 2);
-        ensure_timebase();
-        acc_flog(@"fishhook ret=%d (2 symbols): mach=%p gtod=%p tb=%u/%u",
-                 r, (void *)s_orig_mach_abs, (void *)s_orig_gettod,
-                 s_tb_info.numer, s_tb_info.denom);
+        int r = rebind_symbols(rs, 1);
+        acc_flog(@"fishhook ret=%d: gtod=%p", r, (void *)s_orig_gettod);
     });
 }
 
@@ -677,10 +631,41 @@ static void player_seek_ms(uint32_t ms) {
                 acc_flog(@"[seek] chart clock adjusted: cur=%d target=%u delta=%d new_base=%d",
                          cur_ms, ms, delta, *base_off);
             }
+
+            // 3. 重置谱面事件状态: 重新激活所有音轨, 允许音符重新渲染
+            //    LogicChart+40 -> chart_data -> +80/+88 = tracks vector
+            //    每个 track 的 byte[0] = 1 表示活跃
+            void *chart_data = *(void **)((char *)logic + 40);
+            if (chart_data && ptr_plausible(chart_data) && addr_readable((char *)chart_data + 96, 8)) {
+                void **tracks_begin = *(void ***)((char *)chart_data + 80);
+                void **tracks_end   = *(void ***)((char *)chart_data + 88);
+                if (tracks_begin && tracks_end && tracks_end > tracks_begin) {
+                    int n_reactivated = 0;
+                    for (void **t = tracks_begin; t < tracks_end; t++) {
+                        if (*t && ptr_plausible(*t) && addr_readable(*t, 8)) {
+                            if (*(uint8_t *)(*t) != 1) {
+                                *(uint8_t *)(*t) = 1;
+                                n_reactivated++;
+                            }
+                        }
+                    }
+                    acc_flog(@"[seek] reactivated %d tracks", n_reactivated);
+                }
+            }
+
+            // 4. 清除 "已结束" 标志, 允许谱面继续处理
+            //    LogicChart + 312: chart active, +313: finished, +314..+320: misc flags
+            if (addr_readable((char *)logic + 321, 1)) {
+                *(uint8_t *)((char *)logic + 313) = 0;  // finished → 0
+                *(uint8_t *)((char *)logic + 314) = 0;
+                *(uint8_t *)((char *)logic + 315) = 0;
+                *(uint8_t *)((char *)logic + 316) = 0;
+                acc_flog(@"[seek] chart finished flags reset");
+            }
         }
     }
 
-    s_gp_last_real_us = 0;  // 强制 retime 下一帧重新建立基准
+    s_gp_last_real_us = 0;
 
     time_warp_freeze_dec();
 }
@@ -982,7 +967,6 @@ static void loadPref(void) {
 
     struct { const char *label; _Atomic(int) *en; _Atomic(uint64_t) *cnt; } clocks[] = {
         { "gettimeofday (visual)",             &g_tw_en_gtod,           &g_tw_gtod_calls          },
-        { "mach_absolute_time",                &g_tw_en_mach,           &g_tw_mach_calls          },
     };
     int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
     for (int i = 0; i < nClocks; i++) {
@@ -1124,7 +1108,6 @@ static void loadPref(void) {
     }
     _Atomic(uint64_t) *cnts[] = {
         &g_tw_gtod_calls,
-        &g_tw_mach_calls,
     };
     int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
     UIView *card = [menuView viewWithTag:9001];
@@ -1154,11 +1137,9 @@ static void loadPref(void) {
     int idx = (int)(sw.tag - 3100);
     _Atomic(int) *flags[] = {
         &g_tw_en_gtod,
-        &g_tw_en_mach,
     };
     const char *names[] = {
         "gettimeofday",
-        "mach_absolute_time",
     };
     int n = (int)(sizeof(flags) / sizeof(flags[0]));
     if (idx < 0 || idx >= n) return;
@@ -1356,8 +1337,7 @@ static void doBootstrap(void) {
                 acc_flog(@"new song detected: player=%p channels=%p", p, channels_base_chk);
             }
             if ((s_diag_tick++ % 10) == 0) {
-                acc_flog(@"twcalls mach=%llu gtod=%llu mtp=%llu gp=%llu rate=%.3f freeze=%d",
-                         (unsigned long long)atomic_load(&g_tw_mach_calls),
+                acc_flog(@"twcalls gtod=%llu mtp=%llu gp=%llu rate=%.3f freeze=%d",
                          (unsigned long long)atomic_load(&g_tw_gtod_calls),
                          (unsigned long long)atomic_load(&g_tw_mtp_getpos_calls),
                          (unsigned long long)atomic_load(&g_tw_gp_update_calls),
