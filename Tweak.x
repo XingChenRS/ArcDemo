@@ -405,6 +405,9 @@ static void _gp_retime_logic_clock(void *logic) {
     *start_ms = (int32_t)after;
 }
 
+// forward decl (defined after time_warp_install)
+static int32_t _read_chart_clock_ms(void *clk);
+
 // 音画漂移校正: 比较谱面时间与音频位置, 超过阈值则微调 clock[40]
 static void _gp_drift_correct(void *logic) {
     if (!logic || !addr_readable((char *)logic + 56, sizeof(void *))) return;
