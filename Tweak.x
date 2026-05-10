@@ -15,7 +15,6 @@
 #import <errno.h>
 #import <limits.h>
 #import <mach/vm_map.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_region.h>
 #import <mach/mach_init.h>
 #import <UIKit/UIKit.h>
@@ -148,17 +147,17 @@ static bool addr_readable(const void *p, size_t len) {
     uintptr_t start_u = (uintptr_t)p;
     uintptr_t end_u = start_u + len;
     if (end_u < start_u) return false;
-    mach_vm_address_t region_addr = (mach_vm_address_t)start_u;
-    mach_vm_size_t region_size = 0;
+    vm_address_t region_addr = (vm_address_t)start_u;
+    vm_size_t region_size = 0;
     natural_t depth = 0;
     vm_region_submap_info_data_64_t info;
     mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-    kern_return_t kr = mach_vm_region_recurse(mach_task_self(),
-                                              &region_addr,
-                                              &region_size,
-                                              &depth,
-                                              (vm_region_recurse_info_t)&info,
-                                              &count);
+    kern_return_t kr = vm_region_recurse(mach_task_self(),
+                                         &region_addr,
+                                         &region_size,
+                                         &depth,
+                                         (vm_region_recurse_info_t)&info,
+                                         &count);
     if (kr != KERN_SUCCESS) return false;
     if (start_u < (uintptr_t)region_addr) return false;
     if (end_u > (uintptr_t)(region_addr + region_size)) return false;
