@@ -2,6 +2,10 @@
 // Arcaea iOS 变速/Seek 练习工具 (fork of brendonjkding/accDemo)
 // 单 dylib 注入，游戏内浮窗 UI
 //
+// 修改这个版本号 ↓ 之后所有 NSLog 与 UI 标题会同步更新, 方便排查
+// "用户用的是哪一版" 这种问题。
+#define XRC_TWEAK_VERSION  @"v6.5.3"
+//
 // 变速架构 (v4):
 //   谱面: GP.update vtable -> _gp_retime_logic_clock(clock[16]) + _gp_drift_correct(clock[40])
 //   视觉: gettimeofday fishhook -> CCDirector delta 自动变速
@@ -174,6 +178,7 @@ uint64_t arc_image_base(void) {
 
 static void install_arc_hooks(void) {
     uint64_t base = arc_image_base();
+    NSLog(@"[xrc-arcdemo] tweak %@ loading; arc base = 0x%llx", XRC_TWEAK_VERSION, base);
     if (!base) {
         NSLog(@"[xrc-arcdemo] arc_image_base() = 0, abort");
         return;
@@ -1080,7 +1085,7 @@ void loadPref(void) {
 
     // 标题
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 24)];
-    title.text = @"Arcaea Speed (XRC)";
+    title.text = [NSString stringWithFormat:@"Arcaea Speed (XRC) %@", XRC_TWEAK_VERSION];
     title.font = [UIFont boldSystemFontOfSize:18];
     title.textColor = [UIColor blackColor];
     [card addSubview:title];
@@ -1593,7 +1598,7 @@ void acc_flog(NSString *fmt, ...) {
 static void doBootstrap(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        acc_flog(@"doBootstrap begin");
+        acc_flog(@"==== xrc-arcdemo tweak %@ doBootstrap begin ====", XRC_TWEAK_VERSION);
         @try { initButton(); }       @catch (NSException *e) { acc_flog(@"initButton EX: %@", e); }
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
         @try { time_warp_install(); } @catch (NSException *e) { acc_flog(@"time_warp_install EX: %@", e); }
