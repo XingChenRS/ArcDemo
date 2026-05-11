@@ -34,21 +34,22 @@ extern UIApplication *UIApp;
 
 #import "SuspendView/WQSuspendView.h"
 #import "WHToast/WHToast.h"
+#import "AccCommon.h"
 
 // forward decl: 文件末尾定义，但中部诊断需要用
-static void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
+void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
 #pragma mark - global
 
-static float    *rates = NULL;
-static NSInteger rate_i = 0;
-static NSInteger rate_count = 0;
+float    *rates = NULL;
+NSInteger rate_i = 0;
+NSInteger rate_count = 0;
 
-static BOOL     buttonEnabled = YES;
-static BOOL     toast = YES;
+BOOL     buttonEnabled = YES;
+BOOL     toast = YES;
 
-static WQSuspendView *button = nil;
-static UIView        *menuView = nil;
+WQSuspendView *button = nil;
+UIView        *menuView = nil;
 #pragma mark - Arcaea binary hook (Dobby)
 //
 // 已知偏移 (IDA 6.13.10 分析):
@@ -99,9 +100,25 @@ static _Atomic(float) g_base_freq[ARC_MAX_CHANNELS];   // 0 = 未捕获
 
 // hook 兜底捕获 + 主动通过 registry 获取
 static _Atomic(void *)   g_bgmPlayer = NULL;
-static _Atomic(uint32_t) g_last_pos_ms = 0;
+_Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
 static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
+
+// === 音频速率自校准 ===
+// 想法: FMOD setFrequency(base * rate) 设置后, 由于采样率量化 / 内部混音
+// 误差等原因, 音频实际推进速率不一定精确等于 rate。我们在 tw_mtp_getpos 里
+// 做 ~500ms 滑窗测量 audio_dms / real_dms = measured_rate, 然后乘性逼近
+// 修正系数 corr = target_rate / measured_rate, 在 apply_speed_to_all_channels
+// 时用 base * rate * corr 作为 setFrequency 实参。这样不绑死谱面/音频, 只是
+// 把音频拉到 target_rate, 谱面继续用 _gp_retime_logic_clock 走 target_rate,
+// 两者各自命中总倍率, 不会互相拉扯导致谱面抽搐。
+_Atomic(uint32_t) g_audio_corr_x10000 = 10000;     // 1.0000 默认
+_Atomic(uint32_t) g_audio_meas_rate_x1000 = 1000;  // 最近一次 measured_rate * 1000 (面板诊断)
+static _Atomic(uint32_t) g_audio_meas_count = 0;    // 累计完成测量次数
+// 滑窗状态 (单线程: 只在 tw_mtp_getpos 调用栈使用)
+static uint64_t s_audio_meas_real_us_start = 0;
+static uint32_t s_audio_meas_pos_ms_start = 0;
+static uint32_t s_audio_meas_pos_ms_last = 0;
 
 // 尝试从 player 主轨拿 Sound 总长
 static void try_capture_song_length(void *player) {
@@ -129,21 +146,21 @@ static void *resolve_player_via_registry(void) {
     return mtp;
 }
 
-static inline void *get_player_or_resolve(void) {
+void *get_player_or_resolve(void) {
     void *p = atomic_load(&g_bgmPlayer);
     if (p) return p;
     return resolve_player_via_registry();
 }
 
 // 防止读到野指针：先做用户态地址粗筛。
-static inline bool ptr_plausible(const void *p) {
+bool ptr_plausible(const void *p) {
     uintptr_t v = (uintptr_t)p;
     if (v < 0x100000000ULL) return false;
     if ((v & 0x7ULL) != 0) return false;
     return true;
 }
 
-static bool addr_readable(const void *p, size_t len) {
+bool addr_readable(const void *p, size_t len) {
     if (!p || len == 0) return false;
     if (!ptr_plausible(p)) return false;
     uintptr_t start_u = (uintptr_t)p;
@@ -156,7 +173,7 @@ static bool addr_readable(const void *p, size_t len) {
 }
 
 // 取 Arc-mobile 主二进制基址
-static uint64_t arc_image_base(void) {
+uint64_t arc_image_base(void) {
     static uint64_t cached = 0;
     if (cached) return cached;
     uint32_t n = _dyld_image_count();
@@ -233,12 +250,16 @@ static int player_collect_channels(void **outChs, int outCap) {
     return got;
 }
 
-// 把当前 rate 应用到所有 channel：base_freq * rate；首个调用会缓存 base_freq
+// 把当前 rate 应用到所有 channel：base_freq * rate * audio_corr
+// audio_corr 由 tw_mtp_getpos 滑窗测量并乘性逼近 target/measured，
+// 用来抵消 FMOD setFrequency 的量化/混音误差。
 static void apply_speed_to_all_channels(void) {
     if (!g_ch_set_frequency || !g_ch_get_frequency) return;
     if (rate_count <= 0 || !rates) return;
     float rate = rates[rate_i];
     if (rate <= 0.001f) return;
+    float corr = (float)atomic_load(&g_audio_corr_x10000) / 10000.0f;
+    if (corr < 0.5f || corr > 2.0f) corr = 1.0f;
     void *chs[ARC_MAX_CHANNELS] = {0};
     int n = player_collect_channels(chs, ARC_MAX_CHANNELS);
     for (int i = 0; i < n; i++) {
@@ -254,7 +275,7 @@ static void apply_speed_to_all_channels(void) {
                 continue;
             }
         }
-        float target = base * rate;
+        float target = base * rate * corr;
         g_ch_set_frequency(chs[i], target);
     }
 }
@@ -266,18 +287,18 @@ static void apply_speed_to_all_channels(void) {
 // 切倍率瞬间: t0_real = real_now; t0_warp = warp_now (保持连续, 不跳变)
 
 typedef int (*orig_gettod_t)(struct timeval *tv, void *tz);
-static orig_gettod_t s_orig_gettod = NULL;
+orig_gettod_t s_orig_gettod = NULL;
 
 static _Atomic(uint64_t) g_tw_t0_real_us   = 0;
 static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;
 static _Atomic(uint32_t) g_tw_rate_x1000   = 1000;
 
 // 冻结机制: 暂停 / 切后台 / seek 时冻结 warp 时间
-static _Atomic(int32_t)  g_tw_freeze_count = 0;
+_Atomic(int32_t)  g_tw_freeze_count = 0;
 static _Atomic(uint64_t) g_tw_frozen_us    = 0;
 
-static _Atomic(uint64_t) g_tw_gtod_calls = 0;
-static _Atomic(int) g_tw_en_gtod = 1;
+_Atomic(uint64_t) g_tw_gtod_calls = 0;
+_Atomic(int) g_tw_en_gtod = 1;
 
 static inline double tw_get_rate(void) {
     return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
@@ -340,7 +361,7 @@ typedef int64_t (*orig_gp_update_fn)(void *self, uint64_t a2, uint64_t a3, uint6
 static orig_mtp_getpos_fn s_orig_mtp_getpos = NULL;
 static orig_gp_update_fn s_orig_gp_update = NULL;
 static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
-static _Atomic(uint64_t) g_tw_gp_update_calls = 0;
+_Atomic(uint64_t) g_tw_gp_update_calls = 0;
 static _Atomic(int) g_tw_gp_update_installed = 0;
 
 // isCompleted hook state (v6: timing-aware seek-replay).
@@ -360,18 +381,18 @@ static _Atomic(int) g_tw_gp_update_installed = 0;
 //   +56..63 (int32x2)   distance base offset (init-time const)
 typedef int (*orig_iscompleted_fn)(void *self);
 static orig_iscompleted_fn s_orig_iscompleted = NULL;
-static _Atomic(uint64_t) g_rewind_until_us  = 0;       // legacy v5 backstop window deadline (real us)
-static _Atomic(int32_t)  g_seek_target_ms   = INT_MIN; // v6: chart-ms target of last seek; INT_MIN = inactive
-static _Atomic(uint64_t) g_iscompleted_calls = 0;
-static _Atomic(uint64_t) g_iscompleted_force_zero = 0;
-static _Atomic(uint64_t) g_iscompleted_force_one  = 0;
-static _Atomic(int)      g_iscompleted_installed_count = 0;
+_Atomic(uint64_t) g_rewind_until_us  = 0;       // legacy v5 backstop window deadline (real us)
+_Atomic(int32_t)  g_seek_target_ms   = INT_MIN; // v6: chart-ms target of last seek; INT_MIN = inactive
+_Atomic(uint64_t) g_iscompleted_calls = 0;
+_Atomic(uint64_t) g_iscompleted_force_zero = 0;
+_Atomic(uint64_t) g_iscompleted_force_one  = 0;
+_Atomic(int)      g_iscompleted_installed_count = 0;
 // Per-vtable install diag (visible in panel). 0..4 = code:
 //   0='?' not tried, 'O'=ok, 'B'=bad-base, 'U'=unreadable, 'M'=mismatch slot5,
 //   'P'=mprotect fail, 'S'=signed-write
-static _Atomic(int) g_iscompleted_vt_code[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
+_Atomic(int) g_iscompleted_vt_code[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
 // Last raw value seen at slot 5 (post-PAC-strip), for panel hex dump on failure
-static _Atomic(uint64_t) g_iscompleted_vt_seen[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
+_Atomic(uint64_t) g_iscompleted_vt_seen[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
 // Tunable: future-window slop (ms). Notes within this past-radius of seek
 // target are also treated as "future" so just-passed notes get re-shown.
 #define ARC_SEEK_FUTURE_SLOP_MS  120
@@ -380,7 +401,7 @@ static _Atomic(uint64_t) g_iscompleted_vt_seen[ARC_OFF_VT_LOGICNOTE_COUNT] = {0}
 #define ARC_NOTE_TIMING_MAX  ( 1200000)   /* 20 min */
 
 // 缓存 Gameplay 实例指针 (seek 需要访问谱面时钟)
-static _Atomic(void *) g_gameplay_instance = NULL;
+_Atomic(void *) g_gameplay_instance = NULL;
 
 // retime 状态: 记录上一帧的真实时间和 clock 指针, 用于计算帧间 delta
 static void *s_gp_last_clock = NULL;
@@ -397,6 +418,55 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
             atomic_store(&g_song_length_ms, 0);
         } else if (raw > atomic_load(&g_max_seen_ms)) {
             atomic_store(&g_max_seen_ms, raw);
+        }
+
+        // ===== 音频速率测量 (only when not frozen / not paused) =====
+        if (atomic_load(&g_tw_freeze_count) == 0 && raw > 0) {
+            uint64_t now_us = _real_now_us_unwarped();
+            if (now_us != 0) {
+                if (s_audio_meas_real_us_start == 0 ||
+                    raw < s_audio_meas_pos_ms_last) {
+                    // 初始化 / seek 后回退 -> 重置窗口
+                    s_audio_meas_real_us_start = now_us;
+                    s_audio_meas_pos_ms_start  = raw;
+                    s_audio_meas_pos_ms_last   = raw;
+                } else {
+                    s_audio_meas_pos_ms_last = raw;
+                    uint64_t dur_us = now_us - s_audio_meas_real_us_start;
+                    if (dur_us >= 500000ULL) {  // 500ms 一窗
+                        uint32_t audio_dms = raw - s_audio_meas_pos_ms_start;
+                        double real_dms = (double)dur_us / 1000.0;
+                        if (real_dms > 1.0 && audio_dms < 60000) {  // 防 seek/异常
+                            double measured = (double)audio_dms / real_dms;
+                            if (measured > 0.10 && measured < 5.0) {
+                                atomic_store(&g_audio_meas_rate_x1000,
+                                             (uint32_t)(measured * 1000.0 + 0.5));
+                                double target = tw_get_rate();
+                                double corr = (double)atomic_load(&g_audio_corr_x10000) / 10000.0;
+                                // 乘性收敛: corr_new = corr * (target / measured)
+                                // 限制单步幅度避免震荡
+                                double ratio = target / measured;
+                                if (ratio > 1.05) ratio = 1.05;
+                                if (ratio < 0.95) ratio = 0.95;
+                                corr *= ratio;
+                                if (corr > 1.20) corr = 1.20;
+                                if (corr < 0.80) corr = 0.80;
+                                atomic_store(&g_audio_corr_x10000,
+                                             (uint32_t)(corr * 10000.0 + 0.5));
+                                atomic_fetch_add(&g_audio_meas_count, 1);
+                                // 应用到 FMOD (异步推进, 不阻塞 getpos)
+                                apply_speed_to_all_channels();
+                            }
+                        }
+                        // 滑窗推进
+                        s_audio_meas_real_us_start = now_us;
+                        s_audio_meas_pos_ms_start  = raw;
+                    }
+                }
+            }
+        } else {
+            // freeze 期间冻结测量
+            s_audio_meas_real_us_start = 0;
         }
     }
     return raw;
@@ -423,11 +493,10 @@ static int32_t _read_chart_clock_ms(void *clk);
 // 每帧 adjust = (1 - rate) * real_delta_ms -> clock[16] += adjust
 // 效果: 谱面推进速度 = real_delta + (rate-1)*real_delta = rate * real_delta
 //
-// + 漂移校正 (Issue 4 修复):
-//   即使 rate-driven 推进精确, FMOD setFrequency 量化 / 帧抖动 / int32 ms 截断
-//   会让 chart_clock 相对 audio_pos 缓慢漂移 (实测达 5+ 秒)。
-//   每帧额外注入 drift = (chart_now - audio_now) / 20 (5% 低通) 把 chart 拉回 audio。
-//   只在 song 内 (audio>500ms) 且 |drift|<10s 时启用，避免初始 / seek 期误干预。
+// 注意: 不在这里做 chart->audio 绝对位置的低通拉回 (会让谱面抽搐)。
+// 谱面/音频的相对漂移由 apply_speed_to_all_channels 内基于实际测量的
+// 音频步进速率, 反向补偿 FMOD setFrequency 的乘子来收敛, 见下方 audio
+// rate 自校准段。
 static void _gp_retime_logic_clock(void *logic) {
     if (!logic) return;
     if (atomic_load(&g_tw_freeze_count) > 0) return;
@@ -453,20 +522,6 @@ static void _gp_retime_logic_clock(void *logic) {
     int32_t adjust = 0;
     if (rate < 0.999 || rate > 1.001)
         adjust = (int32_t)((1.0 - rate) * (double)delta_ms);
-
-    // Drift correction toward audio_pos (rate-agnostic, runs always)
-    int32_t chart_now = _read_chart_clock_ms(clk);
-    uint32_t audio_ms = atomic_load(&g_last_pos_ms);
-    if (chart_now > 0 && audio_ms > 500) {
-        int32_t drift = chart_now - (int32_t)audio_ms;  // >0: chart ahead
-        if (drift > -10000 && drift < 10000) {
-            // Apply 5% / frame, capped at ±20ms / frame to avoid visible jump
-            int32_t correct = drift / 20;
-            if (correct > 20) correct = 20;
-            if (correct < -20) correct = -20;
-            adjust += correct;
-        }
-    }
 
     if (adjust == 0) return;
     int32_t *start_ms = (int32_t *)((char *)clk + 16);
@@ -688,7 +743,7 @@ static void install_vtable_swizzles(void) {
     });
 }
 
-static int clock_hook_ready_for_idx(int idx) {
+int clock_hook_ready_for_idx(int idx) {
     if (idx == 0) return s_orig_gettod != NULL;
     return 0;
 }
@@ -724,7 +779,7 @@ static void time_warp_freeze_dec(void) {
     }
 }
 
-static void time_warp_set_rate(double rate) {
+void time_warp_set_rate(double rate) {
     if (rate <= 0.001) return;
     struct timeval tv_now = {0};
     int gtr = s_orig_gettod ? s_orig_gettod(&tv_now, NULL) : gettimeofday(&tv_now, NULL);
@@ -735,6 +790,10 @@ static void time_warp_set_rate(double rate) {
     atomic_store(&g_tw_t0_real_us, real_us_now);
     atomic_store(&g_tw_t0_warp_us, warp_us_now);
     atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
+
+    // 切倍率: 重置音频自校准 (avoid carry-over corr 从旧 rate)
+    atomic_store(&g_audio_corr_x10000, 10000);
+    s_audio_meas_real_us_start = 0;
 
     apply_speed_to_all_channels();
     s_gp_last_real_us = 0;
@@ -762,7 +821,7 @@ static int32_t _read_chart_clock_ms(void *clk) {
     return v - *(int32_t *)((char *)clk + 40) + off;
 }
 
-static void player_seek_ms(uint32_t ms) {
+void player_seek_ms(uint32_t ms) {
     void *self = get_player_or_resolve();
     if (!self) return;
 
@@ -888,29 +947,14 @@ static void player_seek_ms(uint32_t ms) {
     time_warp_freeze_dec();
 }
 
-static void player_set_paused(BOOL paused) {
-    void *self = get_player_or_resolve();
-    if (!self) return;
-    // 修正：vtable[6] = setPaused(this, paused, channel)
-    typedef void (*set_paused_fn)(void *, int, int);
-    set_paused_fn fn = (set_paused_fn)_player_vt_slot(self, 0x30); // slot 6
-    if (!fn) return;
-    if (paused) {
-        time_warp_freeze_inc();
-        fn(self, 1, 0);
-    } else {
-        fn(self, 0, 0);
-        s_gp_last_real_us = 0;  // 恢复后重建 retime 基准
-        time_warp_freeze_dec();
-    }
-}
+// (player_set_paused 已移除: 用户反馈暂停 BGM 没意义且与 freeze 冲突)
 
-static uint32_t player_get_position_ms_cached(void) {
+uint32_t player_get_position_ms_cached(void) {
     return atomic_load(&g_last_pos_ms);
 }
 
 // 调用者需要的最大进度值：优先 FMOD 拿到的真实总长，其次是运行中看到过的最大 ms
-static uint32_t player_get_progress_max_ms(void) {
+uint32_t player_get_progress_max_ms(void) {
     uint32_t len = atomic_load(&g_song_length_ms);
     if (len > 0) return len;
     return atomic_load(&g_max_seen_ms);
@@ -918,7 +962,7 @@ static uint32_t player_get_progress_max_ms(void) {
 
 #pragma mark - prefs
 
-static NSMutableDictionary *loadPrefDict(void) {
+NSMutableDictionary *loadPrefDict(void) {
     NSMutableDictionary *p = [[NSMutableDictionary alloc] initWithContentsOfFile:kPrefPath];
     if (!p) p = [NSMutableDictionary new];
     if (!p[@"speedKeys"] || ![p[@"speedKeys"] count]) {
@@ -934,13 +978,13 @@ static NSMutableDictionary *loadPrefDict(void) {
     return p;
 }
 
-static void savePrefDict(NSDictionary *p) {
+void savePrefDict(NSDictionary *p) {
     NSString *dir = [kPrefPath stringByDeletingLastPathComponent];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     [p writeToFile:kPrefPath atomically:YES];
 }
 
-static void loadPref(void) {
+void loadPref(void) {
     NSMutableDictionary *prefs = loadPrefDict();
     toast         = [prefs[@"toast"] boolValue];
     buttonEnabled = [prefs[@"buttonEnabled"] boolValue];
@@ -1005,9 +1049,7 @@ static void loadPref(void) {
 @property (nonatomic, strong) NSTimer *progressTimer;
 @property (nonatomic, strong) UISlider *progressSlider;
 @property (nonatomic, strong) UILabel *progressLabel;
-@property (nonatomic, strong) UISwitch *pauseSwitch;
 @property (nonatomic, assign) BOOL userDraggingSlider;
-@property (nonatomic, assign) BOOL paused;
 @end
 
 @implementation AccMenuController
@@ -1060,7 +1102,6 @@ static void loadPref(void) {
     self.progressTimer = nil;
     self.progressSlider = nil;
     self.progressLabel = nil;
-    self.pauseSwitch = nil;
     [menuView removeFromSuperview];
     menuView = nil;
 }
@@ -1138,20 +1179,7 @@ static void loadPref(void) {
     self.progressLabel = posLbl;
     y += 22;
 
-    UILabel *pauseLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    pauseLbl.text = @"Pause BGM";
-    pauseLbl.font = [UIFont systemFontOfSize:14];
-    pauseLbl.textColor = [UIColor blackColor];
-    [card addSubview:pauseLbl];
-    UISwitch *pauseSw = [[UISwitch alloc] initWithFrame:CGRectZero];
-    CGSize pSize = pauseSw.bounds.size;
-    pauseSw.frame = CGRectMake(W - 12 - pSize.width, y, pSize.width, pSize.height);
-    pauseSw.on = self.paused;
-    pauseSw.enabled = playerReady;
-    [pauseSw addTarget:self action:@selector(pauseChanged:) forControlEvents:UIControlEventValueChanged];
-    [card addSubview:pauseSw];
-    self.pauseSwitch = pauseSw;
-    y += MAX(28, pSize.height) + 8;
+    // (Pause BGM 控件已移除: setPaused 与 freeze 双重暂停冲突, 实测不可用)
 
     [self.progressTimer invalidate];
     self.progressTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
@@ -1316,11 +1344,6 @@ static void loadPref(void) {
     player_seek_ms((uint32_t)s.value);
 }
 
-- (void)pauseChanged:(UISwitch *)s {
-    self.paused = s.on;
-    player_set_paused(s.on);
-}
-
 - (void)progressTick:(NSTimer *)t {
     if (!menuView) { [t invalidate]; self.progressTimer = nil; return; }
     uint32_t cur = player_get_position_ms_cached();
@@ -1338,9 +1361,6 @@ static void loadPref(void) {
         lbl.text = [NSString stringWithFormat:@"%02u:%02u.%03u / %02u:%02u",
                     cs / 60u, cs % 60u, ms,
                     ts / 60u, ts % 60u];
-    }
-    if (self.pauseSwitch && !self.pauseSwitch.enabled && get_player_or_resolve()) {
-        self.pauseSwitch.enabled = YES;
     }
     _Atomic(uint64_t) *cnts[] = {
         &g_tw_gtod_calls,
@@ -1416,6 +1436,7 @@ static void loadPref(void) {
             @"rate %.3fx  freeze=%d  rwnd=%llums\n"
              "real %llums  warp %llums  drift %lldms\n"
              "mach %llums  audio %ums  chart %dms\n"
+             "audio.meas %.3fx  corr %.3fx  N=%u\n"
              "isComp inst=%d [%s] calls=%llu z=%llu o=%llu\n"
              "%@seekTgt=%@",
             rate, freeze_n,
@@ -1426,6 +1447,9 @@ static void loadPref(void) {
             (unsigned long long)mach_ms,
             audio_ms,
             chart_ms,
+            (double)atomic_load(&g_audio_meas_rate_x1000) / 1000.0,
+            (double)atomic_load(&g_audio_corr_x10000) / 10000.0,
+            (unsigned)atomic_load(&g_audio_meas_count),
             isc_inst, vtcodes, (unsigned long long)isc_calls,
             (unsigned long long)isc_z, (unsigned long long)isc_o,
             (first_bad_idx >= 0
@@ -1597,7 +1621,7 @@ static void initButton(void) {
 #pragma mark - bootstrap
 
 // 文件日志：sideload 下没法接 Console，写到 app Documents/xrc-arcdemo.log
-static void acc_flog(NSString *fmt, ...) {
+void acc_flog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);

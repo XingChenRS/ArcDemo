@@ -8,7 +8,16 @@
 
 ---
 
-## 当前状态 (v6.1, 2026-05-11)
+## 当前状态 (v6.2, 2026-05-11)
+
+### v6.2 改动
+
+- **音/谱解耦** (修复变速抽搐): `_gp_retime_logic_clock` 删除 `chart→audio` 的 5%/帧低通拉回。两路时钟独立按 `target_rate` 推进。
+- **音频自校准**: `tw_mtp_getpos` 滑窗 (~500ms) 实测 `audio_dms / real_dms = measured_rate`, 乘性逼近 `corr ← corr × (target/measured)` (单步±5%, 总幅±20%), `apply_speed_to_all_channels` 用 `base × rate × corr` 抵消 FMOD 频率量化误差。
+- **删除 Pause BGM**: `player_set_paused` + 菜单开关 + `pauseChanged:` 全部移除 (实测与 freeze 双重暂停冲突)。
+- **面板新增** `audio.meas X.XXXx  corr X.XXXx  N=N` 一行用于诊断。
+
+## 历史 v6.1
 
 ### 已实现
 
