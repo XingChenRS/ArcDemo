@@ -471,6 +471,44 @@ static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, u
             logic = *(void **)((char *)self + 928);
         if (logic && ptr_plausible(logic))
             _gp_retime_logic_clock(logic);
+
+        // [v6.6 prep] 一次性 dump 判定窗口 settings 链:
+        //   LogicNoteGroup(+32) -> obj(+0x268) -> vtable[0xE0/8] = getJudgeWindow()
+        //   目标: 摸清 *(LogicNoteGroup+32) 是什么类, 以确认 vtable 劫持安全性。
+        static _Atomic(int) s_judge_dump_done = 0;
+        if (logic && ptr_plausible(logic) && !atomic_load(&s_judge_dump_done)) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&s_judge_dump_done, &expected, 1)) {
+                @try {
+                    void *o32 = NULL;
+                    if (addr_readable((char *)logic + 32, sizeof(void *)))
+                        o32 = *(void **)((char *)logic + 32);
+                    void *o32_vt = NULL, *settings = NULL, *settings_vt = NULL, *fn = NULL;
+                    uint8_t use_custom_flag = 0;
+                    if (o32 && ptr_plausible(o32)) {
+                        if (addr_readable(o32, 8)) o32_vt = *(void **)o32;
+                        if (addr_readable((char *)o32 + 0x110, 1)) // chart+272 use_custom flag
+                            use_custom_flag = *(uint8_t *)((char *)o32 + 0x110);
+                        if (addr_readable((char *)o32 + 0x268, sizeof(void *)))
+                            settings = *(void **)((char *)o32 + 0x268);
+                    }
+                    if (settings && ptr_plausible(settings) && addr_readable(settings, 8)) {
+                        settings_vt = *(void **)settings;
+                        if (settings_vt && ptr_plausible(settings_vt) &&
+                            addr_readable((char *)settings_vt + 0xE0, sizeof(void *)))
+                            fn = *(void **)((char *)settings_vt + 0xE0);
+                    }
+                    uint64_t base = arc_image_base();
+                    acc_flog(@"[judge-probe] logic=%p +32=%p (vt=%p, +0x110=%u, +0x268=settings=%p)",
+                             logic, o32, o32_vt, (unsigned)use_custom_flag, settings);
+                    acc_flog(@"[judge-probe] settings_vt=%p vt[0xE0/8] fn=%p (image=%p, off=0x%llx)",
+                             settings_vt, fn, (void *)base,
+                             (fn && base) ? (unsigned long long)((uint64_t)fn - base) : 0ULL);
+                } @catch (NSException *e) {
+                    acc_flog(@"[judge-probe] EX: %@", e);
+                }
+            }
+        }
     }
     return s_orig_gp_update ? s_orig_gp_update(self, a2, a3, a4, a5) : 0;
 }
