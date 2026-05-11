@@ -8,7 +8,43 @@
 
 ---
 
-## 当前状态 (v6.3.1, 2026-05-12)
+## 当前状态 (v6.4, 2026-05-12)
+
+### v6.4 改动 — 大幅瘦身: 删除音频 hook + 回滚 ScoreKeeper 重置
+
+**删除的代码:**
+- `apply_speed_to_all_channels` (FMOD `Channel::setFrequency` 调用)
+- `player_collect_channels` (枚举 channel 表)
+- `g_base_freq[ARC_MAX_CHANNELS]`, `g_ch_set_frequency`, `g_ch_get_frequency` 及对应类型定义
+- `ARC_OFF_CH_SET_FREQUENCY`, `ARC_OFF_CH_GET_FREQUENCY` (offsets 不再需要)
+- `g_audio_meas_*`, `s_audio_meas_*` (rate 测量全套)
+- `tw_mtp_getpos` 里的 500ms 滑窗校准块
+- `time_warp_set_rate` 里的 `apply_speed_to_all_channels()` 调用
+- `player_seek_ms` 里的 `apply_speed_to_all_channels()` 调用
+- 0.5s NSTimer 里的 `apply_speed_to_all_channels()` + base_freq 重置
+- 面板 `audio.meas X.XXXx N=N` 行 (替换为 `Δ(chart-audio) Nms`)
+
+**回滚的代码:**
+- `player_seek_ms` 步骤 (e) ScoreKeeper 重置整段。原因:
+  实测开始游戏后第一批音符出现时直接跳结算+0分。说明我标的 sk[+92]/[+96]/[+100]/[+104]/[+108]
+  里至少有一个其实是**总谱面 note 数**之类的不变量,被零化后下一帧 `judged>=total`
+  立即触发结束。需要重新反汇编 `sub_100A7DFC4` 的 score-update 入口确认每个偏移
+  的真实语义。**注意: 以前 seek-replay 没崩(只是计分不重置)是因为根本没动 sk!**
+
+**保留的:**
+- 仅两个真 hook: `gettimeofday` (fishhook) + Gameplay vtable[update] (PAC vtable swizzle)
+- LogicNote `isCompleted` vtable swizzle (5 子类) 用于 seek-replay 让 note 重出
+- MTP `getPosition` vtable swizzle: **只读取**,作为进度条 + diag 数据源
+- MTP `seekTo` vtable 调用: `player_seek_ms` 触发
+- 谱面端 `_gp_retime_logic_clock` 独立 rate 推进 (不绑 audio)
+
+**遗留问题:**
+- 音画不同步 (audio 始终 1.0x, chart 按 rate)。用户决定接受/搁置。
+- ScoreKeeper 真实布局未知, seek-replay 无法重置计分。
+
+---
+
+## 历史 v6.3.1 (作废)
 
 ### v6.3.1 改动 — 回退 chart slave, 仅保留 score-keeper reset
 

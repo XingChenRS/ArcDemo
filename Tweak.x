@@ -74,8 +74,6 @@ UIView        *menuView = nil;
 // 直接 FMOD Channel API，绕开 MTP 包装。
 //   getPositionMs(MTP, ch) 内部就是 Channel::getPosition（已确认）→ 改频率 → 谱面/音频同步
 #define ARC_OFF_CH_GET_POSITION    (0xEC03ACULL)
-#define ARC_OFF_CH_SET_FREQUENCY   (0xEC069CULL)
-#define ARC_OFF_CH_GET_FREQUENCY   (0xEC077CULL)
 #define ARC_REG_PLAYER_OFFSET      (8)
 #define ARC_PLAYER_CHANNELS_OFFSET (0x38)
 #define ARC_CHANNEL_ENTRY_PTR_OFF  (8)
@@ -86,17 +84,10 @@ typedef void *   (*get_registry_fn)(void);
 typedef int      (*get_current_sound_fn)(void *channel, void **outSound);
 typedef int      (*get_sound_length_fn)(void *sound, uint32_t *outLen, int unit);
 typedef int      (*ch_get_position_fn)(void *channel, uint32_t *out_ms, int unit);
-typedef int      (*ch_set_frequency_fn)(void *channel, float hz);
-typedef int      (*ch_get_frequency_fn)(void *channel, float *out_hz);
 static get_registry_fn      g_get_registry = NULL;
 static get_current_sound_fn g_get_current_sound = NULL;
 static get_sound_length_fn  g_get_sound_length = NULL;
 static ch_get_position_fn   g_ch_get_position = NULL;
-static ch_set_frequency_fn  g_ch_set_frequency = NULL;
-static ch_get_frequency_fn  g_ch_get_frequency = NULL;
-// 缓存每个 channel 的「初始基准频率」，第一次 setFrequency 前用 getFrequency 抓
-#define ARC_MAX_CHANNELS  (8)
-static _Atomic(float) g_base_freq[ARC_MAX_CHANNELS];   // 0 = 未捕获
 
 // hook 兜底捕获 + 主动通过 registry 获取
 static _Atomic(void *)   g_bgmPlayer = NULL;
@@ -104,14 +95,9 @@ _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
 static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
 
-// === 音频实测速率 (诊断用, 不再做反馈校准) ===
-// chart 直接从 audio_pos 反算, 所以即使 FMOD 频率有量化误差, chart 也会
-// 跟着走, 不需要补偿。这里只保留测量, 方便面板观察 FMOD 实际速率。
-_Atomic(uint32_t) g_audio_meas_rate_x1000 = 1000;  // measured_rate * 1000
-static _Atomic(uint32_t) g_audio_meas_count = 0;
-static uint64_t s_audio_meas_real_us_start = 0;
-static uint32_t s_audio_meas_pos_ms_start = 0;
-static uint32_t s_audio_meas_pos_ms_last = 0;
+// 音频 hook 已废除 (用户决定: 仅留 gettimeofday + Gameplay vtable 两个 hook)。
+// MTP getPos vtable swizzle 仍保留, 仅用作位置读出 (进度条 + seek 反馈),
+// 不再做任何 setFrequency / corr / 滑窗测量。
 
 // 尝试从 player 主轨拿 Sound 总长
 static void try_capture_song_length(void *player) {
@@ -200,11 +186,9 @@ static void install_arc_hooks(void) {
     g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
     g_get_sound_length  = (get_sound_length_fn) (base + ARC_OFF_GET_SOUND_LENGTH);
     g_ch_get_position   = (ch_get_position_fn) (base + ARC_OFF_CH_GET_POSITION);
-    g_ch_set_frequency  = (ch_set_frequency_fn)(base + ARC_OFF_CH_SET_FREQUENCY);
-    g_ch_get_frequency  = (ch_get_frequency_fn)(base + ARC_OFF_CH_GET_FREQUENCY);
-        NSLog(@"[xrc-arcdemo] registry=%p getCurrentSound=%p getLength=%p setFreq=%p",
-            (void *)g_get_registry, (void *)g_get_current_sound,
-          (void *)g_get_sound_length, (void *)g_ch_set_frequency);
+    NSLog(@"[xrc-arcdemo] registry=%p getCurrentSound=%p getLength=%p",
+          (void *)g_get_registry, (void *)g_get_current_sound,
+          (void *)g_get_sound_length);
     void *mtp = resolve_player_via_registry();
     NSLog(@"[xrc-arcdemo] initial MTP via registry = %p", mtp);
     if (mtp) try_capture_song_length(mtp);
@@ -216,58 +200,6 @@ static inline void *_player_vt_slot(void *self, size_t byte_off) {
     void **vtable = *(void ***)self;
     if (!vtable) return NULL;
     return vtable[byte_off / sizeof(void *)];
-}
-
-// 枚举 player 的所有 channel 指针；返回写入数量（最多 outCap 个）
-static int player_collect_channels(void **outChs, int outCap) {
-    void *self = get_player_or_resolve();
-    if (!self) return 0;
-    if (!ptr_plausible(self)) return 0;
-    if (!addr_readable((char *)self + ARC_PLAYER_CHANNELS_OFFSET, 16)) return 0;
-    void *channels_base = *(void **)((char *)self + ARC_PLAYER_CHANNELS_OFFSET);
-    void *channels_end  = *(void **)((char *)self + ARC_PLAYER_CHANNELS_OFFSET + 8);
-    if (!ptr_plausible(channels_base) || !ptr_plausible(channels_end)) return 0;
-    if (!channels_base || !channels_end || channels_end < channels_base) return 0;
-    size_t span = (size_t)((char *)channels_end - (char *)channels_base);
-    if (span > (size_t)ARC_CHANNEL_ENTRY_STRIDE * 256U) return 0;
-    if (!addr_readable(channels_base, span ? span : ARC_CHANNEL_ENTRY_STRIDE)) return 0;
-    size_t n = span / ARC_CHANNEL_ENTRY_STRIDE;
-    if (n > (size_t)outCap) n = (size_t)outCap;
-    int got = 0;
-    for (size_t i = 0; i < n; i++) {
-        void *entry = (char *)channels_base + ARC_CHANNEL_ENTRY_STRIDE * i + ARC_CHANNEL_ENTRY_PTR_OFF;
-        if (!addr_readable(entry, sizeof(void *))) continue;
-        void *ch = *(void **)entry;
-        if (ch) outChs[got++] = ch;
-    }
-    return got;
-}
-
-// 把当前 rate 应用到所有 channel：base_freq * rate
-// (chart 端通过 _gp_retime_logic_clock 直接 slave 到 audio_pos, 不需要乘性
-//  corr 抵消 FMOD 频率量化误差——chart 跟着 audio 走, audio 走多快 chart 就
-//  走多快, 永不漂移。)
-static void apply_speed_to_all_channels(void) {
-    if (!g_ch_set_frequency || !g_ch_get_frequency) return;
-    if (rate_count <= 0 || !rates) return;
-    float rate = rates[rate_i];
-    if (rate <= 0.001f) return;
-    void *chs[ARC_MAX_CHANNELS] = {0};
-    int n = player_collect_channels(chs, ARC_MAX_CHANNELS);
-    for (int i = 0; i < n; i++) {
-        float base = atomic_load(&g_base_freq[i]);
-        if (base <= 1.0f) {
-            float cur = 0;
-            if (g_ch_get_frequency(chs[i], &cur) == 0 && cur > 1.0f) {
-                base = cur;
-                atomic_store(&g_base_freq[i], base);
-            } else {
-                continue;
-            }
-        }
-        float target = base * rate;
-        g_ch_set_frequency(chs[i], target);
-    }
 }
 
 #pragma mark - Time Warp (gettimeofday fishhook for CCDirector visual speed)
@@ -404,7 +336,7 @@ _Atomic(void *) g_gameplay_instance = NULL;
 // retime 状态: 记录上一帧的真实时间和 clock 指针, 用于计算帧间 delta
 static void *s_gp_last_clock = NULL;
 static uint64_t s_gp_last_real_us = 0;
-// MTP getPos vtable wrapper：自动捕获 player 实例 + 位置追踪
+// MTP getPos vtable wrapper：自动捕获 player 实例 + 位置追踪 (仅读取,不变速)
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
     atomic_fetch_add(&g_tw_mtp_getpos_calls, 1);
@@ -416,38 +348,6 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
             atomic_store(&g_song_length_ms, 0);
         } else if (raw > atomic_load(&g_max_seen_ms)) {
             atomic_store(&g_max_seen_ms, raw);
-        }
-
-        // ===== 音频速率测量 (仅诊断, chart 由 _gp_retime_logic_clock 直接 slave) =====
-        if (atomic_load(&g_tw_freeze_count) == 0 && raw > 0) {
-            uint64_t now_us = _real_now_us_unwarped();
-            if (now_us != 0) {
-                if (s_audio_meas_real_us_start == 0 ||
-                    raw < s_audio_meas_pos_ms_last) {
-                    s_audio_meas_real_us_start = now_us;
-                    s_audio_meas_pos_ms_start  = raw;
-                    s_audio_meas_pos_ms_last   = raw;
-                } else {
-                    s_audio_meas_pos_ms_last = raw;
-                    uint64_t dur_us = now_us - s_audio_meas_real_us_start;
-                    if (dur_us >= 500000ULL) {
-                        uint32_t audio_dms = raw - s_audio_meas_pos_ms_start;
-                        double real_dms = (double)dur_us / 1000.0;
-                        if (real_dms > 1.0 && audio_dms < 60000) {
-                            double measured = (double)audio_dms / real_dms;
-                            if (measured > 0.10 && measured < 5.0) {
-                                atomic_store(&g_audio_meas_rate_x1000,
-                                             (uint32_t)(measured * 1000.0 + 0.5));
-                                atomic_fetch_add(&g_audio_meas_count, 1);
-                            }
-                        }
-                        s_audio_meas_real_us_start = now_us;
-                        s_audio_meas_pos_ms_start  = raw;
-                    }
-                }
-            }
-        } else {
-            s_audio_meas_real_us_start = 0;
         }
     }
     return raw;
@@ -768,10 +668,7 @@ void time_warp_set_rate(double rate) {
     atomic_store(&g_tw_t0_warp_us, warp_us_now);
     atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
 
-    // 切倍率: 重置测量窗口
-    s_audio_meas_real_us_start = 0;
-
-    apply_speed_to_all_channels();
+    // (\u97f3\u9891 hook \u5df2\u5e9f\u9664: \u4ec5\u8c03\u8c31\u9762\u53d8\u901f, \u97f3\u9891\u4e0d\u52a8\u3002)
     s_gp_last_real_us = 0;
 }
 
@@ -810,8 +707,6 @@ void player_seek_ms(uint32_t ms) {
         fn(self, ms, 0);
         acc_flog(@"[seek] audio seek to %u ms", ms);
     }
-
-    apply_speed_to_all_channels();
 
     // 2. 谱面时钟跳转：修改 clock[40] 使得 display_time = target_ms
     //    Gameplay(+928) → LogicChart(+48) → Clock
@@ -916,42 +811,7 @@ void player_seek_ms(uint32_t ms) {
                 acc_flog(@"[seek] chart flags reset");
             }
 
-            // e) ScoreKeeper 重置 (类比 ArcCreate 的 ScoreService.ResetScoreTo +
-            //    JudgementService.ResetJudge)。ScoreKeeper = *(LogicNote+56),
-            //    布局来自 sub_100A7DFC4 (per-frame UI updater) 反汇编:
-            //      sk[5]  (off 20)  = 当前显示分数 (int)
-            //      sk[7]  (off 28)  = 当前 HP/life (float)
-            //      sk[19] (off 76)  = HP_max (float)
-            //      sk[23] (off 92)  = total_combo (int)
-            //      sk[24] (off 96)  = pure_count
-            //      sk[25] (off 100) = far_count?
-            //      sk[26] (off 104) = lost_count?
-            //      sk[27] (off 108) = late/early?
-            //    判定计数 (24..27) 在 sub_100A7DFC4 中被计算成 v14 = sk[26]+sk[25]+sk[27]
-            //    并比较 a1+812 缓存——这就是 "已判定 note 数"。我们重置这些字段,
-            //    分数/HP/combo 将按重新出现的 note 重新累计。
-            if (addr_readable((char *)logic + 64, 8)) {
-                void *sk = *(void **)((char *)logic + 56);
-                if (sk && ptr_plausible(sk) && addr_readable(sk, 128)) {
-                    int32_t old_combo = *(int32_t *)((char *)sk + 92);
-                    int32_t old_score = *(int32_t *)((char *)sk + 20);
-                    int32_t old_pure  = *(int32_t *)((char *)sk + 96);
-                    int32_t old_far   = *(int32_t *)((char *)sk + 100);
-                    int32_t old_lost  = *(int32_t *)((char *)sk + 104);
-                    int32_t old_le    = *(int32_t *)((char *)sk + 108);
-                    *(int32_t *)((char *)sk + 20)  = 0;   // score
-                    *(int32_t *)((char *)sk + 92)  = 0;   // combo
-                    *(int32_t *)((char *)sk + 96)  = 0;   // pure
-                    *(int32_t *)((char *)sk + 100) = 0;   // far
-                    *(int32_t *)((char *)sk + 104) = 0;   // lost
-                    *(int32_t *)((char *)sk + 108) = 0;   // late/early
-                    // HP 不重置 (用户可能想保留状态; 后续需要再加)
-                    acc_flog(@"[seek] score-keeper reset: combo %d->0  score %d->0  pure %d  far %d  lost %d  le %d",
-                             old_combo, old_score, old_pure, old_far, old_lost, old_le);
-                } else {
-                    acc_flog(@"[seek] WARN: score-keeper ptr unreadable: %p", sk);
-                }
-            }
+            // (e) ScoreKeeper \u91cd\u7f6e: \u6682\u65f6\u53bb\u9664\u3002sub_100A7DFC4 \u91cc \u6307\u5b9a\u7684 sk \u504f\u79fb\n            //    (sk[+92]/[+96]/[+100]/[+104]/[+108]) \u4f7f\u7528\u5728 v14=sk[26]+sk[25]+sk[27]\n            //    \u8fd9\u4e2a\u300c\u5df2\u5224\u5b9a\u8ba1\u6570\u300d\u516c\u5f0f\u91cc, \u4f46\u6f14\u7ec3\u8868\u660e\u96f6\u5316\u4f1a\u89e6\u53d1\u300c\u5f00\u5c40\u5373\u7ed3\u675f\u300d\n            //    \u2014\u2014\u8bf4\u660e\u90a3\u4e9b\u504f\u79fb\u91cc\u67d0\u4e00\u4e2a\u5176\u5b9e\u662f\u300c\u603b\u8c31\u9762 note \u6570\u300d\u4e4b\u7c7b\u7684\u4e0d\u53d8\u91cf\uff0c\n            //    \u88ab\u6e05 0 \u540e\u201c\u5df2\u5b8c\u6210 == \u603b\u91cf\u201d\u4e0b\u4e00\u5e27\u5224\u5b9a\u4e3a\u7ed3\u5c40\u3002\u9700\u8981\u91cd\u65b0 RE \u786e\u8ba4\u4e3a\u54ea\u4e2a\n            //    \u504f\u79fb\u540e\u518d\u52a0\u56de\u3002
         }
     }
 
@@ -1449,7 +1309,7 @@ void loadPref(void) {
             @"rate %.3fx  freeze=%d  rwnd=%llums\n"
              "real %llums  warp %llums  drift %lldms\n"
              "mach %llums  audio %ums  chart %dms\n"
-             "audio.meas %.3fx  N=%u  Δ=%dms\n"
+             "Δ(chart-audio) %dms\n"
              "isComp inst=%d [%s] calls=%llu z=%llu o=%llu\n"
              "%@seekTgt=%@",
             rate, freeze_n,
@@ -1460,8 +1320,6 @@ void loadPref(void) {
             (unsigned long long)mach_ms,
             audio_ms,
             chart_ms,
-            (double)atomic_load(&g_audio_meas_rate_x1000) / 1000.0,
-            (unsigned)atomic_load(&g_audio_meas_count),
             (int)((int32_t)chart_ms - (int32_t)audio_ms),
             isc_inst, vtcodes, (unsigned long long)isc_calls,
             (unsigned long long)isc_z, (unsigned long long)isc_o,
@@ -1665,20 +1523,14 @@ static void doBootstrap(void) {
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
         @try { time_warp_install(); } @catch (NSException *e) { acc_flog(@"time_warp_install EX: %@", e); }
         @try { install_vtable_swizzles(); } @catch (NSException *e) { acc_flog(@"install_vtable_swizzles EX: %@", e); }
-        // 后台轮询：不断给 channel 应用当前倍率（安全：setFrequency 是 FMOD 公开 API，不写 text）
-        // 第一次进歌曲时会自动捕获 base_freq；之后每次倍率切换由 UI 触发，但 seek/重启歌曲会重置
-        // FMOD 频率，所以这里也要兜底重新 apply。
+        // 0.5s \u8f6e\u8be2: \u68c0\u6d4b\u6362\u6b4c + \u8f93\u51fa\u8bca\u65ad + \u4ece FMOD \u8865\u8db3\u8fdb\u5ea6\u3002\n        // (\u97f3\u9891 hook \u5df2\u53bb\u9664, \u4e0d\u518d\u8c03\u7528 apply_speed_to_all_channels\u3002)
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-            // 暂停状态下不要 apply：部分 FMOD 实现 setFrequency 会把 paused channel 解暂停。
-            if (atomic_load(&g_tw_freeze_count) <= 0)
-                apply_speed_to_all_channels();
             void *p = get_player_or_resolve();
             static void *s_last_player = NULL;
             static void *s_last_channels = NULL;
             static uint64_t s_diag_tick = 0;
             void *channels_base_chk = p ? *(void **)((char *)p + ARC_PLAYER_CHANNELS_OFFSET) : NULL;
             if (p != s_last_player || channels_base_chk != s_last_channels) {
-                for (int i = 0; i < ARC_MAX_CHANNELS; i++) atomic_store(&g_base_freq[i], 0);
                 atomic_store(&g_song_length_ms, 0);
                 atomic_store(&g_max_seen_ms, 0);
                 atomic_store(&g_last_pos_ms, 0);
