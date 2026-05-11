@@ -42,6 +42,49 @@
 - 音画不同步 (audio 始终 1.0x, chart 按 rate)。用户决定接受/搁置。
 - ScoreKeeper 真实布局未知, seek-replay 无法重置计分。
 
+### ScoreKeeper 真布局 (供 v6.5 重新加回 seek 重置使用)
+
+来源: 反汇编 `sub_100A7DFC4` (UI updater) + `sub_100A7E71C` (judge label updater)。
+后者按 `pureLabel/farLabel/lostLabel/earlyLabel/lateLabel` 字符串 100% 锁定语义。
+
+| 偏移 | 类型 | 字段 | 备注 |
+|---|---|---|---|
+| sk+20  | i32 | score_displayed | UI updater 写回 a1+760 |
+| sk+28  | f32 | HP | |
+| sk+76  | f32 | HP_max | |
+| sk+92  | i32 | combo | UI 比对 a1+756 触发 sub_100A7DD20 |
+| sk+96  | i32 | score_raw | PM 投影累加器, **不是** pure_count |
+| sk+100 | i32 | pure_count | "pureLabel-fullnolocalize" |
+| sk+104 | i32 | far_count | "farLabel" |
+| sk+108 | i32 | lost_count | "lostLabel" |
+| sk+128 | i32 | late_count_in_pure | "lateLabel" 默认分支 |
+| sk+132 | i32 | early_count_in_pure | "earlyLabel" 默认分支 |
+| sk+136 | i32 | late_count_in_max_pure | "max-pure" 模式叠加 |
+| sk+140 | i32 | early_count_in_max_pure | "max-pure" 模式叠加 |
+
+总 notes 不在 sk 内, 通过 `sub_1009C756C(sk) = *(*(sk+176)+184)` 从 chart_data 读。
+sk 真实大小 ≥ 144 字节, v6.3 用 `addr_readable(sk, 128)` 范围都不够。
+
+**v6.3 bug 复盘**: 代码漏清 sk+104(far) 与 sk+128..140(late/early 全套)。
+重置后 UI updater 算 v14 = pure(0)+far(旧)+lost(0) = 旧 far, 然后
+sub_100A7E71C 触发条件 `judged != cached_total` 仍然成立, 后续帧
+进入异常分支 (具体怎么连到 a3+316=1 song-end 还需进一步追)。
+
+**v6.5 正确重置序列** (待加):
+```c
+*(int32_t *)((char*)sk + 20)  = 0;  // score
+*(int32_t *)((char*)sk + 92)  = 0;  // combo
+*(int32_t *)((char*)sk + 96)  = 0;  // score_raw
+*(int32_t *)((char*)sk + 100) = 0;  // pure
+*(int32_t *)((char*)sk + 104) = 0;  // far  <-- v6.3 漏了
+*(int32_t *)((char*)sk + 108) = 0;  // lost
+*(int32_t *)((char*)sk + 128) = 0;  // late_pure
+*(int32_t *)((char*)sk + 132) = 0;  // early_pure
+*(int32_t *)((char*)sk + 136) = 0;  // late_max_pure
+*(int32_t *)((char*)sk + 140) = 0;  // early_max_pure
+// 同时 a1+756=0, a1+760=0, a1+812=0 (UI updater 缓存), a1+816?
+```
+
 ---
 
 ## 历史 v6.3.1 (作废)
