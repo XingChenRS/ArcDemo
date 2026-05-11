@@ -1,16 +1,39 @@
-// xrc-arcdemo / Tweak.x
-// Arcaea iOS 变速/Seek 练习工具 (fork of brendonjkding/accDemo)
-// 单 dylib 注入，游戏内浮窗 UI
+﻿// xrc-arcdemo / Tweak.x
+// Arcaea iOS 鍙橀€?/ Seek 宸ュ叿 (fork of brendonjkding/accDemo)
+// 鍗?dylib 娉ㄥ叆, 娓告垙鍐呮诞绐?UI
 //
-// 修改这个版本号 ↓ 之后所有 NSLog 与 UI 标题会同步更新, 方便排查
-// "用户用的是哪一版" 这种问题。
-#define XRC_TWEAK_VERSION  @"v6.5.3"
+// 淇敼杩欎釜鐗堟湰鍙?鈫?涔嬪悗鎵€鏈?NSLog 涓?UI 鏍囬浼氬悓姝ユ洿鏂般€?
+#define XRC_TWEAK_VERSION  @"v6.6"
 //
-// 变速架构 (v4):
-//   谱面: GP.update vtable -> _gp_retime_logic_clock(clock[16]) + _gp_drift_correct(clock[40])
-//   视觉: gettimeofday fishhook -> CCDirector delta 自动变速
-//   音频: FMOD Channel::setFrequency(base * rate)
-// seek 架构: MTP::seekTo + clock[40] + track reactivation + finished flags reset
+// ============================================================
+// 鍔熻兘鑼冨洿 (v6.6 绠€鍖栧悗)
+// ============================================================
+//   1. 鍙橀€? gettimeofday fishhook 璋冨姩鐢?clock + GP.update vtable
+//                hook 鎸変及璁?delta 鍋忕Щ璋遍潰 logic clock
+//   2. 鍓?鍚?seek: 鍙烦闊抽 (MTP::seekTo) + 璋遍潰 clock
+//                  鍋忕Щ (clock+40)銆傝烦杩囩殑 note 鐢辨父鎴忚嚜鍔?
+//                  鍒?lost (鎴栬€呬笉鍐嶆樉绀?銆傚凡鍒よ繃鐨?note
+//                  **涓嶄細閲嶇幇**, 闇€瑕侀噸鏂版父鐜╄氨闈㈣鐢?Retry銆?
+// ============================================================
+// 宸茶鎷嗛櫎鐨勫疄楠屾€ч儴鍒?(v6.5 浠ュ墠閬楃暀)
+// ============================================================
+//   - LogicNote::isCompleted vtable swizzle (妯℃嫙璋遍潰鍥炴斁)
+//   - rewind grace window + g_seek_target_ms
+//   - 璺宠浆鍚庢竻娲昏穬闊崇鍒楄〃 / 閲嶆柊婵€娲?track / 娓呴浂 sk
+//   鍘熷洜: 涓婅堪鎿嶄綔闇€瑕佸悓鏃?RE 鍑?Tap/Hold/Arc/ArcTap 鍏ㄩ儴鍐呴儴
+//   state 鎵嶈兘鍍?ArcCreate 閭ｆ牱 "鏃犵姸鎬侀噸娲剧敓". 闂簮浜岃繘鍒?
+//   涓婁唬浠峰お澶? 涓?HoldNote 涓杩涘叆浼氳Е鍙戣秺鐣屻€?
+// ============================================================
+// 瀹夊叏绾︽潫
+// ============================================================
+//   - iOS 16+ sideload 涓嶈兘 Dobby inline hook 涓讳簩杩涘埗 __TEXT
+//     (AMFI / CoreTrust 瀵逛唬鐮侀〉鏈?hash seal). 鍙兘:
+//       a) fishhook 涓讳簩杩涘埗 GOT (gettimeofday)  瀹夊叏
+//       b) vtable 妲戒綅鏇挎崲 (__DATA_CONST mprotect RW 鍙互)
+//       c) 璇诲嚱鏁版寚閽堜絾涓嶆敼鍑芥暟瀹炵幇
+//   - PAC: arm64e 涓?vtable 鍐欓渶瑕?ptrauth_sign_unauthenticated +
+//     ptrauth_blend_discriminator(slot_addr, 0)銆俤irect BL 涓嶈蛋 PAC銆?
+// ============================================================
 
 #import <substrate.h>
 #import <time.h>
@@ -40,7 +63,7 @@ extern UIApplication *UIApp;
 #import "WHToast/WHToast.h"
 #import "AccCommon.h"
 
-// forward decl: 文件末尾定义，但中部诊断需要用
+// forward decl: 鏂囦欢鏈熬瀹氫箟锛屼絾涓儴璇婃柇闇€瑕佺敤
 void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
 #pragma mark - global
@@ -56,27 +79,27 @@ WQSuspendView *button = nil;
 UIView        *menuView = nil;
 #pragma mark - Arcaea binary hook (Dobby)
 //
-// 已知偏移 (IDA 6.13.10 分析):
+// 宸茬煡鍋忕Щ (IDA 6.13.10 鍒嗘瀽):
 //   sub_100846950 (vtable[7] of MultiTrackPlayer) = getPositionMs(this, channel)
 //   sub_100846914 (vtable[6])                     = setPaused(this, paused, channel)
 //   sub_10084699C (vtable[8])                     = seekTo(this, ms, channel)
-//   sub_100C9D718                                 = getRegistry() - 全局单例
+//   sub_100C9D718                                 = getRegistry() - 鍏ㄥ眬鍗曚緥
 //   *(getRegistry() + 8)                          = MultiTrackPlayer
 //   sub_100EC094C                                 = Channel::getCurrentSound(ch, Sound**)
 //   sub_100F2BB64                                 = Sound::getLength(snd, uint32_t*, unit=1)
 //   sub_100EC069C                                 = Channel::setFrequency(ch, float)
 // 
-// MTP 内部布局: 通道数组 channels[i] @ player+0x38, stride=16, 每项+8 = Channel*
+// MTP 鍐呴儴甯冨眬: 閫氶亾鏁扮粍 channels[i] @ player+0x38, stride=16, 姣忛」+8 = Channel*
 //   ch0 = *(*(player+0x38) + 8)
 //
-// 运行时地址 = arcaea_base + offset
+// 杩愯鏃跺湴鍧€ = arcaea_base + offset
 #define ARC_OFF_GET_POSITION_MS    (0x846950ULL)
 #define ARC_OFF_GET_REGISTRY       (0xC9D718ULL)
-// 以下偏移仅用于数据/函数指针读取，不做 vtable 写入
+// 浠ヤ笅鍋忕Щ浠呯敤浜庢暟鎹?鍑芥暟鎸囬拡璇诲彇锛屼笉鍋?vtable 鍐欏叆
 #define ARC_OFF_GET_CURRENT_SOUND  (0xEC094CULL)
 #define ARC_OFF_GET_SOUND_LENGTH   (0xF2BB64ULL)
-// 直接 FMOD Channel API，绕开 MTP 包装。
-//   getPositionMs(MTP, ch) 内部就是 Channel::getPosition（已确认）→ 改频率 → 谱面/音频同步
+// 鐩存帴 FMOD Channel API锛岀粫寮€ MTP 鍖呰銆?
+//   getPositionMs(MTP, ch) 鍐呴儴灏辨槸 Channel::getPosition锛堝凡纭锛夆啋 鏀归鐜?鈫?璋遍潰/闊抽鍚屾
 #define ARC_OFF_CH_GET_POSITION    (0xEC03ACULL)
 #define ARC_REG_PLAYER_OFFSET      (8)
 #define ARC_PLAYER_CHANNELS_OFFSET (0x38)
@@ -93,17 +116,17 @@ static get_current_sound_fn g_get_current_sound = NULL;
 static get_sound_length_fn  g_get_sound_length = NULL;
 static ch_get_position_fn   g_ch_get_position = NULL;
 
-// hook 兜底捕获 + 主动通过 registry 获取
+// hook 鍏滃簳鎹曡幏 + 涓诲姩閫氳繃 registry 鑾峰彇
 static _Atomic(void *)   g_bgmPlayer = NULL;
 _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
-static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
+static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 鎷垮埌鐨勭湡瀹炴€绘椂闀?
 
-// 音频 hook 已废除 (用户决定: 仅留 gettimeofday + Gameplay vtable 两个 hook)。
-// MTP getPos vtable swizzle 仍保留, 仅用作位置读出 (进度条 + seek 反馈),
-// 不再做任何 setFrequency / corr / 滑窗测量。
+// 闊抽 hook 宸插簾闄?(鐢ㄦ埛鍐冲畾: 浠呯暀 gettimeofday + Gameplay vtable 涓や釜 hook)銆?
+// MTP getPos vtable swizzle 浠嶄繚鐣? 浠呯敤浣滀綅缃鍑?(杩涘害鏉?+ seek 鍙嶉),
+// 涓嶅啀鍋氫换浣?setFrequency / corr / 婊戠獥娴嬮噺銆?
 
-// 尝试从 player 主轨拿 Sound 总长
+// 灏濊瘯浠?player 涓昏建鎷?Sound 鎬婚暱
 static void try_capture_song_length(void *player) {
     if (!player || !g_get_current_sound || !g_get_sound_length) return;
     if (atomic_load(&g_song_length_ms) != 0) return;
@@ -119,7 +142,7 @@ static void try_capture_song_length(void *player) {
     }
 }
 
-// 主动通过 registry 拿 MTP（不需要等 hook 触发）
+// 涓诲姩閫氳繃 registry 鎷?MTP锛堜笉闇€瑕佺瓑 hook 瑙﹀彂锛?
 static void *resolve_player_via_registry(void) {
     if (!g_get_registry) return NULL;
     void *reg = g_get_registry();
@@ -135,7 +158,7 @@ void *get_player_or_resolve(void) {
     return resolve_player_via_registry();
 }
 
-// 防止读到野指针：先做用户态地址粗筛。
+// 闃叉璇诲埌閲庢寚閽堬細鍏堝仛鐢ㄦ埛鎬佸湴鍧€绮楃瓫銆?
 bool ptr_plausible(const void *p) {
     uintptr_t v = (uintptr_t)p;
     if (v < 0x100000000ULL) return false;
@@ -149,13 +172,13 @@ bool addr_readable(const void *p, size_t len) {
     uintptr_t start_u = (uintptr_t)p;
     uintptr_t end_u = start_u + len;
     if (end_u < start_u) return false;
-    // 启发式上限：拒绝超大跨度访问，避免野 end 指针导致后续越界。
+    // 鍚彂寮忎笂闄愶細鎷掔粷瓒呭ぇ璺ㄥ害璁块棶锛岄伩鍏嶉噹 end 鎸囬拡瀵艰嚧鍚庣画瓒婄晫銆?
     if (len > (1ULL << 20)) return false;
-    // 这里不再调用 vm_region_recurse（部分 Theos/SDK 组合下该符号缺失导致链接失败）。
+    // 杩欓噷涓嶅啀璋冪敤 vm_region_recurse锛堥儴鍒?Theos/SDK 缁勫悎涓嬭绗﹀彿缂哄け瀵艰嚧閾炬帴澶辫触锛夈€?
     return true;
 }
 
-// 取 Arc-mobile 主二进制基址
+// 鍙?Arc-mobile 涓讳簩杩涘埗鍩哄潃
 uint64_t arc_image_base(void) {
     static uint64_t cached = 0;
     if (cached) return cached;
@@ -170,7 +193,7 @@ uint64_t arc_image_base(void) {
         }
     }
     if (!cached && n > 0) {
-        // 兜底：主可执行体一般是 image 0
+        // 鍏滃簳锛氫富鍙墽琛屼綋涓€鑸槸 image 0
         cached = (uint64_t)_dyld_get_image_header(0);
     }
     return cached;
@@ -183,10 +206,10 @@ static void install_arc_hooks(void) {
         NSLog(@"[xrc-arcdemo] arc_image_base() = 0, abort");
         return;
     }
-    // iOS 16 sideload: 不要给主二进制 __TEXT 打 DobbyHook 补丁。
-    // mprotect(rwx) 会破坏 amfi/CoreTrust 的 text page seal，
-    // 其它线程跑该页时触发 EXC_BAD_ACCESS / Permission fault (Instruction Abort)。
-    // 改为只读取函数指针，不修改函数实现。
+    // iOS 16 sideload: 涓嶈缁欎富浜岃繘鍒?__TEXT 鎵?DobbyHook 琛ヤ竵銆?
+    // mprotect(rwx) 浼氱牬鍧?amfi/CoreTrust 鐨?text page seal锛?
+    // 鍏跺畠绾跨▼璺戣椤垫椂瑙﹀彂 EXC_BAD_ACCESS / Permission fault (Instruction Abort)銆?
+    // 鏀逛负鍙鍙栧嚱鏁版寚閽堬紝涓嶄慨鏀瑰嚱鏁板疄鐜般€?
     g_get_registry = (get_registry_fn)(base + ARC_OFF_GET_REGISTRY);
     g_get_current_sound = (get_current_sound_fn)(base + ARC_OFF_GET_CURRENT_SOUND);
     g_get_sound_length  = (get_sound_length_fn) (base + ARC_OFF_GET_SOUND_LENGTH);
@@ -199,7 +222,7 @@ static void install_arc_hooks(void) {
     if (mtp) try_capture_song_length(mtp);
 }
 
-// 通过 player vtable 调用对应槽位
+// 閫氳繃 player vtable 璋冪敤瀵瑰簲妲戒綅
 static inline void *_player_vt_slot(void *self, size_t byte_off) {
     if (!self) return NULL;
     void **vtable = *(void ***)self;
@@ -209,9 +232,9 @@ static inline void *_player_vt_slot(void *self, size_t byte_off) {
 
 #pragma mark - Time Warp (gettimeofday fishhook for CCDirector visual speed)
 
-// gettimeofday fishhook: CCDirector 用它计算帧间 delta, warp 后视觉动画按 rate 播放
-// 公式: t_warp(real) = t0_warp + (real - t0_real) * rate
-// 切倍率瞬间: t0_real = real_now; t0_warp = warp_now (保持连续, 不跳变)
+// gettimeofday fishhook: CCDirector 鐢ㄥ畠璁＄畻甯ч棿 delta, warp 鍚庤瑙夊姩鐢绘寜 rate 鎾斁
+// 鍏紡: t_warp(real) = t0_warp + (real - t0_real) * rate
+// 鍒囧€嶇巼鐬棿: t0_real = real_now; t0_warp = warp_now (淇濇寔杩炵画, 涓嶈烦鍙?
 
 typedef int (*orig_gettod_t)(struct timeval *tv, void *tz);
 orig_gettod_t s_orig_gettod = NULL;
@@ -220,7 +243,7 @@ static _Atomic(uint64_t) g_tw_t0_real_us   = 0;
 static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;
 static _Atomic(uint32_t) g_tw_rate_x1000   = 1000;
 
-// 冻结机制: 暂停 / 切后台 / seek 时冻结 warp 时间
+// 鍐荤粨鏈哄埗: 鏆傚仠 / 鍒囧悗鍙?/ seek 鏃跺喕缁?warp 鏃堕棿
 _Atomic(int32_t)  g_tw_freeze_count = 0;
 static _Atomic(uint64_t) g_tw_frozen_us    = 0;
 
@@ -267,28 +290,14 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
 
 
 
-#pragma mark - vtable swizzle (核心 Hook)
+#pragma mark - vtable swizzle (鏍稿績 Hook)
 
 #define ARC_OFF_MTP_VTABLE  (0x1312860ULL)
 #define ARC_OFF_MTP_GETPOS  (0x846950ULL)
 #define ARC_OFF_GP_VTABLE    (0x136E1C0ULL)
 #define ARC_OFF_GP_UPDATE_FN (0xB3AD70ULL)
 
-// LogicNote::isCompleted (vtable+40, slot 5).
-// Same impl 0x7E27B8 lives in 5 subclass vtables (Tap/ArcTap/Hold/Arc/Bar variants).
-// Vtable starts identified via IDA xrefs to 0x1007E27B8 (xref data addrs are
-// vtable_start + 0x28 = slot[5], so vtable_start = xref - 0x28):
-//   xref 0x101303ff8 -> vtable 0x101303fd0 -> off 0x1303FD0
-//   xref 0x10130bc68 -> vtable 0x10130bc40 -> off 0x130BC40
-//   xref 0x10130dbd8 -> vtable 0x10130dbb0 -> off 0x130DBB0
-//   xref 0x101317218 -> vtable 0x1013171f0 -> off 0x13171F0
-//   xref 0x101338918 -> vtable 0x1013388f0 -> off 0x13388F0
-// (Earlier comment had typo 0x303FD0; the correct offsets are 0x1303FD0...)
-#define ARC_OFF_LOGICNOTE_ISCOMPLETED (0x7E27B8ULL)
-#define ARC_OFF_VT_LOGICNOTE_COUNT 5
-static const uint64_t kArcLogicNoteVtables[ARC_OFF_VT_LOGICNOTE_COUNT] = {
-    0x1303FD0ULL, 0x130BC40ULL, 0x130DBB0ULL, 0x13171F0ULL, 0x13388F0ULL
-};
+// (v6.6) isCompleted hook 瀹氫箟 / vtable 琛?/ hook 瀹炵幇鍏ㄩ儴鎷嗛櫎銆?
 
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 typedef int64_t (*orig_gp_update_fn)(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
@@ -299,49 +308,19 @@ static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
 _Atomic(uint64_t) g_tw_gp_update_calls = 0;
 static _Atomic(int) g_tw_gp_update_installed = 0;
 
-// isCompleted hook state (v6: timing-aware seek-replay).
-//
-// v5 did:  during 1.5s grace window, force return 0 + clear byte[12]/[13].
-// v6 does: maintain g_seek_target_ms; for ANY note whose timing >= target-120,
-//          force return 0 (note re-appears via spatial query); for past notes
-//          delegate to original (stays completed). Window is kept as a SAFETY
-//          BACKSTOP only -- if g_seek_target_ms is unset but window is open,
-//          fall back to "force 0" (legacy v5 behaviour).
-//
-// IDA-derived layout (LogicNote, common base):
-//   +0..7   vtable
-//   +20 (DWORD, int32)  note.timing in chart-ms          ← used here
-//   +28 (DWORD, int32)  note.end_timing
-//   +48..55 (int32x2)   per-frame distance cache (vtable[3] writes; do NOT touch)
-//   +56..63 (int32x2)   distance base offset (init-time const)
-typedef int (*orig_iscompleted_fn)(void *self);
-static orig_iscompleted_fn s_orig_iscompleted = NULL;
-_Atomic(uint64_t) g_rewind_until_us  = 0;       // legacy v5 backstop window deadline (real us)
-_Atomic(int32_t)  g_seek_target_ms   = INT_MIN; // v6: chart-ms target of last seek; INT_MIN = inactive
-_Atomic(uint64_t) g_iscompleted_calls = 0;
-_Atomic(uint64_t) g_iscompleted_force_zero = 0;
-_Atomic(uint64_t) g_iscompleted_force_one  = 0;
-_Atomic(int)      g_iscompleted_installed_count = 0;
-// Per-vtable install diag (visible in panel). 0..4 = code:
-//   0='?' not tried, 'O'=ok, 'B'=bad-base, 'U'=unreadable, 'M'=mismatch slot5,
-//   'P'=mprotect fail, 'S'=signed-write
-_Atomic(int) g_iscompleted_vt_code[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
-// Last raw value seen at slot 5 (post-PAC-strip), for panel hex dump on failure
-_Atomic(uint64_t) g_iscompleted_vt_seen[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
-// Tunable: future-window slop (ms). Notes within this past-radius of seek
-// target are also treated as "future" so just-passed notes get re-shown.
-#define ARC_SEEK_FUTURE_SLOP_MS  120
-// Heuristic plausibility for note.timing (chart-ms). Reject obviously bogus reads.
-#define ARC_NOTE_TIMING_MIN  (-10000)
-#define ARC_NOTE_TIMING_MAX  ( 1200000)   /* 20 min */
+// LogicNote::isCompleted hook 鍦?v6.5 鍙婁箣鍓嶇敤浜庢ā鎷熻氨闈㈠洖鏀?
+// (rewind grace window). v6.6 鎷嗛櫎. 淇濈暀浠ヤ笅瀹氫箟浠呬綔涓鸿褰?
+//   - 璋遍潰鍥炴斁闇€瑕侀噸缃?Tap/Hold/Arc/ArcTap 姣忎釜鑺傜偣鐨勫唴閮?
+//     state. iOS 闂簮浜岃繘鍒朵笂杩欓」宸ヤ綔閲忎笉鐜板疄 (鍙?ArcCreate
+//     ResetJudgeTo 瀵规瘮)銆傚鏋滈渶瑕侀噸鐜? 璇风敤娓告垙鍐?Retry銆?
 
-// 缓存 Gameplay 实例指针 (seek 需要访问谱面时钟)
+// 缂撳瓨 Gameplay 瀹炰緥鎸囬拡 (seek 闇€瑕佽闂氨闈㈡椂閽?
 _Atomic(void *) g_gameplay_instance = NULL;
 
-// retime 状态: 记录上一帧的真实时间和 clock 指针, 用于计算帧间 delta
+// retime 鐘舵€? 璁板綍涓婁竴甯х殑鐪熷疄鏃堕棿鍜?clock 鎸囬拡, 鐢ㄤ簬璁＄畻甯ч棿 delta
 static void *s_gp_last_clock = NULL;
 static uint64_t s_gp_last_real_us = 0;
-// MTP getPos vtable wrapper：自动捕获 player 实例 + 位置追踪 (仅读取,不变速)
+// MTP getPos vtable wrapper锛氳嚜鍔ㄦ崟鑾?player 瀹炰緥 + 浣嶇疆杩借釜 (浠呰鍙?涓嶅彉閫?
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
     atomic_fetch_add(&g_tw_mtp_getpos_calls, 1);
@@ -358,7 +337,7 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
     return raw;
 }
 
-// 取未被 warp 的真实 microsecond 时间 (用于 retime delta 计算)
+// 鍙栨湭琚?warp 鐨勭湡瀹?microsecond 鏃堕棿 (鐢ㄤ簬 retime delta 璁＄畻)
 static uint64_t _real_now_us_unwarped(void) {
     struct timeval tv = {0};
     if (s_orig_gettod) {
@@ -374,11 +353,11 @@ static uint64_t _real_now_us_unwarped(void) {
 // forward decl (defined later in file): chart clock reader used by retime drift fix
 static int32_t _read_chart_clock_ms(void *clk);
 
-// 谱面 retime: 每帧按 rate 推进 clk[16], 与音频独立。
-// 不做 audio<->chart 任何绑定 (绑定无论怎么做都会抽搐或加延迟)。
-// 公式: chart_displayed = steady_now - clk[16] - clk[40]
-// 想让 chart 走 rate 倍速 -> 每帧让 clk[16] 反向走 (rate-1)*delta_ms
-// 即  clk[16] += (1 - rate) * delta_ms
+// 璋遍潰 retime: 姣忓抚鎸?rate 鎺ㄨ繘 clk[16], 涓庨煶棰戠嫭绔嬨€?
+// 涓嶅仛 audio<->chart 浠讳綍缁戝畾 (缁戝畾鏃犺鎬庝箞鍋氶兘浼氭娊鎼愭垨鍔犲欢杩?銆?
+// 鍏紡: chart_displayed = steady_now - clk[16] - clk[40]
+// 鎯宠 chart 璧?rate 鍊嶉€?-> 姣忓抚璁?clk[16] 鍙嶅悜璧?(rate-1)*delta_ms
+// 鍗? clk[16] += (1 - rate) * delta_ms
 static void _gp_retime_logic_clock(void *logic) {
     if (!logic) return;
     if (atomic_load(&g_tw_freeze_count) > 0) return;
@@ -416,111 +395,28 @@ static void _gp_retime_logic_clock(void *logic) {
 // forward decl (defined after time_warp_install)
 static int32_t _read_chart_clock_ms(void *clk);
 
-// LogicNote::isCompleted vtable hook (v6 timing-aware seek-replay).
-//
-// Decision matrix (only active while seek grace window open):
-//   if window_open and g_seek_target_ms set:
-//     if note.timing >= target - SLOP   -> return 0  (treat as future, re-show)
-//     else                                -> return original (likely 1, stay completed)
-//   elif window_open (timing read failed): -> return 0 (legacy v5 fallback)
-//   else:                                  -> delegate to original
-//
-// We DELIBERATELY do NOT touch byte[12]/[13] anymore -- vtable[3] writes
-// bytes +48..+55 every frame as cached distances, so any state-clearing
-// at those offsets is a no-op (cache gets overwritten next spatial query).
-// IMPORTANT: g_seek_target_ms must be SCOPED to the grace window. If left
-// armed forever, every newly judged note during normal play would get
-// re-shown (target stale). Window expiry disarms both.
-static int tw_logicnote_isCompleted(void *self) {
-    atomic_fetch_add(&g_iscompleted_calls, 1);
-    uint64_t until = atomic_load(&g_rewind_until_us);
-    if (until == 0) {
-        // Window closed -> normal play, transparent passthrough
-        return s_orig_iscompleted ? s_orig_iscompleted(self) : 0;
-    }
-    uint64_t now_us = _real_now_us_unwarped();
-    if (now_us != 0 && now_us >= until) {
-        // Window expired -> disarm both (avoid stale target affecting normal play)
-        atomic_store(&g_rewind_until_us, 0);
-        atomic_store(&g_seek_target_ms, INT_MIN);
-        return s_orig_iscompleted ? s_orig_iscompleted(self) : 0;
-    }
-
-    // Window active.
-    int32_t target = atomic_load(&g_seek_target_ms);
-    if (target != INT_MIN && self && ptr_plausible(self) && addr_readable((char *)self + 24, 4)) {
-        int32_t note_timing = *(int32_t *)((char *)self + 20);
-        if (note_timing > ARC_NOTE_TIMING_MIN && note_timing < ARC_NOTE_TIMING_MAX) {
-            if (note_timing >= target - ARC_SEEK_FUTURE_SLOP_MS) {
-                atomic_fetch_add(&g_iscompleted_force_zero, 1);
-                return 0;
-            }
-            atomic_fetch_add(&g_iscompleted_force_one, 1);
-            return s_orig_iscompleted ? s_orig_iscompleted(self) : 1;
-        }
-    }
-    // timing read failed or target unset -> legacy v5: force 0 within window
-    atomic_fetch_add(&g_iscompleted_force_zero, 1);
-    return 0;
-}
+// LogicNote::isCompleted vtable hook 宸叉媶 (v6.6). 涓嶅啀瀹氫箟 tw_logicnote_isCompleted銆?
 
 // Gameplay.update vtable hook:
-//   1. 缓存 Gameplay 实例 (seek/reset 需要)
-//   2. _gp_retime_logic_clock 变速谱面
+//   1. 缂撳瓨 Gameplay 瀹炰緥 (seek/reset 闇€瑕?
+//   2. _gp_retime_logic_clock 鍙橀€熻氨闈?
 static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     atomic_fetch_add(&g_tw_gp_update_calls, 1);
     if (self) {
+        // 缂撳瓨 Gameplay 瀹炰緥鎸囬拡 (player_seek_ms 闇€瑕佽闂?logic clock)
         atomic_store(&g_gameplay_instance, self);
         void *logic = NULL;
         if (addr_readable((char *)self + 936, sizeof(void *)))
             logic = *(void **)((char *)self + 928);
         if (logic && ptr_plausible(logic))
             _gp_retime_logic_clock(logic);
-
-        // [v6.6 prep] 一次性 dump 判定窗口 settings 链:
-        //   LogicNoteGroup(+32) -> obj(+0x268) -> vtable[0xE0/8] = getJudgeWindow()
-        //   目标: 摸清 *(LogicNoteGroup+32) 是什么类, 以确认 vtable 劫持安全性。
-        static _Atomic(int) s_judge_dump_done = 0;
-        if (logic && ptr_plausible(logic) && !atomic_load(&s_judge_dump_done)) {
-            int expected = 0;
-            if (atomic_compare_exchange_strong(&s_judge_dump_done, &expected, 1)) {
-                @try {
-                    void *o32 = NULL;
-                    if (addr_readable((char *)logic + 32, sizeof(void *)))
-                        o32 = *(void **)((char *)logic + 32);
-                    void *o32_vt = NULL, *settings = NULL, *settings_vt = NULL, *fn = NULL;
-                    uint8_t use_custom_flag = 0;
-                    if (o32 && ptr_plausible(o32)) {
-                        if (addr_readable(o32, 8)) o32_vt = *(void **)o32;
-                        if (addr_readable((char *)o32 + 0x110, 1)) // chart+272 use_custom flag
-                            use_custom_flag = *(uint8_t *)((char *)o32 + 0x110);
-                        if (addr_readable((char *)o32 + 0x268, sizeof(void *)))
-                            settings = *(void **)((char *)o32 + 0x268);
-                    }
-                    if (settings && ptr_plausible(settings) && addr_readable(settings, 8)) {
-                        settings_vt = *(void **)settings;
-                        if (settings_vt && ptr_plausible(settings_vt) &&
-                            addr_readable((char *)settings_vt + 0xE0, sizeof(void *)))
-                            fn = *(void **)((char *)settings_vt + 0xE0);
-                    }
-                    uint64_t base = arc_image_base();
-                    acc_flog(@"[judge-probe] logic=%p +32=%p (vt=%p, +0x110=%u, +0x268=settings=%p)",
-                             logic, o32, o32_vt, (unsigned)use_custom_flag, settings);
-                    acc_flog(@"[judge-probe] settings_vt=%p vt[0xE0/8] fn=%p (image=%p, off=0x%llx)",
-                             settings_vt, fn, (void *)base,
-                             (fn && base) ? (unsigned long long)((uint64_t)fn - base) : 0ULL);
-                } @catch (NSException *e) {
-                    acc_flog(@"[judge-probe] EX: %@", e);
-                }
-            }
-        }
     }
     return s_orig_gp_update ? s_orig_gp_update(self, a2, a3, a4, a5) : 0;
 }
 
 
-// 在 vtable 区域 ±64 slots 范围内扫描,找到匹配 orig_fn 的 slot 并替换为 new_fn。
-// 返回找到的 slot index (相对 vtable 起始,可能负数),失败返回 INT_MIN。
+// 鍦?vtable 鍖哄煙 卤64 slots 鑼冨洿鍐呮壂鎻?鎵惧埌鍖归厤 orig_fn 鐨?slot 骞舵浛鎹负 new_fn銆?
+// 杩斿洖鎵惧埌鐨?slot index (鐩稿 vtable 璧峰,鍙兘璐熸暟),澶辫触杩斿洖 INT_MIN銆?
 static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
                                      void *new_fn, void **out_orig)
 {
@@ -537,21 +433,21 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
     for (int i = -4; i < 64; i++) {
         void *cur = vt[i];
         if (!cur) continue;
-        // PAC strip (arm64e instruction key A);arm64 上是 noop
+        // PAC strip (arm64e instruction key A);arm64 涓婃槸 noop
 #if __has_feature(ptrauth_calls)
         void *stripped = ptrauth_strip(cur, ptrauth_key_asia);
 #else
         void *stripped = cur;
 #endif
         if ((uint64_t)stripped != target) continue;
-        // 找到了。mprotect 整 16K 页 RW (iOS 16 __DATA_CONST 可能 deny → 退化 vm_protect+COPY)
+        // 鎵惧埌浜嗐€俶protect 鏁?16K 椤?RW (iOS 16 __DATA_CONST 鍙兘 deny 鈫?閫€鍖?vm_protect+COPY)
         uintptr_t page = (uintptr_t)&vt[i] & ~(uintptr_t)0x3FFF;
         bool wrote = false;
         if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE) == 0) {
             wrote = true;
         } else {
             int e1 = errno;
-            // 备用:vm_protect with VM_PROT_COPY (fishhook 同款)
+            // 澶囩敤:vm_protect with VM_PROT_COPY (fishhook 鍚屾)
             kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
                                           0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
             if (kr == KERN_SUCCESS) {
@@ -562,10 +458,10 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
             }
         }
         if (!wrote) return INT_MIN;
-        if (out_orig) *out_orig = stripped;  // 裸地址,可直接调用
+        if (out_orig) *out_orig = stripped;  // 瑁稿湴鍧€,鍙洿鎺ヨ皟鐢?
 #if __has_feature(ptrauth_calls)
-        // arm64e: 用相同 slot 地址作为 discriminator blend 重新签名
-        // 注意:C++ vtable 真实 discriminator 在编译期 hash 决定,这里只是尽力而为
+        // arm64e: 鐢ㄧ浉鍚?slot 鍦板潃浣滀负 discriminator blend 閲嶆柊绛惧悕
+        // 娉ㄦ剰:C++ vtable 鐪熷疄 discriminator 鍦ㄧ紪璇戞湡 hash 鍐冲畾,杩欓噷鍙槸灏藉姏鑰屼负
         void *signed_new = ptrauth_sign_unauthenticated(new_fn,
                               ptrauth_key_asia,
                               ptrauth_blend_discriminator(&vt[i], 0));
@@ -573,7 +469,7 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
 #else
         vt[i] = new_fn;
 #endif
-        // 不能 PROT_EXEC, __DATA_CONST 不允许; 恢复 RO (尽力而为,失败也无所谓)
+        // 涓嶈兘 PROT_EXEC, __DATA_CONST 涓嶅厑璁? 鎭㈠ RO (灏藉姏鑰屼负,澶辫触涔熸棤鎵€璋?
         mprotect((void *)page, 0x4000, PROT_READ);
         acc_flog(@"swizzle OK: vtable=%p slot[%d] orig=%p -> new=%p",
                  (void *)vtable_addr, i, stripped, new_fn);
@@ -589,77 +485,20 @@ static void install_vtable_swizzles(void) {
     dispatch_once(&once, ^{
         uint64_t base = arc_image_base();
         if (!base) { acc_flog(@"swizzle: no image base"); return; }
+        // 1) MTP::getPositionMs vtable swap: 浠呯敤浜庤褰撳墠鎾斁浣嶇疆 (杩涘害鏉?
+        //    + seek 鍙嶉), 涓嶅彉閫熴€?
         swizzle_vtable_find_swap(base + ARC_OFF_MTP_VTABLE, ARC_OFF_MTP_GETPOS,
                                  (void *)tw_mtp_getpos, (void **)&s_orig_mtp_getpos);
+        // 2) Gameplay::update vtable swap: 姣忓抚鎷︽埅浠?
+        //    a) 缂撳瓨 Gameplay 瀹炰緥 (渚?player_seek_ms 璁块棶 logic clock)
+        //    b) 璋冪敤 _gp_retime_logic_clock(logic) 瀹炵幇璋遍潰鍙橀€?
         int gp_slot = swizzle_vtable_find_swap(base + ARC_OFF_GP_VTABLE, ARC_OFF_GP_UPDATE_FN,
                                                (void *)tw_gp_update, (void **)&s_orig_gp_update);
         if (gp_slot != INT_MIN && s_orig_gp_update) {
             atomic_store(&g_tw_gp_update_installed, 1);
             acc_flog(@"gp.update vtable installed slot=%d", gp_slot);
         }
-        // Hook isCompleted on every known LogicNote subclass vtable.
-        // The first successful swizzle captures the original; later vtables share it
-        // (all 5 vtables hold the same impl 0x7E27B8 at slot+40).
-        // IDA-confirmed layout: vtable[5] = isCompleted on every subclass.
-        // We bypass the ±64-slot scan and write slot 5 directly, capturing
-        // per-vtable diag codes so the panel can show why any failed.
-        int n_iscomp = 0;
-        uint64_t iscomp_target = base + ARC_OFF_LOGICNOTE_ISCOMPLETED;
-        for (int i = 0; i < ARC_OFF_VT_LOGICNOTE_COUNT; i++) {
-            uint64_t vt_addr = base + kArcLogicNoteVtables[i];
-            void **vt = (void **)vt_addr;
-            if (!ptr_plausible(vt) || !addr_readable(vt, 8 * 8)) {
-                atomic_store(&g_iscompleted_vt_code[i], 'U');
-                acc_flog(@"isComp[%d] vtable %p UNREADABLE", i, vt);
-                continue;
-            }
-            void *cur = vt[5];
-#if __has_feature(ptrauth_calls)
-            void *stripped = ptrauth_strip(cur, ptrauth_key_asia);
-#else
-            void *stripped = cur;
-#endif
-            atomic_store(&g_iscompleted_vt_seen[i], (uint64_t)stripped);
-            if ((uint64_t)stripped != iscomp_target) {
-                atomic_store(&g_iscompleted_vt_code[i], 'M');
-                acc_flog(@"isComp[%d] vtable %p slot5=%p (stripped=%p) != target %p",
-                         i, vt, cur, stripped, (void *)iscomp_target);
-                continue;
-            }
-            // mprotect 16K page RW
-            uintptr_t page = (uintptr_t)&vt[5] & ~(uintptr_t)0x3FFF;
-            bool wrote = false;
-            if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE) == 0) {
-                wrote = true;
-            } else {
-                kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
-                                              0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-                if (kr == KERN_SUCCESS) wrote = true;
-            }
-            if (!wrote) {
-                atomic_store(&g_iscompleted_vt_code[i], 'P');
-                acc_flog(@"isComp[%d] vtable %p mprotect+vmprotect FAIL page=%p",
-                         i, vt, (void *)page);
-                continue;
-            }
-            if (!s_orig_iscompleted)
-                s_orig_iscompleted = (orig_iscompleted_fn)stripped;
-#if __has_feature(ptrauth_calls)
-            void *signed_new = ptrauth_sign_unauthenticated((void *)tw_logicnote_isCompleted,
-                                  ptrauth_key_asia,
-                                  ptrauth_blend_discriminator(&vt[5], 0));
-            vt[5] = signed_new;
-#else
-            vt[5] = (void *)tw_logicnote_isCompleted;
-#endif
-            mprotect((void *)page, 0x4000, PROT_READ);
-            atomic_store(&g_iscompleted_vt_code[i], 'O');
-            n_iscomp++;
-            acc_flog(@"isComp[%d] vtable %p slot5 OK orig=%p", i, vt, stripped);
-        }
-        atomic_store(&g_iscompleted_installed_count, n_iscomp);
-        acc_flog(@"isCompleted vtable installed on %d/%d vtables, orig=%p",
-                 n_iscomp, ARC_OFF_VT_LOGICNOTE_COUNT, (void *)s_orig_iscompleted);
+        // (v6.6) LogicNote::isCompleted swizzle 鎷嗛櫎銆?
     });
 }
 
@@ -726,8 +565,8 @@ static void time_warp_install(void) {
     });
 }
 
-// 读取谱面时钟的当前显示 ms（复刻 sub_10086E69C 逻辑）
-// 时钟结构: clock[32]=累计时间, clock[40]=基准偏移, clock[45]=内部驱动标志, clock[52]=外部位置
+// 璇诲彇璋遍潰鏃堕挓鐨勫綋鍓嶆樉绀?ms锛堝鍒?sub_10086E69C 閫昏緫锛?
+// 鏃堕挓缁撴瀯: clock[32]=绱鏃堕棿, clock[40]=鍩哄噯鍋忕Щ, clock[45]=鍐呴儴椹卞姩鏍囧織, clock[52]=澶栭儴浣嶇疆
 static int32_t _read_chart_clock_ms(void *clk) {
     if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return -1;
     if (*(uint8_t *)((char *)clk + 45) & 1)
@@ -743,7 +582,7 @@ void player_seek_ms(uint32_t ms) {
 
     time_warp_freeze_inc();
 
-    // 1. 音频跳转：MTP::seekTo(this, ms, channel=0)
+    // 1. 闊抽璺宠浆锛歁TP::seekTo(this, ms, channel=0)
     typedef void (*seek_fn)(void *, uint32_t, int);
     seek_fn fn = (seek_fn)_player_vt_slot(self, 0x40);
     if (fn) {
@@ -751,10 +590,10 @@ void player_seek_ms(uint32_t ms) {
         acc_flog(@"[seek] audio seek to %u ms", ms);
     }
 
-    // 2. 谱面时钟跳转：修改 clock[40] 使得 display_time = target_ms
-    //    Gameplay(+928) → LogicChart(+48) → Clock
-    //    display = clock[32] - clock[40]  (当 clock[45] 置位时, steady_clock 驱动)
-    //    调整: clock[40] += (current_display - target_ms)
+    // 2. 璋遍潰鏃堕挓璺宠浆锛氫慨鏀?clock[40] 浣垮緱 display_time = target_ms
+    //    Gameplay(+928) 鈫?LogicChart(+48) 鈫?Clock
+    //    display = clock[32] - clock[40]  (褰?clock[45] 缃綅鏃? steady_clock 椹卞姩)
+    //    璋冩暣: clock[40] += (current_display - target_ms)
     void *gp = atomic_load(&g_gameplay_instance);
     if (gp && ptr_plausible(gp) && addr_readable((char *)gp + 936, 8)) {
         void *logic = *(void **)((char *)gp + 928);
@@ -769,129 +608,18 @@ void player_seek_ms(uint32_t ms) {
                          cur_ms, ms, delta, *base_off);
             }
 
-            // 3. 谱面状态重置 (Plan A, v6 timing-aware):
-            //    - IDA 逆向 sub_10086EE70 (空间查询) 确认: 加回活跃列表的关键
-            //      条件是 vtable[5](note) == 0 (isCompleted)。byte[12]/[13] 是
-            //      sub_1007E2788 (vtable[3]) 每帧重写的距离缓存,清零无意义。
-            //    - v6 改为 timing-aware: 设置 g_seek_target_ms 后,hook 按
-            //      note.timing(LogicNote+20) 与 target 比较精确决定返回值,
-            //      模拟 ArcCreate 的 ResetJudgeTo(timing) 语义。
-            //      - note.timing >= target-120  -> 返回 0 (重新出现)
-            //      - note.timing <  target-120  -> 返回 1 (保持已完成)
-            //    - 旧的 1.5s rewind window 仍开启,作为 timing 字段读失败时的
-            //      安全兜底 (legacy v5 path)。
-            //    保留辅助清理:
-            //      a) 清空活跃音符列表 (+160/+168) 强制下一帧重查询
-            //      b) 重新激活所有音轨 (chart_data+80 tracks byte[0])
-            //      c) 清空事件队列 (+288/+296)
-            //      d) 清除结束标志 (+313..+316)
-
-            // v6: 设置精确 seek 目标 (chart-ms)
-            if (atomic_load(&g_iscompleted_installed_count) > 0) {
-                atomic_store(&g_seek_target_ms, (int32_t)ms);
-                acc_flog(@"[seek] g_seek_target_ms = %d (timing-aware re-show armed)", (int32_t)ms);
-            } else {
-                acc_flog(@"[seek] WARN: isCompleted hook not installed, replay may fail");
-            }
-
-            // Legacy v5 backstop: ~1.5s rewind grace window (兼容 timing 读失败)
-            uint64_t now_us = _real_now_us_unwarped();
-            if (now_us != 0 && atomic_load(&g_iscompleted_installed_count) > 0) {
-                atomic_store(&g_rewind_until_us, now_us + 1500000ULL);
-                acc_flog(@"[seek] backstop rewind window opened until +1500ms (real)");
-            }
-
-            typedef void (*release_fn)(void *);
-            uint64_t base = arc_image_base();
-
-            // a) 清空活跃音符列表: release 每个引用, 然后截断
-            if (base && addr_readable((char *)logic + 168, 8)) {
-                void **notes_begin = *(void ***)((char *)logic + 160);
-                void **notes_end   = *(void ***)((char *)logic + 168);
-                if (notes_begin && notes_end && notes_end > notes_begin) {
-                    release_fn rel = (release_fn)(base + 0xDB1A28ULL);
-                    int n_notes = (int)(notes_end - notes_begin);
-                    for (int ni = 0; ni < n_notes; ni++) {
-                        if (notes_begin[ni]) rel(notes_begin[ni]);
-                    }
-                    *(void ***)((char *)logic + 168) = notes_begin;
-                    acc_flog(@"[seek] cleared %d active notes", n_notes);
-                }
-            }
-
-            // b) 重新激活所有音轨
-            if (addr_readable((char *)logic + 40, 8)) {
-                void *cd = *(void **)((char *)logic + 40);
-                if (cd && ptr_plausible(cd) && addr_readable((char *)cd + 96, 8)) {
-                    void **tracks_begin = *(void ***)((char *)cd + 80);
-                    void **tracks_end   = *(void ***)((char *)cd + 88);
-                    if (tracks_begin && tracks_end && tracks_end > tracks_begin) {
-                        int n_reactivated = 0;
-                        for (void **t = tracks_begin; t < tracks_end; t++) {
-                            if (*t && ptr_plausible(*t) && addr_readable(*t, 8)) {
-                                *(uint8_t *)(*t) = 1;
-                                n_reactivated++;
-                            }
-                        }
-                        acc_flog(@"[seek] reactivated %d tracks", n_reactivated);
-                    }
-                }
-            }
-
-            // c) 清空事件队列
-            if (addr_readable((char *)logic + 296, 8)) {
-                void *ev_begin = *(void **)((char *)logic + 288);
-                if (ev_begin)
-                    *(void **)((char *)logic + 296) = ev_begin;
-            }
-
-            // d) 清除结束标志
-            if (addr_readable((char *)logic + 321, 1)) {
-                *(uint8_t *)((char *)logic + 313) = 0;
-                *(uint8_t *)((char *)logic + 314) = 0;
-                *(uint8_t *)((char *)logic + 315) = 0;
-                *(uint8_t *)((char *)logic + 316) = 0;
-                acc_flog(@"[seek] chart flags reset");
-            }
-
-            // (e) ScoreKeeper 重置 (v6.5 修复版)
-            //   v6.3 失败原因: 漏掉 sk+104(far) 与 sk+128..140(late/early), 导致下一帧
-            //   sub_100A7DFC4 看到 v14 = pure(0)+far(旧值)+lost(0) > 0,
-            //   而 sub_100A7E71C 触发条件 (judged != cached_total) 异常成立。
-            //   完整布局来自 sub_100A7DFC4 + sub_100A7E71C 反编 (label 字符串验证):
-            //     sk+20  score_displayed   sk+92  combo            sk+96  score_raw
-            //     sk+100 pure_count        sk+104 far_count        sk+108 lost_count
-            //     sk+128 late_in_pure      sk+132 early_in_pure
-            //     sk+136 late_in_max_pure  sk+140 early_in_max_pure
-            //   总 notes 不在 sk 内 (来自 *((sk+176)+184)). HP (sk+28) 不重置。
-            if (addr_readable((char *)logic + 64, 8)) {
-                void *sk = *(void **)((char *)logic + 56);
-                if (sk && ptr_plausible(sk) && addr_readable(sk, 144)) {
-                    int32_t old_combo = *(int32_t *)((char *)sk + 92);
-                    int32_t old_score = *(int32_t *)((char *)sk + 20);
-                    int32_t old_pure  = *(int32_t *)((char *)sk + 100);
-                    int32_t old_far   = *(int32_t *)((char *)sk + 104);
-                    int32_t old_lost  = *(int32_t *)((char *)sk + 108);
-                    *(int32_t *)((char *)sk + 20)  = 0;  // score_displayed
-                    *(int32_t *)((char *)sk + 92)  = 0;  // combo
-                    *(int32_t *)((char *)sk + 96)  = 0;  // score_raw (PM 投影累加器)
-                    *(int32_t *)((char *)sk + 100) = 0;  // pure_count
-                    *(int32_t *)((char *)sk + 104) = 0;  // far_count   (v6.3 漏点)
-                    *(int32_t *)((char *)sk + 108) = 0;  // lost_count
-                    *(int32_t *)((char *)sk + 128) = 0;  // late_in_pure
-                    *(int32_t *)((char *)sk + 132) = 0;  // early_in_pure
-                    *(int32_t *)((char *)sk + 136) = 0;  // late_in_max_pure
-                    *(int32_t *)((char *)sk + 140) = 0;  // early_in_max_pure
-                    // ⚠ 不要写 logic+756/760/812: 这些 UI 缓存字段实际在 *(GP+896)
-                    //   (即 ScorePresenter) 上, 不在 LogicNoteGroup 上!
-                    //   v6.5.1 写在这里直接堆越界, 导致 seek 后下一帧闪退。
-                    //   省略也无所谓: UI updater 下一帧自检 combo/score 不一致会刷新。
-                    acc_flog(@"[seek] sk reset: combo %d->0  score %d->0  P/F/L = %d/%d/%d -> 0/0/0",
-                             old_combo, old_score, old_pure, old_far, old_lost);
-                } else {
-                    acc_flog(@"[seek] WARN: sk ptr unreadable: %p", sk);
-                }
-            }
+            // (v6.6) 涓嶅啀鍋氫互涓?璋遍潰鐘舵€侀噸缃?鎿嶄綔:
+            //   - 娓呯┖娲昏穬闊崇鍒楄〃 / release 姣忎釜 note (鏈?use-after-free 椋庨櫓)
+            //   - 閲嶆柊婵€娲绘墍鏈夐煶杞?byte[0]=1 (鍙兘澶嶆椿宸叉 track)
+            //   - 娓呯┖浜嬩欢闃熷垪 / 娓呴櫎缁撴潫鏍囧織
+            //   - 娓呴浂 ScoreKeeper (combo/score/P/F/L)
+            // 杩欎簺閮芥槸 v6 涔嬪墠涓烘ā鎷?鍚戝悗璺冲悗鍥炴斁" 鍔犵殑鍓綔鐢ㄥ緢閲嶇殑浠ｇ爜.
+            // 鐜板凡纭鍦?iOS 闂簮浜岃繘鍒朵笂鏃犳硶鍋氬埌 ArcCreate 鐨?鏃犵姸鎬侀噸娲剧敓"
+            // 璇箟 (HoldNote 鍐呴儴 tick 璁℃暟鍣ㄦ棤娉曢噸缃?, 寮鸿娓呯悊浼氳Е鍙戝穿婧?
+            //
+            // 鐜板湪 seek 鍙姩涓や欢浜?(涓婇潰鐨?: 闊抽璺?+ 璋遍潰 clock 鍋忕Щ. 璺宠繃鐨?
+            // note 鐢辨父鎴忚嚜韬殑 sub_100870344 璺緞鑷姩鍒?lost; 宸叉紨濂忚繃鐨?note
+            // 涓嶄細閲嶇幇, 闇€瑕侀噸鐜╄鐢?Retry.
         }
     }
 
@@ -900,13 +628,13 @@ void player_seek_ms(uint32_t ms) {
     time_warp_freeze_dec();
 }
 
-// (player_set_paused 已移除: 用户反馈暂停 BGM 没意义且与 freeze 冲突)
+// (player_set_paused 宸茬Щ闄? 鐢ㄦ埛鍙嶉鏆傚仠 BGM 娌℃剰涔変笖涓?freeze 鍐茬獊)
 
 uint32_t player_get_position_ms_cached(void) {
     return atomic_load(&g_last_pos_ms);
 }
 
-// 调用者需要的最大进度值：优先 FMOD 拿到的真实总长，其次是运行中看到过的最大 ms
+// 璋冪敤鑰呴渶瑕佺殑鏈€澶ц繘搴﹀€硷細浼樺厛 FMOD 鎷垮埌鐨勭湡瀹炴€婚暱锛屽叾娆℃槸杩愯涓湅鍒拌繃鐨勬渶澶?ms
 uint32_t player_get_progress_max_ms(void) {
     uint32_t len = atomic_load(&g_song_length_ms);
     if (len > 0) return len;
@@ -959,7 +687,7 @@ void loadPref(void) {
 %hook NSBundle
 + (NSBundle *)bundleForClass:(Class)aClass {
     if (aClass == [%c(WHToastView) class]) {
-        // WHToast 资源被打包进 dylib 同目录的 bundle; TrollStore 场景下用 mainBundle 兜底
+        // WHToast 璧勬簮琚墦鍖呰繘 dylib 鍚岀洰褰曠殑 bundle; TrollStore 鍦烘櫙涓嬬敤 mainBundle 鍏滃簳
         NSBundle *main = [NSBundle mainBundle];
         return main ?: %orig;
     }
@@ -970,7 +698,7 @@ void loadPref(void) {
 %hook UIWindow
 - (void)bringSubviewToFront:(UIView *)view {
     %orig;
-    // 防递归：当外部把 button/menuView 自己置顶时，不要再递归置顶它们
+    // 闃查€掑綊锛氬綋澶栭儴鎶?button/menuView 鑷繁缃《鏃讹紝涓嶈鍐嶉€掑綊缃《瀹冧滑
     if (view == button || view == menuView) return;
     if (button) %orig(button);
     if (menuView) %orig(menuView);
@@ -1027,7 +755,7 @@ void loadPref(void) {
     UIWindow *w = [self keyWindow];
     acc_flog(@"show: keyWindow=%p windows.count=%lu", w, (unsigned long)UIApp.windows.count);
     if (!w) {
-        // cocos2d-x 场景下 keyWindow 可能为 nil，手动拉一个
+        // cocos2d-x 鍦烘櫙涓?keyWindow 鍙兘涓?nil锛屾墜鍔ㄦ媺涓€涓?
         for (UIWindow *win in UIApp.windows) {
             acc_flog(@"  win=%p key=%d level=%f hidden=%d", win, win.isKeyWindow, win.windowLevel, win.hidden);
             if (!win.hidden) { w = win; break; }
@@ -1083,9 +811,9 @@ void loadPref(void) {
     CGFloat y = 12;
     CGFloat innerW = W - 24;
 
-    // 标题
+    // 鏍囬
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 24)];
-    title.text = [NSString stringWithFormat:@"Arcaea Speed (XRC) %@", XRC_TWEAK_VERSION];
+    title.text = [NSString stringWithFormat:@"Arcaea 鍙橀€?(XRC) %@", XRC_TWEAK_VERSION];
     title.font = [UIFont boldSystemFontOfSize:18];
     title.textColor = [UIColor blackColor];
     [card addSubview:title];
@@ -1093,7 +821,7 @@ void loadPref(void) {
 
     // architecture summary line
     UILabel *warn = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 48)];
-    warn.text = @"Audio: FMOD freq | Chart: GP.update retime | Visual: gettimeofday warp";
+    warn.text = @"闊抽: FMOD freq | 璋遍潰: GP.update retime | 鐢婚潰: gettimeofday warp";
     warn.font = [UIFont systemFontOfSize:10];
     warn.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.2 alpha:1.0];
     warn.numberOfLines = 0;
@@ -1104,7 +832,7 @@ void loadPref(void) {
     BOOL playerReady = (get_player_or_resolve() != NULL);
 
     UILabel *playerHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    playerHdr.text = playerReady ? @"BGM Control" : @"BGM (waiting...)";
+    playerHdr.text = playerReady ? @"BGM 鎺у埗" : @"BGM (绛夊緟涓?..)";
     playerHdr.font = [UIFont systemFontOfSize:13];
     playerHdr.textColor = [UIColor darkGrayColor];
     [card addSubview:playerHdr];
@@ -1132,7 +860,7 @@ void loadPref(void) {
     self.progressLabel = posLbl;
     y += 22;
 
-    // (Pause BGM 控件已移除: setPaused 与 freeze 双重暂停冲突, 实测不可用)
+    // (Pause BGM 鎺т欢宸茬Щ闄? setPaused 涓?freeze 鍙岄噸鏆傚仠鍐茬獊, 瀹炴祴涓嶅彲鐢?
 
     [self.progressTimer invalidate];
     self.progressTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
@@ -1143,7 +871,7 @@ void loadPref(void) {
 
     // toast switch
     UILabel *toastLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    toastLbl.text = @"Show toast on rate change";
+    toastLbl.text = @"鍒囨崲鍊嶇巼鏃舵彁绀?;
     toastLbl.font = [UIFont systemFontOfSize:14];
     toastLbl.textColor = [UIColor blackColor];
     [card addSubview:toastLbl];
@@ -1157,7 +885,7 @@ void loadPref(void) {
 
     // ---- hook toggles ----
     UILabel *clkHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
-    clkHdr.text = @"Hook (ON=warp at rate)";
+    clkHdr.text = @"Hook 鐘舵€?(寮€ = 鎸夊€嶇巼 warp)";
     clkHdr.font = [UIFont systemFontOfSize:11];
     clkHdr.textColor = [UIColor darkGrayColor];
     clkHdr.numberOfLines = 0;
@@ -1179,7 +907,7 @@ void loadPref(void) {
         cntLbl.text = [NSString stringWithFormat:@"%llu calls", (unsigned long long)atomic_load(clocks[i].cnt)];
         cntLbl.font = [UIFont systemFontOfSize:10];
         cntLbl.textColor = [UIColor grayColor];
-        cntLbl.tag = 3000 + i; // 给 progressTick 用，后续可刷新
+        cntLbl.tag = 3000 + i; // 缁?progressTick 鐢紝鍚庣画鍙埛鏂?
         [card addSubview:cntLbl];
 
         UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
@@ -1193,9 +921,9 @@ void loadPref(void) {
         y += MAX(36, sz.height) + 4;
     }
 
-    // GP.update (chart retime) - 只读显示, 始终启用
+    // GP.update (chart retime) - 鍙鏄剧ず, 濮嬬粓鍚敤
     UILabel *gpLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 20)];
-    gpLbl.text = @"GP.update (chart retime)";
+    gpLbl.text = @"GP.update (璋遍潰 retime)";
     gpLbl.font = [UIFont systemFontOfSize:12];
     gpLbl.textColor = [UIColor blackColor];
     [card addSubview:gpLbl];
@@ -1215,25 +943,25 @@ void loadPref(void) {
 
     // ---- B-1: clock-domain diagnostic panel ----
     UILabel *diagHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    diagHdr.text = @"Time domains (live)";
+    diagHdr.text = @"鏃堕棿鍩?(瀹炴椂)";
     diagHdr.font = [UIFont systemFontOfSize:11];
     diagHdr.textColor = [UIColor darkGrayColor];
     [card addSubview:diagHdr];
     y += 22;
 
-    // 5~6 行：real / warp / mach / audio / iscomp [+ optional vt-fail line]
+    // 5~6 琛岋細real / warp / mach / audio / iscomp [+ optional vt-fail line]
     UILabel *diagBody = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 108)];
     diagBody.numberOfLines = 7;
     diagBody.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
     diagBody.textColor = [UIColor blackColor];
-    diagBody.text = @"(initialising...)";
+    diagBody.text = @"(鍒濆鍖栦腑...)";
     diagBody.tag = 3020;
     [card addSubview:diagBody];
     y += 114;
 
     // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    speedHdr.text = @"Speed (tap=select, hold=delete)";
+    speedHdr.text = @"鍊嶇巼 (鍗曞嚮=閫変腑, 闀挎寜=鍒犻櫎)";
     speedHdr.font = [UIFont systemFontOfSize:12];
     speedHdr.textColor = [UIColor darkGrayColor];
     speedHdr.numberOfLines = 0;
@@ -1249,7 +977,7 @@ void loadPref(void) {
         UIButton *row = [UIButton buttonWithType:UIButtonTypeSystem];
         row.frame = CGRectMake(12, y, innerW - 60, 32);
         row.tag = 1000 + i;
-        [row setTitle:[NSString stringWithFormat:@"  %.3f×", v] forState:UIControlStateNormal];
+        [row setTitle:[NSString stringWithFormat:@"  %.3f脳", v] forState:UIControlStateNormal];
         row.titleLabel.font = [UIFont systemFontOfSize:15];
         row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
         row.backgroundColor = (i == rate_i) ? [UIColor colorWithRed:0.9 green:0.95 blue:1 alpha:1] : [UIColor clearColor];
@@ -1275,14 +1003,14 @@ void loadPref(void) {
 
     UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     addBtn.frame = CGRectMake(12, y, innerW, 32);
-    [addBtn setTitle:@"+ Add speed" forState:UIControlStateNormal];
+    [addBtn setTitle:@"+ 娣诲姞鍊嶇巼" forState:UIControlStateNormal];
     [addBtn addTarget:self action:@selector(addSpeed) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:addBtn];
     y += 40;
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     closeBtn.frame = CGRectMake(12, y, innerW, 32);
-    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"鍏抽棴" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:closeBtn];
@@ -1327,7 +1055,7 @@ void loadPref(void) {
                                    (unsigned long long)atomic_load(cnts[i])];
         }
     }
-    // GP.update 计数器
+    // GP.update 璁℃暟鍣?
     UIView *gpv = [card viewWithTag:3010];
     if ([gpv isKindOfClass:[UILabel class]]) {
         ((UILabel *)gpv).text = [NSString stringWithFormat:@"%llu calls",
@@ -1363,52 +1091,24 @@ void loadPref(void) {
                 }
             }
         }
-        uint64_t isc_calls = atomic_load(&g_iscompleted_calls);
-        uint64_t isc_z     = atomic_load(&g_iscompleted_force_zero);
-        uint64_t isc_o     = atomic_load(&g_iscompleted_force_one);
-        int isc_inst       = atomic_load(&g_iscompleted_installed_count);
-        // build per-vtable status string e.g. "OOOMM" + first failure hex
-        char vtcodes[ARC_OFF_VT_LOGICNOTE_COUNT + 1] = {0};
-        uint64_t first_bad_seen = 0; int first_bad_idx = -1;
-        for (int vi = 0; vi < ARC_OFF_VT_LOGICNOTE_COUNT; vi++) {
-            int code = atomic_load(&g_iscompleted_vt_code[vi]);
-            vtcodes[vi] = code ? (char)code : '?';
-            if (vtcodes[vi] != 'O' && first_bad_idx < 0) {
-                first_bad_idx = vi;
-                first_bad_seen = atomic_load(&g_iscompleted_vt_seen[vi]);
-            }
-        }
-        int32_t seek_tgt   = atomic_load(&g_seek_target_ms);
-        uint64_t rwnd_us   = atomic_load(&g_rewind_until_us);
         int32_t freeze_n   = atomic_load(&g_tw_freeze_count);
         double rate        = tw_get_rate();
         // wall-warp drift since rate switch (positive: warp ahead of real)
         int64_t drift_ms = 0;
         if (real_us && warp_us) drift_ms = ((int64_t)warp_us - (int64_t)real_us) / 1000;
         ((UILabel *)diagv).text = [NSString stringWithFormat:
-            @"rate %.3fx  freeze=%d  rwnd=%llums\n"
+            @"rate %.3fx  freeze=%d\n"
              "real %llums  warp %llums  drift %lldms\n"
              "mach %llums  audio %ums  chart %dms\n"
-             "Δ(chart-audio) %dms\n"
-             "isComp inst=%d [%s] calls=%llu z=%llu o=%llu\n"
-             "%@seekTgt=%@",
+             "螖(chart-audio) %dms",
             rate, freeze_n,
-            (unsigned long long)(rwnd_us ? (rwnd_us / 1000) : 0),
             (unsigned long long)(real_us / 1000),
             (unsigned long long)(warp_us / 1000),
             (long long)drift_ms,
             (unsigned long long)mach_ms,
             audio_ms,
             chart_ms,
-            (int)((int32_t)chart_ms - (int32_t)audio_ms),
-            isc_inst, vtcodes, (unsigned long long)isc_calls,
-            (unsigned long long)isc_z, (unsigned long long)isc_o,
-            (first_bad_idx >= 0
-                ? [NSString stringWithFormat:@"vt[%d] seen=0x%llx (target=0x%llx)\n",
-                       first_bad_idx, (unsigned long long)first_bad_seen,
-                       (unsigned long long)(arc_image_base() + ARC_OFF_LOGICNOTE_ISCOMPLETED)]
-                : @""),
-            (seek_tgt == INT_MIN ? @"--" : [NSString stringWithFormat:@"%dms", seek_tgt])];
+            (int)((int32_t)chart_ms - (int32_t)audio_ms)];
     }
 }
 
@@ -1464,7 +1164,7 @@ void loadPref(void) {
     NSMutableDictionary *p = loadPrefDict();
     NSMutableArray *keys = [p[@"speedKeys"] mutableCopy];
     if (i >= (NSInteger)keys.count) return;
-    if (keys.count <= 1) return; // 至少留一个
+    if (keys.count <= 1) return; // 鑷冲皯鐣欎竴涓?
     NSString *k = keys[i];
     [keys removeObjectAtIndex:i];
     [p removeObjectForKey:k];
@@ -1512,14 +1212,14 @@ void loadPref(void) {
 static void initButton(void) {
     [WHToast setShowMask:NO];
     [WQSuspendView showWithType:WQSuspendViewTypeNone tapBlock:^{
-        // 单击：切换倍率（低频动作）
+        // 鍗曞嚮锛氬垏鎹㈠€嶇巼锛堜綆棰戝姩浣滐級
         if (rate_count <= 0) return;
         rate_i = (rate_i + 1) % rate_count;
-        // 【修复】time_warp_set_rate现在内部已调用apply_speed_to_all_channels和重置逻辑时钟
+        // 銆愪慨澶嶃€憈ime_warp_set_rate鐜板湪鍐呴儴宸茶皟鐢╝pply_speed_to_all_channels鍜岄噸缃€昏緫鏃堕挓
         time_warp_set_rate((double)rates[rate_i]);
         if (toast) {
-            [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (tap2x=menu)", rates[rate_i]]
-                                   duration:0.5 finishHandler:^{}];
+            [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (鍙屽嚮鎵撳紑鑿滃崟)", rates[rate_i]]
+                                       duration:0.5 finishHandler:^{}];
         }
     }];
     button.frame = CGRectMake(0, 200, 40, 40);
@@ -1536,12 +1236,12 @@ static void initButton(void) {
     label.textAlignment = NSTextAlignmentCenter;
     [button addSubview:label];
 
-    // 长按浮窗 开菜单
+    // 闀挎寜娴獥 寮€鑿滃崟
     UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[AccMenuController shared] action:@selector(handleLongPress:)];
     lp.minimumPressDuration = 0.45;
     [button addGestureRecognizer:lp];
-    // 双击浮窗 开菜单（陪绑）
+    // 鍙屽嚮娴獥 寮€鑿滃崟锛堥櫔缁戯級
     UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
         initWithTarget:[AccMenuController shared] action:@selector(handleDoubleTap:)];
     dt.numberOfTapsRequired = 2;
@@ -1571,7 +1271,7 @@ static void initButton(void) {
 
 #pragma mark - bootstrap
 
-// 文件日志：sideload 下没法接 Console，写到 app Documents/xrc-arcdemo.log
+// 鏂囦欢鏃ュ織锛歴ideload 涓嬫病娉曟帴 Console锛屽啓鍒?app Documents/xrc-arcdemo.log
 void acc_flog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -1627,7 +1327,7 @@ static void doBootstrap(void) {
                          atomic_load(&g_tw_freeze_count));
             }
             if (p) try_capture_song_length(p);
-            // 兜底维护 last_pos_ms / max_seen_ms（用于进度条显示）
+            // 鍏滃簳缁存姢 last_pos_ms / max_seen_ms锛堢敤浜庤繘搴︽潯鏄剧ず锛?
             if (p && g_ch_get_position) {
                 void *channels_base = channels_base_chk;
                 if (channels_base) {
@@ -1648,7 +1348,7 @@ static void doBootstrap(void) {
 static void onAppDidEnterBackground(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
-    // 切后台：冻结 warp 时间，防止回前台时 currentTimeMs 跳变 = 后台时长 * rate
+    // 鍒囧悗鍙帮細鍐荤粨 warp 鏃堕棿锛岄槻姝㈠洖鍓嶅彴鏃?currentTimeMs 璺冲彉 = 鍚庡彴鏃堕暱 * rate
     time_warp_freeze_inc();
     acc_flog(@"app -> background, warp frozen (count=%d)", atomic_load(&g_tw_freeze_count));
 }
@@ -1656,7 +1356,7 @@ static void onAppDidEnterBackground(CFNotificationCenterRef center, void *observ
 static void onAppWillEnterForeground(CFNotificationCenterRef center, void *observer,
                                      CFStringRef name, const void *object,
                                      CFDictionaryRef userInfo) {
-    s_gp_last_real_us = 0;  // 回前台后重建 retime 基准
+    s_gp_last_real_us = 0;  // 鍥炲墠鍙板悗閲嶅缓 retime 鍩哄噯
     time_warp_freeze_dec();
     acc_flog(@"app -> foreground, warp unfrozen (count=%d)", atomic_load(&g_tw_freeze_count));
 }
@@ -1684,8 +1384,8 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
         onAppWillEnterForeground,
         (CFStringRef)UIApplicationWillEnterForegroundNotification,
         NULL, CFNotificationSuspensionBehaviorCoalesce);
-    // 兜底：如果 ctor 在 UIApplicationDidFinishLaunching 之后才跑（理论上不会，但
-    // 注入工具如果用 LC_LOAD_WEAK_DYLIB / 延迟加载可能错过通知），3 秒后强制走一次
+    // 鍏滃簳锛氬鏋?ctor 鍦?UIApplicationDidFinishLaunching 涔嬪悗鎵嶈窇锛堢悊璁轰笂涓嶄細锛屼絾
+    // 娉ㄥ叆宸ュ叿濡傛灉鐢?LC_LOAD_WEAK_DYLIB / 寤惰繜鍔犺浇鍙兘閿欒繃閫氱煡锛夛紝3 绉掑悗寮哄埗璧颁竴娆?
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         acc_flog(@"3s fallback bootstrap");
