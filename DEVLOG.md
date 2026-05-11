@@ -8,9 +8,29 @@
 
 ---
 
-## 当前状态 (v6.3, 2026-05-12)
+## 当前状态 (v6.3.1, 2026-05-12)
 
-### v6.3 改动 — 重构: chart slave audio + score-keeper reset
+### v6.3.1 改动 — 回退 chart slave, 仅保留 score-keeper reset
+
+用户反馈: chart slave 到 audio 任何形式都会引入延迟或抽搐 (FMOD `getPos`
+ms 量化 + 帧间不均匀 + 量化往复, 即使 ≥3ms 阈值仍然会肉眼可见跳)。
+**变速回到 v6.2 思路**: chart 端独立按 rate 推进 (`(1-rate)*delta`),
+audio 端 `setFrequency(base*rate)`, **不做任何对齐绑定**。后续如果
+要做精确对齐, 思路只有三选一: (a) 完全相同 rate; (b) 不同 rate +
+固定延迟补偿; (c) 不做音画同步变速。当前默认 (a), 误差靠用户接受。
+
+**保留:** Seek 时 ScoreKeeper 重置 (这部分用户先验证)。布局来自
+`sub_100A7DFC4` 反汇编, `sk = *(LogicNote+56)`:
+  sk[+20] score, sk[+92] combo, sk[+96] pure, sk[+100] far,
+  sk[+104] lost, sk[+108] late/early —— 全部清零。HP 不动。
+
+**删掉:** `g_audio_corr_x10000` (FMOD 频率反馈校准), `apply_speed_to_all_channels`
+里的 corr 乘子。`g_audio_meas_rate_x1000` 测量保留作面板诊断。
+面板诊断行: `audio.meas X.XXXx  N=N  Δ=Nms` (Δ = chart - audio, 仅观测)。
+
+---
+
+## 历史 v6.3 (作废)
 
 **变速思路换:** 不再做 FMOD 频率自校准 (`g_audio_corr_x10000` 删除)。理由: 即使
 FMOD 实际速率有 ±2% 量化误差, chart 端只要直接读 `audio_pos_ms` 反算 `clk[16]`

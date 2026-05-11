@@ -469,59 +469,43 @@ static uint64_t _real_now_us_unwarped(void) {
 // forward decl (defined later in file): chart clock reader used by retime drift fix
 static int32_t _read_chart_clock_ms(void *clk);
 
-// 谱面 retime: 让 chart_clock 完全 SLAVE 到 audio_pos
-//
-// 游戏内 chart 时钟公式 (sub_1008C2FEC):
-//   chart_displayed_ms = steady_clock_ms - clk[16] - clk[40]
-//
-// 我们想让 chart_displayed_ms == audio_pos_ms, 反推:
-//   clk[16] = steady_clock_ms - audio_pos_ms - clk[40]
-//
-// 这样不需要测量倍率, 不需要每帧 (1-rate)*delta 累积, 不需要 chart→audio
-// 低通拉回——直接从 audio 反算, 一次到位。当 audio 推进 rate 倍速 (FMOD
-// setFrequency 已经做到), chart 自动跟着以 rate 倍速推进, 而且字面上等于
-// 音频位置, 永不漂移。
-//
-// 防抽搐: 仅当差距 >= 3ms 才写, 其它帧让 steady_clock 平滑插值。
+// 谱面 retime: 每帧按 rate 推进 clk[16], 与音频独立。
+// 不做 audio<->chart 任何绑定 (绑定无论怎么做都会抽搐或加延迟)。
+// 公式: chart_displayed = steady_now - clk[16] - clk[40]
+// 想让 chart 走 rate 倍速 -> 每帧让 clk[16] 反向走 (rate-1)*delta_ms
+// 即  clk[16] += (1 - rate) * delta_ms
 static void _gp_retime_logic_clock(void *logic) {
     if (!logic) return;
     if (atomic_load(&g_tw_freeze_count) > 0) return;
     if (!addr_readable((char *)logic + 56, sizeof(void *))) return;
     void *clk = *(void **)((char *)logic + 48);
     if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return;
-    // 只在 internal-drive 模式 (clk[45]&1) 下生效——external 模式由游戏自管
-    uint8_t mode = *(uint8_t *)((char *)clk + 45);
-    if ((mode & 1) == 0) return;
 
-    // audio_pos_ms 必须有效
-    uint32_t audio_ms = atomic_load(&g_last_pos_ms);
-    if (audio_ms == 0) return;  // 还没开始/seek 后
-
-    // 1.0x 不需要 retime: 让游戏自己跑
-    double rate = tw_get_rate();
-    if (rate >= 0.999 && rate <= 1.001) {
-        // 1.0x 时仅在 chart 偏离 audio 太多 (>50ms) 时矫正一次
-        int32_t chart_now = _read_chart_clock_ms(clk);
-        if (chart_now <= 0) return;
-        int32_t err = chart_now - (int32_t)audio_ms;
-        if (err > -50 && err < 50) return;
+    uint64_t now_us = _real_now_us_unwarped();
+    if (!now_us) return;
+    if (clk != s_gp_last_clock || s_gp_last_real_us == 0 || now_us <= s_gp_last_real_us) {
+        s_gp_last_clock = clk;
+        s_gp_last_real_us = now_us;
+        return;
     }
 
-    // steady_clock_ms (与游戏内 clk[32] 推进同源)
-    static mach_timebase_info_data_t s_tb_local;
-    if (s_tb_local.denom == 0) mach_timebase_info(&s_tb_local);
-    int64_t steady_ms = (int64_t)((mach_absolute_time() * (uint64_t)s_tb_local.numer / (uint64_t)s_tb_local.denom) / 1000000ULL);
+    uint64_t delta_us = now_us - s_gp_last_real_us;
+    if (delta_us > 200000ULL) delta_us = 200000ULL;
+    s_gp_last_real_us = now_us;
+    int32_t delta_ms = (int32_t)(delta_us / 1000ULL);
+    if (delta_ms <= 0) return;
 
-    int32_t clk40 = *(int32_t *)((char *)clk + 40);
-    int64_t target_clk16 = steady_ms - (int64_t)audio_ms - (int64_t)clk40;
-    if (target_clk16 > INT_MAX) target_clk16 = INT_MAX;
-    if (target_clk16 < INT_MIN) target_clk16 = INT_MIN;
-    int32_t *clk16 = (int32_t *)((char *)clk + 16);
-    int32_t cur = *clk16;
-    int32_t diff = (int32_t)target_clk16 - cur;
-    // 抗抖动: |diff| < 3ms 不动
-    if (diff > -3 && diff < 3) return;
-    *clk16 = (int32_t)target_clk16;
+    double rate = tw_get_rate();
+    int32_t adjust = 0;
+    if (rate < 0.999 || rate > 1.001)
+        adjust = (int32_t)((1.0 - rate) * (double)delta_ms);
+
+    if (adjust == 0) return;
+    int32_t *start_ms = (int32_t *)((char *)clk + 16);
+    int64_t after = (int64_t)(*start_ms) + (int64_t)adjust;
+    if (after > INT_MAX) after = INT_MAX;
+    if (after < INT_MIN) after = INT_MIN;
+    *start_ms = (int32_t)after;
 }
 
 // forward decl (defined after time_warp_install)
