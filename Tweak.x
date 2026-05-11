@@ -104,18 +104,11 @@ _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
 static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
 
-// === 音频速率自校准 ===
-// 想法: FMOD setFrequency(base * rate) 设置后, 由于采样率量化 / 内部混音
-// 误差等原因, 音频实际推进速率不一定精确等于 rate。我们在 tw_mtp_getpos 里
-// 做 ~500ms 滑窗测量 audio_dms / real_dms = measured_rate, 然后乘性逼近
-// 修正系数 corr = target_rate / measured_rate, 在 apply_speed_to_all_channels
-// 时用 base * rate * corr 作为 setFrequency 实参。这样不绑死谱面/音频, 只是
-// 把音频拉到 target_rate, 谱面继续用 _gp_retime_logic_clock 走 target_rate,
-// 两者各自命中总倍率, 不会互相拉扯导致谱面抽搐。
-_Atomic(uint32_t) g_audio_corr_x10000 = 10000;     // 1.0000 默认
-_Atomic(uint32_t) g_audio_meas_rate_x1000 = 1000;  // 最近一次 measured_rate * 1000 (面板诊断)
-static _Atomic(uint32_t) g_audio_meas_count = 0;    // 累计完成测量次数
-// 滑窗状态 (单线程: 只在 tw_mtp_getpos 调用栈使用)
+// === 音频实测速率 (诊断用, 不再做反馈校准) ===
+// chart 直接从 audio_pos 反算, 所以即使 FMOD 频率有量化误差, chart 也会
+// 跟着走, 不需要补偿。这里只保留测量, 方便面板观察 FMOD 实际速率。
+_Atomic(uint32_t) g_audio_meas_rate_x1000 = 1000;  // measured_rate * 1000
+static _Atomic(uint32_t) g_audio_meas_count = 0;
 static uint64_t s_audio_meas_real_us_start = 0;
 static uint32_t s_audio_meas_pos_ms_start = 0;
 static uint32_t s_audio_meas_pos_ms_last = 0;
@@ -250,16 +243,15 @@ static int player_collect_channels(void **outChs, int outCap) {
     return got;
 }
 
-// 把当前 rate 应用到所有 channel：base_freq * rate * audio_corr
-// audio_corr 由 tw_mtp_getpos 滑窗测量并乘性逼近 target/measured，
-// 用来抵消 FMOD setFrequency 的量化/混音误差。
+// 把当前 rate 应用到所有 channel：base_freq * rate
+// (chart 端通过 _gp_retime_logic_clock 直接 slave 到 audio_pos, 不需要乘性
+//  corr 抵消 FMOD 频率量化误差——chart 跟着 audio 走, audio 走多快 chart 就
+//  走多快, 永不漂移。)
 static void apply_speed_to_all_channels(void) {
     if (!g_ch_set_frequency || !g_ch_get_frequency) return;
     if (rate_count <= 0 || !rates) return;
     float rate = rates[rate_i];
     if (rate <= 0.001f) return;
-    float corr = (float)atomic_load(&g_audio_corr_x10000) / 10000.0f;
-    if (corr < 0.5f || corr > 2.0f) corr = 1.0f;
     void *chs[ARC_MAX_CHANNELS] = {0};
     int n = player_collect_channels(chs, ARC_MAX_CHANNELS);
     for (int i = 0; i < n; i++) {
@@ -267,15 +259,13 @@ static void apply_speed_to_all_channels(void) {
         if (base <= 1.0f) {
             float cur = 0;
             if (g_ch_get_frequency(chs[i], &cur) == 0 && cur > 1.0f) {
-                // 第一次：当前频率就是上次设置后的值。如果之前没改过，cur 就是 base。
-                // 为了简单起见：第一次见到 channel 时，cur 视为 base（要求第一次调用前 rate 必须 = 1.0）。
                 base = cur;
                 atomic_store(&g_base_freq[i], base);
             } else {
                 continue;
             }
         }
-        float target = base * rate * corr;
+        float target = base * rate;
         g_ch_set_frequency(chs[i], target);
     }
 }
@@ -428,52 +418,35 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
             atomic_store(&g_max_seen_ms, raw);
         }
 
-        // ===== 音频速率测量 (only when not frozen / not paused) =====
+        // ===== 音频速率测量 (仅诊断, chart 由 _gp_retime_logic_clock 直接 slave) =====
         if (atomic_load(&g_tw_freeze_count) == 0 && raw > 0) {
             uint64_t now_us = _real_now_us_unwarped();
             if (now_us != 0) {
                 if (s_audio_meas_real_us_start == 0 ||
                     raw < s_audio_meas_pos_ms_last) {
-                    // 初始化 / seek 后回退 -> 重置窗口
                     s_audio_meas_real_us_start = now_us;
                     s_audio_meas_pos_ms_start  = raw;
                     s_audio_meas_pos_ms_last   = raw;
                 } else {
                     s_audio_meas_pos_ms_last = raw;
                     uint64_t dur_us = now_us - s_audio_meas_real_us_start;
-                    if (dur_us >= 500000ULL) {  // 500ms 一窗
+                    if (dur_us >= 500000ULL) {
                         uint32_t audio_dms = raw - s_audio_meas_pos_ms_start;
                         double real_dms = (double)dur_us / 1000.0;
-                        if (real_dms > 1.0 && audio_dms < 60000) {  // 防 seek/异常
+                        if (real_dms > 1.0 && audio_dms < 60000) {
                             double measured = (double)audio_dms / real_dms;
                             if (measured > 0.10 && measured < 5.0) {
                                 atomic_store(&g_audio_meas_rate_x1000,
                                              (uint32_t)(measured * 1000.0 + 0.5));
-                                double target = tw_get_rate();
-                                double corr = (double)atomic_load(&g_audio_corr_x10000) / 10000.0;
-                                // 乘性收敛: corr_new = corr * (target / measured)
-                                // 限制单步幅度避免震荡
-                                double ratio = target / measured;
-                                if (ratio > 1.05) ratio = 1.05;
-                                if (ratio < 0.95) ratio = 0.95;
-                                corr *= ratio;
-                                if (corr > 1.20) corr = 1.20;
-                                if (corr < 0.80) corr = 0.80;
-                                atomic_store(&g_audio_corr_x10000,
-                                             (uint32_t)(corr * 10000.0 + 0.5));
                                 atomic_fetch_add(&g_audio_meas_count, 1);
-                                // 应用到 FMOD (异步推进, 不阻塞 getpos)
-                                apply_speed_to_all_channels();
                             }
                         }
-                        // 滑窗推进
                         s_audio_meas_real_us_start = now_us;
                         s_audio_meas_pos_ms_start  = raw;
                     }
                 }
             }
         } else {
-            // freeze 期间冻结测量
             s_audio_meas_real_us_start = 0;
         }
     }
@@ -496,47 +469,59 @@ static uint64_t _real_now_us_unwarped(void) {
 // forward decl (defined later in file): chart clock reader used by retime drift fix
 static int32_t _read_chart_clock_ms(void *clk);
 
-// 谱面 retime: 每帧微调 clock[16] (start_ms), 使谱面时间按 rate 推进
-// clock[32] = steady_now - clock[16] + offset
-// 每帧 adjust = (1 - rate) * real_delta_ms -> clock[16] += adjust
-// 效果: 谱面推进速度 = real_delta + (rate-1)*real_delta = rate * real_delta
+// 谱面 retime: 让 chart_clock 完全 SLAVE 到 audio_pos
 //
-// 注意: 不在这里做 chart->audio 绝对位置的低通拉回 (会让谱面抽搐)。
-// 谱面/音频的相对漂移由 apply_speed_to_all_channels 内基于实际测量的
-// 音频步进速率, 反向补偿 FMOD setFrequency 的乘子来收敛, 见下方 audio
-// rate 自校准段。
+// 游戏内 chart 时钟公式 (sub_1008C2FEC):
+//   chart_displayed_ms = steady_clock_ms - clk[16] - clk[40]
+//
+// 我们想让 chart_displayed_ms == audio_pos_ms, 反推:
+//   clk[16] = steady_clock_ms - audio_pos_ms - clk[40]
+//
+// 这样不需要测量倍率, 不需要每帧 (1-rate)*delta 累积, 不需要 chart→audio
+// 低通拉回——直接从 audio 反算, 一次到位。当 audio 推进 rate 倍速 (FMOD
+// setFrequency 已经做到), chart 自动跟着以 rate 倍速推进, 而且字面上等于
+// 音频位置, 永不漂移。
+//
+// 防抽搐: 仅当差距 >= 3ms 才写, 其它帧让 steady_clock 平滑插值。
 static void _gp_retime_logic_clock(void *logic) {
     if (!logic) return;
     if (atomic_load(&g_tw_freeze_count) > 0) return;
     if (!addr_readable((char *)logic + 56, sizeof(void *))) return;
     void *clk = *(void **)((char *)logic + 48);
     if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return;
+    // 只在 internal-drive 模式 (clk[45]&1) 下生效——external 模式由游戏自管
+    uint8_t mode = *(uint8_t *)((char *)clk + 45);
+    if ((mode & 1) == 0) return;
 
-    uint64_t now_us = _real_now_us_unwarped();
-    if (!now_us) return;
-    if (clk != s_gp_last_clock || s_gp_last_real_us == 0 || now_us <= s_gp_last_real_us) {
-        s_gp_last_clock = clk;
-        s_gp_last_real_us = now_us;
-        return;
+    // audio_pos_ms 必须有效
+    uint32_t audio_ms = atomic_load(&g_last_pos_ms);
+    if (audio_ms == 0) return;  // 还没开始/seek 后
+
+    // 1.0x 不需要 retime: 让游戏自己跑
+    double rate = tw_get_rate();
+    if (rate >= 0.999 && rate <= 1.001) {
+        // 1.0x 时仅在 chart 偏离 audio 太多 (>50ms) 时矫正一次
+        int32_t chart_now = _read_chart_clock_ms(clk);
+        if (chart_now <= 0) return;
+        int32_t err = chart_now - (int32_t)audio_ms;
+        if (err > -50 && err < 50) return;
     }
 
-    uint64_t delta_us = now_us - s_gp_last_real_us;
-    if (delta_us > 200000ULL) delta_us = 200000ULL;
-    s_gp_last_real_us = now_us;
-    int32_t delta_ms = (int32_t)(delta_us / 1000ULL);
-    if (delta_ms <= 0) return;
+    // steady_clock_ms (与游戏内 clk[32] 推进同源)
+    static mach_timebase_info_data_t s_tb_local;
+    if (s_tb_local.denom == 0) mach_timebase_info(&s_tb_local);
+    int64_t steady_ms = (int64_t)((mach_absolute_time() * (uint64_t)s_tb_local.numer / (uint64_t)s_tb_local.denom) / 1000000ULL);
 
-    double rate = tw_get_rate();
-    int32_t adjust = 0;
-    if (rate < 0.999 || rate > 1.001)
-        adjust = (int32_t)((1.0 - rate) * (double)delta_ms);
-
-    if (adjust == 0) return;
-    int32_t *start_ms = (int32_t *)((char *)clk + 16);
-    int64_t after = (int64_t)(*start_ms) + (int64_t)adjust;
-    if (after > INT_MAX) after = INT_MAX;
-    if (after < INT_MIN) after = INT_MIN;
-    *start_ms = (int32_t)after;
+    int32_t clk40 = *(int32_t *)((char *)clk + 40);
+    int64_t target_clk16 = steady_ms - (int64_t)audio_ms - (int64_t)clk40;
+    if (target_clk16 > INT_MAX) target_clk16 = INT_MAX;
+    if (target_clk16 < INT_MIN) target_clk16 = INT_MIN;
+    int32_t *clk16 = (int32_t *)((char *)clk + 16);
+    int32_t cur = *clk16;
+    int32_t diff = (int32_t)target_clk16 - cur;
+    // 抗抖动: |diff| < 3ms 不动
+    if (diff > -3 && diff < 3) return;
+    *clk16 = (int32_t)target_clk16;
 }
 
 // forward decl (defined after time_warp_install)
@@ -799,8 +784,7 @@ void time_warp_set_rate(double rate) {
     atomic_store(&g_tw_t0_warp_us, warp_us_now);
     atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
 
-    // 切倍率: 重置音频自校准 (avoid carry-over corr 从旧 rate)
-    atomic_store(&g_audio_corr_x10000, 10000);
+    // 切倍率: 重置测量窗口
     s_audio_meas_real_us_start = 0;
 
     apply_speed_to_all_channels();
@@ -946,6 +930,43 @@ void player_seek_ms(uint32_t ms) {
                 *(uint8_t *)((char *)logic + 315) = 0;
                 *(uint8_t *)((char *)logic + 316) = 0;
                 acc_flog(@"[seek] chart flags reset");
+            }
+
+            // e) ScoreKeeper 重置 (类比 ArcCreate 的 ScoreService.ResetScoreTo +
+            //    JudgementService.ResetJudge)。ScoreKeeper = *(LogicNote+56),
+            //    布局来自 sub_100A7DFC4 (per-frame UI updater) 反汇编:
+            //      sk[5]  (off 20)  = 当前显示分数 (int)
+            //      sk[7]  (off 28)  = 当前 HP/life (float)
+            //      sk[19] (off 76)  = HP_max (float)
+            //      sk[23] (off 92)  = total_combo (int)
+            //      sk[24] (off 96)  = pure_count
+            //      sk[25] (off 100) = far_count?
+            //      sk[26] (off 104) = lost_count?
+            //      sk[27] (off 108) = late/early?
+            //    判定计数 (24..27) 在 sub_100A7DFC4 中被计算成 v14 = sk[26]+sk[25]+sk[27]
+            //    并比较 a1+812 缓存——这就是 "已判定 note 数"。我们重置这些字段,
+            //    分数/HP/combo 将按重新出现的 note 重新累计。
+            if (addr_readable((char *)logic + 64, 8)) {
+                void *sk = *(void **)((char *)logic + 56);
+                if (sk && ptr_plausible(sk) && addr_readable(sk, 128)) {
+                    int32_t old_combo = *(int32_t *)((char *)sk + 92);
+                    int32_t old_score = *(int32_t *)((char *)sk + 20);
+                    int32_t old_pure  = *(int32_t *)((char *)sk + 96);
+                    int32_t old_far   = *(int32_t *)((char *)sk + 100);
+                    int32_t old_lost  = *(int32_t *)((char *)sk + 104);
+                    int32_t old_le    = *(int32_t *)((char *)sk + 108);
+                    *(int32_t *)((char *)sk + 20)  = 0;   // score
+                    *(int32_t *)((char *)sk + 92)  = 0;   // combo
+                    *(int32_t *)((char *)sk + 96)  = 0;   // pure
+                    *(int32_t *)((char *)sk + 100) = 0;   // far
+                    *(int32_t *)((char *)sk + 104) = 0;   // lost
+                    *(int32_t *)((char *)sk + 108) = 0;   // late/early
+                    // HP 不重置 (用户可能想保留状态; 后续需要再加)
+                    acc_flog(@"[seek] score-keeper reset: combo %d->0  score %d->0  pure %d  far %d  lost %d  le %d",
+                             old_combo, old_score, old_pure, old_far, old_lost, old_le);
+                } else {
+                    acc_flog(@"[seek] WARN: score-keeper ptr unreadable: %p", sk);
+                }
             }
         }
     }
@@ -1444,7 +1465,7 @@ void loadPref(void) {
             @"rate %.3fx  freeze=%d  rwnd=%llums\n"
              "real %llums  warp %llums  drift %lldms\n"
              "mach %llums  audio %ums  chart %dms\n"
-             "audio.meas %.3fx  corr %.3fx  N=%u\n"
+             "audio.meas %.3fx  N=%u  Δ=%dms\n"
              "isComp inst=%d [%s] calls=%llu z=%llu o=%llu\n"
              "%@seekTgt=%@",
             rate, freeze_n,
@@ -1456,8 +1477,8 @@ void loadPref(void) {
             audio_ms,
             chart_ms,
             (double)atomic_load(&g_audio_meas_rate_x1000) / 1000.0,
-            (double)atomic_load(&g_audio_corr_x10000) / 10000.0,
             (unsigned)atomic_load(&g_audio_meas_count),
+            (int)((int32_t)chart_ms - (int32_t)audio_ms),
             isc_inst, vtcodes, (unsigned long long)isc_calls,
             (unsigned long long)isc_z, (unsigned long long)isc_o,
             (first_bad_idx >= 0

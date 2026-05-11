@@ -8,7 +8,38 @@
 
 ---
 
-## 当前状态 (v6.2, 2026-05-11)
+## 当前状态 (v6.3, 2026-05-12)
+
+### v6.3 改动 — 重构: chart slave audio + score-keeper reset
+
+**变速思路换:** 不再做 FMOD 频率自校准 (`g_audio_corr_x10000` 删除)。理由: 即使
+FMOD 实际速率有 ±2% 量化误差, chart 端只要直接读 `audio_pos_ms` 反算 `clk[16]`
+就能让 `chart_displayed == audio_pos`, 永不漂移, 而且不需要每帧 `(1-rate)*delta`
+累积——零误差累计、零抖动来源。
+
+- `_gp_retime_logic_clock` 重写:
+  ```
+  clk[16] = steady_clock_ms - audio_pos_ms - clk[40]
+  ```
+  当差距 ≥3ms 才写, 让 steady_clock 平滑插值。1.0x 时差 ≤50ms 不动,
+  完全交给游戏自己跑。
+- `apply_speed_to_all_channels` 简化为 `base * rate` (去掉 corr 乘子)。
+- `tw_mtp_getpos` 滑窗保留, 仅作面板诊断用 (`g_audio_meas_rate_x1000`)。
+- 面板诊断行换为 `audio.meas X.XXXx  N=N  Δ=Nms` (Δ = chart - audio)。
+
+**Seek 重放:** 之前只 hook isCompleted 让音符重出, 但**计分器 (ScoreKeeper)
+独立累计 combo / score / pure / far / lost**, 没重置。类比 ArcCreate 的
+`ChartService.ResetJudge() + ScoreService.ResetScoreTo() + JudgementService.ResetJudge()`,
+本版本反汇编 `sub_100A7DFC4` (per-frame UI updater) 摸出 ScoreKeeper 布局
+(`sk = *(LogicNote+56)`):
+  - sk[+20] score, sk[+92] combo, sk[+96] pure, sk[+100] far, sk[+104] lost, sk[+108] late/early
+  
+`player_seek_ms` 步骤 (e) 把这些字段全部归零, HP 暂时不动。下一帧 isCompleted
+hook 让音符重出 → 玩家重新打 → ScoreKeeper 自然重新累加。
+
+---
+
+## 历史 v6.2
 
 ### v6.2 改动
 
