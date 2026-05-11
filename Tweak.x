@@ -346,13 +346,18 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
 
 // LogicNote::isCompleted (vtable+40, slot 5).
 // Same impl 0x7E27B8 lives in 5 subclass vtables (Tap/ArcTap/Hold/Arc/Bar variants).
-// Vtable starts identified via IDA xrefs to 0x1007E27B8 (image offsets):
-//   0x303FD0   0x30BC40   0x30DBB0 (LogicTapNote, typeinfo @0x10130DC00)
-//   0x3171F0   0x3388F0
+// Vtable starts identified via IDA xrefs to 0x1007E27B8 (xref data addrs are
+// vtable_start + 0x28 = slot[5], so vtable_start = xref - 0x28):
+//   xref 0x101303ff8 -> vtable 0x101303fd0 -> off 0x1303FD0
+//   xref 0x10130bc68 -> vtable 0x10130bc40 -> off 0x130BC40
+//   xref 0x10130dbd8 -> vtable 0x10130dbb0 -> off 0x130DBB0
+//   xref 0x101317218 -> vtable 0x1013171f0 -> off 0x13171F0
+//   xref 0x101338918 -> vtable 0x1013388f0 -> off 0x13388F0
+// (Earlier comment had typo 0x303FD0; the correct offsets are 0x1303FD0...)
 #define ARC_OFF_LOGICNOTE_ISCOMPLETED (0x7E27B8ULL)
 #define ARC_OFF_VT_LOGICNOTE_COUNT 5
 static const uint64_t kArcLogicNoteVtables[ARC_OFF_VT_LOGICNOTE_COUNT] = {
-    0x303FD0ULL, 0x30BC40ULL, 0x30DBB0ULL, 0x3171F0ULL, 0x3388F0ULL
+    0x1303FD0ULL, 0x130BC40ULL, 0x130DBB0ULL, 0x13171F0ULL, 0x13388F0ULL
 };
 
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
