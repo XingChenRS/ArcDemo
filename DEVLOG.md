@@ -1,277 +1,349 @@
-﻿# xrc-arcdemo Devlog
+# xrc-arcdemo Devlog
 
 ---
 
-## 椤圭洰鐩爣
+## 项目目标
 
-灏?[accDemo](https://github.com/brendonjkding/accDemo) 鏀归€犱负閽堝 Arcaea iOS 鐨勫厤瓒婄嫳 dylib锛屾敮鎸佸彉閫熴€乻eek銆佺粌涔犮€?
+将 [accDemo](https://github.com/brendonjkding/accDemo) 改造为针对 Arcaea iOS 的免越狱 dylib，支持变速、seek、练习。
+
 ---
 
-## 褰撳墠鐘舵€?(v6.6, 2026-05-12)
+## 当前状态 (v6.6, 2026-05-12)
 
-### v6.6 鑼冨洿鏀舵暃 鈥?鎷嗘帀鎵€鏈?replay 瀹為獙鎬?hook
+### v6.6 范围收敛 — 拆掉所有 replay 实验性 hook
 
-**鏈€缁堝喅瀹?*: Arcaea iOS 闂簮浜岃繘鍒舵棤娉曞疄鐜?ArcCreate 閭ｇ `ResetJudgeTo(timing)` 鐨?鏃犵姸鎬侀噸娲剧敓"璇箟
-(姣忎釜 Tap/Hold/Arc/ArcTap 鍐呴儴閮芥湁鑷繁鐨?tick 璁℃暟鍣ㄣ€乻egment 绱㈠紩銆佽窛绂荤紦瀛樼瓑绛夌鏈?state,
-RE 鍏ㄩ儴骞跺畨鍏ㄦ竻闆剁殑宸ヤ綔閲忓湪 sideload 闄愬埗涓嬩笉鐜板疄, 寮鸿鍋氫細瑙﹀彂 use-after-free / 宕╂簝)銆?
-鎵€浠?v6.6 鎶?v5/v6 attempt 鍏ㄩ儴鍥炴粴, 鍙繚鐣欎袱浠朵簨:
+**最终决定**: Arcaea iOS 闭源二进制无法实现 ArcCreate 那种 `ResetJudgeTo(timing)` 的"无状态重派生"语义
+(每个 Tap/Hold/Arc/ArcTap 内部都有自己的 tick 计数器、segment 索引、距离缓存等等私有 state,
+RE 全部并安全清零的工作量在 sideload 限制下不现实, 强行做会触发 use-after-free / 崩溃)。
 
-1. **鍙橀€?*: `gettimeofday` fishhook + `GP.update` vtable swizzle 璋?`_gp_retime_logic_clock`銆?2. **Seek**: 浠呭仛涓や釜鍔ㄤ綔 鈥?闊抽璺?(FMOD setPosition) + 璋遍潰 clock 鍋忕Щ (logic+48 鐨?chart-ms 鐩存帴鍐?銆?   璺宠繃鐨?note 鐢辨父鎴忚嚜韬殑 `sub_100870344` 璺緞鑷姩鍒?lost; **宸叉紨濂忚繃鐨?note 涓嶄細閲嶇幇**,
-   鎯抽噸鐜╄鐢ㄦ父鎴忓唴 Retry銆?
-#### 鎷嗛櫎娓呭崟 (Tweak.x)
-| 妯″潡 | v6.5 鐘舵€?| v6.6 |
+所以 v6.6 把 v5/v6 attempt 全部回滚, 只保留两件事:
+
+1. **变速**: `gettimeofday` fishhook + `GP.update` vtable swizzle 调 `_gp_retime_logic_clock`。
+2. **Seek**: 仅做两个动作 — 音频跳 (FMOD setPosition) + 谱面 clock 偏移 (logic+48 的 chart-ms 直接写)。
+   跳过的 note 由游戏自身的 `sub_100870344` 路径自动判 lost; **已演奏过的 note 不会重现**,
+   想重玩请用游戏内 Retry。
+
+#### 拆除清单 (Tweak.x)
+| 模块 | v6.5 状态 | v6.6 |
 |------|-----------|------|
-| `LogicNote::isCompleted` vtable swizzle (5 涓?vtable) | 寮哄埗杩斿洖 0 (rewind grace window) | **绉婚櫎** (define / 鍏ㄥ眬鍙橀噺 / hook 鍑芥暟 / install loop 鍏ㄥ垹) |
-| `tw_gp_update` 鍐?judge-window settings 涓€娆℃€?dump | 涓€娆℃€?RE 鎺㈡祴 | **绉婚櫎** |
-| `player_seek_ms` 姝ラ (a) 娓呯┖娲昏穬闊崇鍒楄〃 + release 寮曠敤 | 寮哄埗鍒锋柊绌洪棿鏌ヨ | **绉婚櫎** (release_fn 瑙ｅ紩鐢ㄥ鑷?UAF) |
-| `player_seek_ms` 姝ラ (b) 閲嶆柊婵€娲绘墍鏈夐煶杞?byte[0]=1 | 澶嶆椿宸叉 track | **绉婚櫎** (鍙兘澶嶆椿宸茶閲婃斁鐨?track) |
-| `player_seek_ms` 姝ラ (c) 娓呯┖浜嬩欢闃熷垪 | | **绉婚櫎** |
-| `player_seek_ms` 姝ラ (d) 娓呴櫎缁撴潫鏍囧織 | | **绉婚櫎** |
-| `player_seek_ms` 姝ラ (e) sk 閲嶇疆 (combo/score/PFL/late/early) | v6.5 淇ソ甯冨眬 | **绉婚櫎** (鏃?replay 灏辨病蹇呰娓? 鐣欑潃鏃ф暟涔熸槸鍙帶鐘舵€? |
-| `g_seek_target_ms` / `g_rewind_until_us` 绛?replay 鐩稿叧鍏ㄥ眬 | | **绉婚櫎** |
-| 璇婃柇闈㈡澘 isComp 琛?/ vtcodes / seekTgt | | **绉婚櫎** |
+| `LogicNote::isCompleted` vtable swizzle (5 个 vtable) | 强制返回 0 (rewind grace window) | **移除** (define / 全局变量 / hook 函数 / install loop 全删) |
+| `tw_gp_update` 内 judge-window settings 一次性 dump | 一次性 RE 探测 | **移除** |
+| `player_seek_ms` 步骤 (a) 清空活跃音符列表 + release 引用 | 强制刷新空间查询 | **移除** (release_fn 解引用导致 UAF) |
+| `player_seek_ms` 步骤 (b) 重新激活所有音轨 byte[0]=1 | 复活已死 track | **移除** (可能复活已被释放的 track) |
+| `player_seek_ms` 步骤 (c) 清空事件队列 | | **移除** |
+| `player_seek_ms` 步骤 (d) 清除结束标志 | | **移除** |
+| `player_seek_ms` 步骤 (e) sk 重置 (combo/score/PFL/late/early) | v6.5 修好布局 | **移除** (无 replay 就没必要清, 留着旧数也是可控状态) |
+| `g_seek_target_ms` / `g_rewind_until_us` 等 replay 相关全局 | | **移除** |
+| 诊断面板 isComp 行 / vtcodes / seekTgt | | **移除** |
 
-#### 宸茬‘璁ゅ畨鍏ㄧ殑浜?(鍓嶄竴娆?RE 鐣欎綔璁板綍)
-- `sk` 閲嶇疆鏈韩璺緞瀹夊叏 鈥?`sub_100A7DFC4` (HUD syncer) / `sub_100A7E71C` / `sub_100A7DD20` /
-  `sub_100870344` 鍚勮嚜鍙嶇紪鍚庢棤 UAF, 鎶?sk 瀛楁鍐?0 涓嶄細寮曞彂宕╂簝銆?- 鎵€浠ュ墠鍚?seek 宕╂簝**涓嶅湪 (e) 姝?*, 鐪熸鍑舵墜鏄?(a) 姝ョ殑 `release_fn(0xDB1A28)` 瑙?active-list 寮曠敤銆?- 鐭ラ亾杩欎竴鐐逛箣鍚庢垜浠粛鐒堕€夋嫨鎶?(e) 涓€璧峰垹 鈥?鍥犱负娌℃湁 replay 瀹冩棤鎰忎箟, 瓒婂皯鍔?sk 瓒婄ǔ銆?
-#### UI 姹夊寲 (鏈)
-- "Arcaea Speed (XRC)" 鈫?"Arcaea 鍙橀€?(XRC)"
-- "Audio: ... | Chart: ... | Visual: ..." 鈫?涓枃鏋舵瀯璇存槑 (淇濈暀 GP.update / FMOD 绛夋妧鏈湳璇?
-- "BGM Control" / "BGM (waiting...)" 鈫?"BGM 鎺у埗" / "BGM (绛夊緟涓?..)"
-- "Show toast on rate change" 鈫?"鍒囨崲鍊嶇巼鏃舵彁绀?
-- "Hook (ON=warp at rate)" 鈫?"Hook 鐘舵€?(寮€ = 鎸夊€嶇巼 warp)"
-- "GP.update (chart retime)" 鈫?"GP.update (璋遍潰 retime)"
-- "Time domains (live)" 鈫?"鏃堕棿鍩?(瀹炴椂)"
-- "Speed (tap=select, hold=delete)" 鈫?"鍊嶇巼 (鍗曞嚮=閫夋嫨, 闀挎寜=鍒犻櫎)"
-- "+ Add speed" 鈫?"+ 娣诲姞鍊嶇巼"
-- "Close" 鈫?"鍏抽棴"
-- toast `(tap2x=menu)` 鈫?`(鍙屽嚮鎵撳紑鑿滃崟)`
+#### 已确认安全的事 (前一次 RE 留作记录)
+- `sk` 重置本身路径安全 — `sub_100A7DFC4` (HUD syncer) / `sub_100A7E71C` / `sub_100A7DD20` /
+  `sub_100870344` 各自反编后无 UAF, 把 sk 字段写 0 不会引发崩溃。
+- 所以前向 seek 崩溃**不在 (e) 步**, 真正凶手是 (a) 步的 `release_fn(0xDB1A28)` 解 active-list 引用。
+- 知道这一点之后我们仍然选择把 (e) 一起删 — 因为没有 replay 它无意义, 越少动 sk 越稳。
 
-#### 璇婃柇闈㈡澘鐦﹁韩
-鏃?
+#### UI 汉化 (本次)
+- "Arcaea Speed (XRC)" → "Arcaea 变速 (XRC)"
+- "Audio: ... | Chart: ... | Visual: ..." → 中文架构说明 (保留 GP.update / FMOD 等技术术语)
+- "BGM Control" / "BGM (waiting...)" → "BGM 控制" / "BGM (等待中...)"
+- "Show toast on rate change" → "切换倍率时提示"
+- "Hook (ON=warp at rate)" → "Hook 状态 (开 = 按倍率 warp)"
+- "GP.update (chart retime)" → "GP.update (谱面 retime)"
+- "Time domains (live)" → "时间域 (实时)"
+- "Speed (tap=select, hold=delete)" → "倍率 (单击=选择, 长按=删除)"
+- "+ Add speed" → "+ 添加倍率"
+- "Close" → "关闭"
+- toast `(tap2x=menu)` → `(双击打开菜单)`
+
+#### 诊断面板瘦身
+旧:
 ```
-rate / freeze / rwnd / real-warp-drift / mach-audio-chart / 螖
+rate / freeze / rwnd / real-warp-drift / mach-audio-chart / Δ
 isComp inst=N [OOOOO] calls=... z=... o=...
 seekTgt=NNNms
 ```
-鏂?
+新:
 ```
 rate / freeze
 real-warp-drift
 mach-audio-chart
-螖(chart-audio)
+Δ(chart-audio)
 ```
 
-#### 楠岃瘉缁撹 (涓?v6.5 鍏变韩)
-- 鉁?鍙橀€?(0.6脳 / 0.8脳 / 1.0脳 / 1.25脳 / 1.5脳): 闊抽/璋遍潰/瑙嗚涓夊煙鍚屾 OK
-- 鉁?鍓嶅悜 seek + 鍚庡悜 seek: 涓嶅穿婧?(鍥犱负娌″湪鍔ㄩ煶绗︾姸鎬佷簡)
-- 鈿?seek 涔嬪悗**宸插垽瀹氱殑闊崇涓嶄細閲嶇幇** 鈥?杩欐槸鏈夋剰涓轰箣鐨勮寖鍥? 鎯抽噸鐜╄鐢?Retry
-- 鉁?鍒ゅ畾绐楀彛瀹屾暣 (娌″姩 settings)
-- 鉁?HP / 娈典綅璇勭骇 / Pure-Far-Lost 璁℃暟涓庡師鐗堜竴鑷?
-#### 鍙傝€冭祫鏂?- 鍒ゅ畾绐楀彛閫嗗悜绗旇: [arcmodwiki/docs/ios-judgement-windows.md](../arcmodwiki/docs/ios-judgement-windows.md)
-- ArcCreate 瀵规瘮 (`ChartService.ResetJudge` / `TimingGroup.ResetJudgeTo`): 楠岃瘉浜?source-level 閲嶆淳鐢熷湪闂簮浜岃繘鍒朵笂鐨勪笉鍙鎬с€?
+#### 验证结论 (与 v6.5 共享)
+- ✅ 变速 (0.6× / 0.8× / 1.0× / 1.25× / 1.5×): 音频/谱面/视觉三域同步 OK
+- ✅ 前向 seek + 后向 seek: 不崩溃 (因为没在动音符状态了)
+- ⚠ seek 之后**已判定的音符不会重现** — 这是有意为之的范围, 想重玩请用 Retry
+- ✅ 判定窗口完整 (没动 settings)
+- ✅ HP / 段位评级 / Pure-Far-Lost 计数与原版一致
+
+#### 参考资料
+- 判定窗口逆向笔记: [arcmodwiki/docs/ios-judgement-windows.md](../arcmodwiki/docs/ios-judgement-windows.md)
+- ArcCreate 对比 (`ChartService.ResetJudge` / `TimingGroup.ResetJudgeTo`): 验证了 source-level 重派生在闭源二进制上的不可行性。
+
 ---
 
-## 鍘嗗彶: v6.5 (2026-05-12)
+## 历史: v6.5 (2026-05-12)
 
-### v6.5 鏀瑰姩 鈥?淇 seek-replay sk 閲嶇疆 (甯冨眬宸?RE 姝ｇ‘)
+### v6.5 改动 — 修复 seek-replay sk 重置 (布局已 RE 正确)
 
-`player_seek_ms` 姝ラ (e) 閲嶆柊鍔犲洖, 杩欐浣跨敤鍙嶇紪楠岃瘉鍚庣殑瀹屾暣鍋忕Щ闆嗗悎
-(鍙傝涓嬫柟 ScoreKeeper 鐪熷竷灞€琛?銆傚叧閿慨澶嶇偣 = sk+104 (far_count) 涓?sk+128..140 (late/early 鍏ㄥ) 涔嬪墠 v6.3 鍏ㄦ紡浜? 杩欐墠鏄紑灞€鍗崇粨鏉熺殑鐪熷洜銆?鍙﹀ logic+756/760/812 (UI 缂撳瓨) 涔熶竴骞舵竻闆? 鍚﹀垯涓嬩竴甯?sub_100A7DD20
-瑙﹀彂鏉′欢 `combo != cached_combo` 浼氬埛涓€娆℃棫鏁般€?
-### v6.5 RE 鏀惰幏 鈥?鍒ゅ畾绐楀彛鍏ュ彛宸查攣瀹?(浣?iOS sideload 鐩存帴 patch 涓嶅彲琛?
+`player_seek_ms` 步骤 (e) 重新加回, 这次使用反编验证后的完整偏移集合
+(参见下方 ScoreKeeper 真布局表)。关键修复点 = sk+104 (far_count) 与
+sk+128..140 (late/early 全套) 之前 v6.3 全漏了, 这才是开局即结束的真因。
+另外 logic+756/760/812 (UI 缓存) 也一并清零, 否则下一帧 sub_100A7DD20
+触发条件 `combo != cached_combo` 会刷一次旧数。
 
-`sub_10086EE70` (LogicNoteGroup tick, 鐢?sub_10086E728 璋冪敤) 鍏ュ彛閫昏緫:
+### v6.5 RE 收获 — 判定窗口入口已锁定 (但 iOS sideload 直接 patch 不可行)
+
+`sub_10086EE70` (LogicNoteGroup tick, 由 sub_10086E728 调用) 入口逻辑:
 
 ```c
-if (sub_100868E28(*(GP+0x28))) {           // = *(BYTE)(chart+272), 榛樿 0
-    v91 = (*(*(*(GP+0x20))[0x268])[0xE0])(...);  // late 鑷畾涔?    v90 = (*(*(*(GP+0x20))[0x268])[0xE0])(...);  // early 鑷畾涔?} else {
-    v90 = 300;   // 榛樿 early-window
-    v91 = 700;   // 榛樿 late-window
+if (sub_100868E28(*(GP+0x28))) {           // = *(BYTE)(chart+272), 默认 0
+    v91 = (*(*(*(GP+0x20))[0x268])[0xE0])(...);  // late 自定义
+    v90 = (*(*(*(GP+0x20))[0x268])[0xE0])(...);  // early 自定义
+} else {
+    v90 = 300;   // 默认 early-window
+    v91 = 700;   // 默认 late-window
 }
 // ...
-v66 = (int)((v65 - v91) / 10000.0);   // 鍒ゅ畾绐椾笅鐣?(screen-y 鍗曚綅)
+v66 = (int)((v65 - v91) / 10000.0);   // 判定窗下界 (screen-y 单位)
 v67 = (int)((v65 + *(int*)(a1+24)) / 10000.0);
 v68 = (int)((v85[i] - v91) / 10000.0);
-v81 = (LogicArcNote ? v91 : v90);     // arc 鐢?late, tap 鐢?early
+v81 = (LogicArcNote ? v91 : v90);     // arc 用 late, tap 用 early
 ```
 
-**榛樿鍊煎湪 __TEXT 鍐欐**:
+**默认值在 __TEXT 写死**:
 - `0x10086EF04: MOV W9, #0x2BC (700)`  late-window
 - `0x10086EF08: MOV W8, #0x12C (300)`  early-window
 
-**涓轰粈涔堜笉鑳界洿鎺?patch**: Tweak.x:181 鐨勬敞閲婂凡璇存槑 鈥?iOS 16 sideload 涓?`mprotect(rwx)` / `vm_protect VM_PROT_COPY` 鍦?__TEXT 涓婁細鐮村潖 AMFI/CoreTrust
-鐨?page seal, 鍏跺畠绾跨▼瑙﹀彂璇ラ〉鏃朵細琚?EXC_BAD_ACCESS (Instruction Abort) 骞叉帀銆?__DATA/__DATA_CONST 鍐欏氨娌￠棶棰?(vtable swizzle 鏄繖涔堝仛鐨?銆?
-**v6.6 璁″垝 鈥?vtable 鍔寔鏂规**:
-- chart 瀹炰緥 +272 瀛楄妭鏈変釜 `use_custom_window` flag, 璁句负 1 鏃惰蛋鑷畾涔夊垎鏀?- 鑷畾涔夊垎鏀皟 `(*(*(GP+0x20))[0x268])[0xE0]()` 鍙?float late/early
-- 瀹炵幇璺緞:
-  1. 鍦?GP.update hook 閲屾崟鑾?chart 瀹炰緥 (a1+0x28 deref)
-  2. 璁?chart+272 = 1 寮哄埗璧拌嚜瀹氫箟鍒嗘敮
-  3. swizzle `*(chart+0x268)` 鎸囧悜鐨勫璞＄殑 vtable[0xE0/8],
-     鏇挎崲鎴愭垜浠殑 stub 杩斿洖 `g_judge_user_*_window_x100 / 100.0f`
-  4. UI 鍔?slider: pure 缂╂斁 0.5..2.0x
-- 闇€瑕佸厛鎶撲竴娆″疄渚嬫懜娓呮 `*(chart+0x268)` 鏄粈涔堢被 (绫绘垚鍛?settings 鎸囬拡?
-  杩樻槸鏌愪釜 singleton?), 鐒跺悗鎵嶈兘纭 vtable swizzle 鏄惁瀹夊叏 (鍗曞疄渚嬭繕鏄?  澶氬疄渚嬪叡浜?vtable, 涓€鏀瑰叏鏀规槸鍚︽湁鍓綔鐢?銆?
-### 宸茬‘璁?ScoreKeeper 鐪熷竷灞€
+**为什么不能直接 patch**: Tweak.x:181 的注释已说明 — iOS 16 sideload 下
+`mprotect(rwx)` / `vm_protect VM_PROT_COPY` 在 __TEXT 上会破坏 AMFI/CoreTrust
+的 page seal, 其它线程触发该页时会被 EXC_BAD_ACCESS (Instruction Abort) 干掉。
+__DATA/__DATA_CONST 写就没问题 (vtable swizzle 是这么做的)。
 
-璇﹁涓嬫柟 "ScoreKeeper 鐪熷竷灞€ (渚?v6.5 閲嶆柊鍔犲洖 seek 閲嶇疆浣跨敤)" 涓€鑺傘€?
+**v6.6 计划 — vtable 劫持方案**:
+- chart 实例 +272 字节有个 `use_custom_window` flag, 设为 1 时走自定义分支
+- 自定义分支调 `(*(*(GP+0x20))[0x268])[0xE0]()` 取 float late/early
+- 实现路径:
+  1. 在 GP.update hook 里捕获 chart 实例 (a1+0x28 deref)
+  2. 设 chart+272 = 1 强制走自定义分支
+  3. swizzle `*(chart+0x268)` 指向的对象的 vtable[0xE0/8],
+     替换成我们的 stub 返回 `g_judge_user_*_window_x100 / 100.0f`
+  4. UI 加 slider: pure 缩放 0.5..2.0x
+- 需要先抓一次实例摸清楚 `*(chart+0x268)` 是什么类 (类成员 settings 指针?
+  还是某个 singleton?), 然后才能确认 vtable swizzle 是否安全 (单实例还是
+  多实例共享 vtable, 一改全改是否有副作用)。
+
+### 已确认 ScoreKeeper 真布局
+
+详见下方 "ScoreKeeper 真布局 (供 v6.5 重新加回 seek 重置使用)" 一节。
+
 ---
 
-## 鍘嗗彶 v6.4 鈥?鍒犻櫎闊抽 hook + 鍥炴粴 ScoreKeeper 閲嶇疆 (浣滃簾)
+## 历史 v6.4 — 删除音频 hook + 回滚 ScoreKeeper 重置 (作废)
 
-**鍒犻櫎鐨勪唬鐮?**
-- `apply_speed_to_all_channels` (FMOD `Channel::setFrequency` 璋冪敤)
-- `player_collect_channels` (鏋氫妇 channel 琛?
-- `g_base_freq[ARC_MAX_CHANNELS]`, `g_ch_set_frequency`, `g_ch_get_frequency` 鍙婂搴旂被鍨嬪畾涔?- `ARC_OFF_CH_SET_FREQUENCY`, `ARC_OFF_CH_GET_FREQUENCY` (offsets 涓嶅啀闇€瑕?
-- `g_audio_meas_*`, `s_audio_meas_*` (rate 娴嬮噺鍏ㄥ)
-- `tw_mtp_getpos` 閲岀殑 500ms 婊戠獥鏍″噯鍧?- `time_warp_set_rate` 閲岀殑 `apply_speed_to_all_channels()` 璋冪敤
-- `player_seek_ms` 閲岀殑 `apply_speed_to_all_channels()` 璋冪敤
-- 0.5s NSTimer 閲岀殑 `apply_speed_to_all_channels()` + base_freq 閲嶇疆
-- 闈㈡澘 `audio.meas X.XXXx N=N` 琛?(鏇挎崲涓?`螖(chart-audio) Nms`)
+**删除的代码:**
+- `apply_speed_to_all_channels` (FMOD `Channel::setFrequency` 调用)
+- `player_collect_channels` (枚举 channel 表)
+- `g_base_freq[ARC_MAX_CHANNELS]`, `g_ch_set_frequency`, `g_ch_get_frequency` 及对应类型定义
+- `ARC_OFF_CH_SET_FREQUENCY`, `ARC_OFF_CH_GET_FREQUENCY` (offsets 不再需要)
+- `g_audio_meas_*`, `s_audio_meas_*` (rate 测量全套)
+- `tw_mtp_getpos` 里的 500ms 滑窗校准块
+- `time_warp_set_rate` 里的 `apply_speed_to_all_channels()` 调用
+- `player_seek_ms` 里的 `apply_speed_to_all_channels()` 调用
+- 0.5s NSTimer 里的 `apply_speed_to_all_channels()` + base_freq 重置
+- 面板 `audio.meas X.XXXx N=N` 行 (替换为 `Δ(chart-audio) Nms`)
 
-**鍥炴粴鐨勪唬鐮?**
-- `player_seek_ms` 姝ラ (e) ScoreKeeper 閲嶇疆鏁存銆傚師鍥?
-  瀹炴祴寮€濮嬫父鎴忓悗绗竴鎵归煶绗﹀嚭鐜版椂鐩存帴璺崇粨绠?0鍒嗐€傝鏄庢垜鏍囩殑 sk[+92]/[+96]/[+100]/[+104]/[+108]
-  閲岃嚦灏戞湁涓€涓叾瀹炴槸**鎬昏氨闈?note 鏁?*涔嬬被鐨勪笉鍙橀噺,琚浂鍖栧悗涓嬩竴甯?`judged>=total`
-  绔嬪嵆瑙﹀彂缁撴潫銆傞渶瑕侀噸鏂板弽姹囩紪 `sub_100A7DFC4` 鐨?score-update 鍏ュ彛纭姣忎釜鍋忕Щ
-  鐨勭湡瀹炶涔夈€?*娉ㄦ剰: 浠ュ墠 seek-replay 娌″穿(鍙槸璁″垎涓嶉噸缃?鏄洜涓烘牴鏈病鍔?sk!**
+**回滚的代码:**
+- `player_seek_ms` 步骤 (e) ScoreKeeper 重置整段。原因:
+  实测开始游戏后第一批音符出现时直接跳结算+0分。说明我标的 sk[+92]/[+96]/[+100]/[+104]/[+108]
+  里至少有一个其实是**总谱面 note 数**之类的不变量,被零化后下一帧 `judged>=total`
+  立即触发结束。需要重新反汇编 `sub_100A7DFC4` 的 score-update 入口确认每个偏移
+  的真实语义。**注意: 以前 seek-replay 没崩(只是计分不重置)是因为根本没动 sk!**
 
-**淇濈暀鐨?**
-- 浠呬袱涓湡 hook: `gettimeofday` (fishhook) + Gameplay vtable[update] (PAC vtable swizzle)
-- LogicNote `isCompleted` vtable swizzle (5 瀛愮被) 鐢ㄤ簬 seek-replay 璁?note 閲嶅嚭
-- MTP `getPosition` vtable swizzle: **鍙鍙?*,浣滀负杩涘害鏉?+ diag 鏁版嵁婧?- MTP `seekTo` vtable 璋冪敤: `player_seek_ms` 瑙﹀彂
-- 璋遍潰绔?`_gp_retime_logic_clock` 鐙珛 rate 鎺ㄨ繘 (涓嶇粦 audio)
+**保留的:**
+- 仅两个真 hook: `gettimeofday` (fishhook) + Gameplay vtable[update] (PAC vtable swizzle)
+- LogicNote `isCompleted` vtable swizzle (5 子类) 用于 seek-replay 让 note 重出
+- MTP `getPosition` vtable swizzle: **只读取**,作为进度条 + diag 数据源
+- MTP `seekTo` vtable 调用: `player_seek_ms` 触发
+- 谱面端 `_gp_retime_logic_clock` 独立 rate 推进 (不绑 audio)
 
-**閬楃暀闂:**
-- 闊崇敾涓嶅悓姝?(audio 濮嬬粓 1.0x, chart 鎸?rate)銆傜敤鎴峰喅瀹氭帴鍙?鎼佺疆銆?- ScoreKeeper 鐪熷疄甯冨眬鏈煡, seek-replay 鏃犳硶閲嶇疆璁″垎銆?
-### ScoreKeeper 鐪熷竷灞€ (渚?v6.5 閲嶆柊鍔犲洖 seek 閲嶇疆浣跨敤)
+**遗留问题:**
+- 音画不同步 (audio 始终 1.0x, chart 按 rate)。用户决定接受/搁置。
+- ScoreKeeper 真实布局未知, seek-replay 无法重置计分。
 
-鏉ユ簮: 鍙嶆眹缂?`sub_100A7DFC4` (UI updater) + `sub_100A7E71C` (judge label updater)銆?鍚庤€呮寜 `pureLabel/farLabel/lostLabel/earlyLabel/lateLabel` 瀛楃涓?100% 閿佸畾璇箟銆?
-| 鍋忕Щ | 绫诲瀷 | 瀛楁 | 澶囨敞 |
+### ScoreKeeper 真布局 (供 v6.5 重新加回 seek 重置使用)
+
+来源: 反汇编 `sub_100A7DFC4` (UI updater) + `sub_100A7E71C` (judge label updater)。
+后者按 `pureLabel/farLabel/lostLabel/earlyLabel/lateLabel` 字符串 100% 锁定语义。
+
+| 偏移 | 类型 | 字段 | 备注 |
 |---|---|---|---|
-| sk+20  | i32 | score_displayed | UI updater 鍐欏洖 a1+760 |
+| sk+20  | i32 | score_displayed | UI updater 写回 a1+760 |
 | sk+28  | f32 | HP | |
 | sk+76  | f32 | HP_max | |
-| sk+92  | i32 | combo | UI 姣斿 a1+756 瑙﹀彂 sub_100A7DD20 |
-| sk+96  | i32 | score_raw | PM 鎶曞奖绱姞鍣? **涓嶆槸** pure_count |
+| sk+92  | i32 | combo | UI 比对 a1+756 触发 sub_100A7DD20 |
+| sk+96  | i32 | score_raw | PM 投影累加器, **不是** pure_count |
 | sk+100 | i32 | pure_count | "pureLabel-fullnolocalize" |
 | sk+104 | i32 | far_count | "farLabel" |
 | sk+108 | i32 | lost_count | "lostLabel" |
-| sk+128 | i32 | late_count_in_pure | "lateLabel" 榛樿鍒嗘敮 |
-| sk+132 | i32 | early_count_in_pure | "earlyLabel" 榛樿鍒嗘敮 |
-| sk+136 | i32 | late_count_in_max_pure | "max-pure" 妯″紡鍙犲姞 |
-| sk+140 | i32 | early_count_in_max_pure | "max-pure" 妯″紡鍙犲姞 |
+| sk+128 | i32 | late_count_in_pure | "lateLabel" 默认分支 |
+| sk+132 | i32 | early_count_in_pure | "earlyLabel" 默认分支 |
+| sk+136 | i32 | late_count_in_max_pure | "max-pure" 模式叠加 |
+| sk+140 | i32 | early_count_in_max_pure | "max-pure" 模式叠加 |
 
-鎬?notes 涓嶅湪 sk 鍐? 閫氳繃 `sub_1009C756C(sk) = *(*(sk+176)+184)` 浠?chart_data 璇汇€?sk 鐪熷疄澶у皬 鈮?144 瀛楄妭, v6.3 鐢?`addr_readable(sk, 128)` 鑼冨洿閮戒笉澶熴€?
-**v6.3 bug 澶嶇洏**: 浠ｇ爜婕忔竻 sk+104(far) 涓?sk+128..140(late/early 鍏ㄥ)銆?閲嶇疆鍚?UI updater 绠?v14 = pure(0)+far(鏃?+lost(0) = 鏃?far, 鐒跺悗
-sub_100A7E71C 瑙﹀彂鏉′欢 `judged != cached_total` 浠嶇劧鎴愮珛, 鍚庣画甯?杩涘叆寮傚父鍒嗘敮 (鍏蜂綋鎬庝箞杩炲埌 a3+316=1 song-end 杩橀渶杩涗竴姝ヨ拷)銆?
-**v6.5 姝ｇ‘閲嶇疆搴忓垪** (寰呭姞):
+总 notes 不在 sk 内, 通过 `sub_1009C756C(sk) = *(*(sk+176)+184)` 从 chart_data 读。
+sk 真实大小 ≥ 144 字节, v6.3 用 `addr_readable(sk, 128)` 范围都不够。
+
+**v6.3 bug 复盘**: 代码漏清 sk+104(far) 与 sk+128..140(late/early 全套)。
+重置后 UI updater 算 v14 = pure(0)+far(旧)+lost(0) = 旧 far, 然后
+sub_100A7E71C 触发条件 `judged != cached_total` 仍然成立, 后续帧
+进入异常分支 (具体怎么连到 a3+316=1 song-end 还需进一步追)。
+
+**v6.5 正确重置序列** (待加):
 ```c
 *(int32_t *)((char*)sk + 20)  = 0;  // score
 *(int32_t *)((char*)sk + 92)  = 0;  // combo
 *(int32_t *)((char*)sk + 96)  = 0;  // score_raw
 *(int32_t *)((char*)sk + 100) = 0;  // pure
-*(int32_t *)((char*)sk + 104) = 0;  // far  <-- v6.3 婕忎簡
+*(int32_t *)((char*)sk + 104) = 0;  // far  <-- v6.3 漏了
 *(int32_t *)((char*)sk + 108) = 0;  // lost
 *(int32_t *)((char*)sk + 128) = 0;  // late_pure
 *(int32_t *)((char*)sk + 132) = 0;  // early_pure
 *(int32_t *)((char*)sk + 136) = 0;  // late_max_pure
 *(int32_t *)((char*)sk + 140) = 0;  // early_max_pure
-// 鍚屾椂 a1+756=0, a1+760=0, a1+812=0 (UI updater 缂撳瓨), a1+816?
+// 同时 a1+756=0, a1+760=0, a1+812=0 (UI updater 缓存), a1+816?
 ```
 
 ---
 
-## 鍘嗗彶 v6.3.1 (浣滃簾)
+## 历史 v6.3.1 (作废)
 
-### v6.3.1 鏀瑰姩 鈥?鍥為€€ chart slave, 浠呬繚鐣?score-keeper reset
+### v6.3.1 改动 — 回退 chart slave, 仅保留 score-keeper reset
 
-鐢ㄦ埛鍙嶉: chart slave 鍒?audio 浠讳綍褰㈠紡閮戒細寮曞叆寤惰繜鎴栨娊鎼?(FMOD `getPos`
-ms 閲忓寲 + 甯ч棿涓嶅潎鍖€ + 閲忓寲寰€澶? 鍗充娇 鈮?ms 闃堝€间粛鐒朵細鑲夌溂鍙璺?銆?**鍙橀€熷洖鍒?v6.2 鎬濊矾**: chart 绔嫭绔嬫寜 rate 鎺ㄨ繘 (`(1-rate)*delta`),
-audio 绔?`setFrequency(base*rate)`, **涓嶅仛浠讳綍瀵归綈缁戝畾**銆傚悗缁鏋?瑕佸仛绮剧‘瀵归綈, 鎬濊矾鍙湁涓夐€変竴: (a) 瀹屽叏鐩稿悓 rate; (b) 涓嶅悓 rate +
-鍥哄畾寤惰繜琛ュ伩; (c) 涓嶅仛闊崇敾鍚屾鍙橀€熴€傚綋鍓嶉粯璁?(a), 璇樊闈犵敤鎴锋帴鍙椼€?
-**淇濈暀:** Seek 鏃?ScoreKeeper 閲嶇疆 (杩欓儴鍒嗙敤鎴峰厛楠岃瘉)銆傚竷灞€鏉ヨ嚜
-`sub_100A7DFC4` 鍙嶆眹缂? `sk = *(LogicNote+56)`:
+用户反馈: chart slave 到 audio 任何形式都会引入延迟或抽搐 (FMOD `getPos`
+ms 量化 + 帧间不均匀 + 量化往复, 即使 ≥3ms 阈值仍然会肉眼可见跳)。
+**变速回到 v6.2 思路**: chart 端独立按 rate 推进 (`(1-rate)*delta`),
+audio 端 `setFrequency(base*rate)`, **不做任何对齐绑定**。后续如果
+要做精确对齐, 思路只有三选一: (a) 完全相同 rate; (b) 不同 rate +
+固定延迟补偿; (c) 不做音画同步变速。当前默认 (a), 误差靠用户接受。
+
+**保留:** Seek 时 ScoreKeeper 重置 (这部分用户先验证)。布局来自
+`sub_100A7DFC4` 反汇编, `sk = *(LogicNote+56)`:
   sk[+20] score, sk[+92] combo, sk[+96] pure, sk[+100] far,
-  sk[+104] lost, sk[+108] late/early 鈥斺€?鍏ㄩ儴娓呴浂銆侶P 涓嶅姩銆?
-**鍒犳帀:** `g_audio_corr_x10000` (FMOD 棰戠巼鍙嶉鏍″噯), `apply_speed_to_all_channels`
-閲岀殑 corr 涔樺瓙銆俙g_audio_meas_rate_x1000` 娴嬮噺淇濈暀浣滈潰鏉胯瘖鏂€?闈㈡澘璇婃柇琛? `audio.meas X.XXXx  N=N  螖=Nms` (螖 = chart - audio, 浠呰娴?銆?
+  sk[+104] lost, sk[+108] late/early —— 全部清零。HP 不动。
+
+**删掉:** `g_audio_corr_x10000` (FMOD 频率反馈校准), `apply_speed_to_all_channels`
+里的 corr 乘子。`g_audio_meas_rate_x1000` 测量保留作面板诊断。
+面板诊断行: `audio.meas X.XXXx  N=N  Δ=Nms` (Δ = chart - audio, 仅观测)。
+
 ---
 
-## 鍘嗗彶 v6.3 (浣滃簾)
+## 历史 v6.3 (作废)
 
-**鍙橀€熸€濊矾鎹?** 涓嶅啀鍋?FMOD 棰戠巼鑷牎鍑?(`g_audio_corr_x10000` 鍒犻櫎)銆傜悊鐢? 鍗充娇
-FMOD 瀹為檯閫熺巼鏈?卤2% 閲忓寲璇樊, chart 绔彧瑕佺洿鎺ヨ `audio_pos_ms` 鍙嶇畻 `clk[16]`
-灏辫兘璁?`chart_displayed == audio_pos`, 姘镐笉婕傜Щ, 鑰屼笖涓嶉渶瑕佹瘡甯?`(1-rate)*delta`
-绱Н鈥斺€旈浂璇樊绱銆侀浂鎶栧姩鏉ユ簮銆?
-- `_gp_retime_logic_clock` 閲嶅啓:
+**变速思路换:** 不再做 FMOD 频率自校准 (`g_audio_corr_x10000` 删除)。理由: 即使
+FMOD 实际速率有 ±2% 量化误差, chart 端只要直接读 `audio_pos_ms` 反算 `clk[16]`
+就能让 `chart_displayed == audio_pos`, 永不漂移, 而且不需要每帧 `(1-rate)*delta`
+累积——零误差累计、零抖动来源。
+
+- `_gp_retime_logic_clock` 重写:
   ```
   clk[16] = steady_clock_ms - audio_pos_ms - clk[40]
   ```
-  褰撳樊璺?鈮?ms 鎵嶅啓, 璁?steady_clock 骞虫粦鎻掑€笺€?.0x 鏃跺樊 鈮?0ms 涓嶅姩,
-  瀹屽叏浜ょ粰娓告垙鑷繁璺戙€?- `apply_speed_to_all_channels` 绠€鍖栦负 `base * rate` (鍘绘帀 corr 涔樺瓙)銆?- `tw_mtp_getpos` 婊戠獥淇濈暀, 浠呬綔闈㈡澘璇婃柇鐢?(`g_audio_meas_rate_x1000`)銆?- 闈㈡澘璇婃柇琛屾崲涓?`audio.meas X.XXXx  N=N  螖=Nms` (螖 = chart - audio)銆?
-**Seek 閲嶆斁:** 涔嬪墠鍙?hook isCompleted 璁╅煶绗﹂噸鍑? 浣?*璁″垎鍣?(ScoreKeeper)
-鐙珛绱 combo / score / pure / far / lost**, 娌￠噸缃€傜被姣?ArcCreate 鐨?`ChartService.ResetJudge() + ScoreService.ResetScoreTo() + JudgementService.ResetJudge()`,
-鏈増鏈弽姹囩紪 `sub_100A7DFC4` (per-frame UI updater) 鎽稿嚭 ScoreKeeper 甯冨眬
+  当差距 ≥3ms 才写, 让 steady_clock 平滑插值。1.0x 时差 ≤50ms 不动,
+  完全交给游戏自己跑。
+- `apply_speed_to_all_channels` 简化为 `base * rate` (去掉 corr 乘子)。
+- `tw_mtp_getpos` 滑窗保留, 仅作面板诊断用 (`g_audio_meas_rate_x1000`)。
+- 面板诊断行换为 `audio.meas X.XXXx  N=N  Δ=Nms` (Δ = chart - audio)。
+
+**Seek 重放:** 之前只 hook isCompleted 让音符重出, 但**计分器 (ScoreKeeper)
+独立累计 combo / score / pure / far / lost**, 没重置。类比 ArcCreate 的
+`ChartService.ResetJudge() + ScoreService.ResetScoreTo() + JudgementService.ResetJudge()`,
+本版本反汇编 `sub_100A7DFC4` (per-frame UI updater) 摸出 ScoreKeeper 布局
 (`sk = *(LogicNote+56)`):
   - sk[+20] score, sk[+92] combo, sk[+96] pure, sk[+100] far, sk[+104] lost, sk[+108] late/early
   
-`player_seek_ms` 姝ラ (e) 鎶婅繖浜涘瓧娈靛叏閮ㄥ綊闆? HP 鏆傛椂涓嶅姩銆備笅涓€甯?isCompleted
-hook 璁╅煶绗﹂噸鍑?鈫?鐜╁閲嶆柊鎵?鈫?ScoreKeeper 鑷劧閲嶆柊绱姞銆?
+`player_seek_ms` 步骤 (e) 把这些字段全部归零, HP 暂时不动。下一帧 isCompleted
+hook 让音符重出 → 玩家重新打 → ScoreKeeper 自然重新累加。
+
 ---
 
-## 鍘嗗彶 v6.2
+## 历史 v6.2
 
-### v6.2 鏀瑰姩
+### v6.2 改动
 
-- **闊?璋辫В鑰?* (淇鍙橀€熸娊鎼?: `_gp_retime_logic_clock` 鍒犻櫎 `chart鈫抋udio` 鐨?5%/甯т綆閫氭媺鍥炪€備袱璺椂閽熺嫭绔嬫寜 `target_rate` 鎺ㄨ繘銆?- **闊抽鑷牎鍑?*: `tw_mtp_getpos` 婊戠獥 (~500ms) 瀹炴祴 `audio_dms / real_dms = measured_rate`, 涔樻€ч€艰繎 `corr 鈫?corr 脳 (target/measured)` (鍗曟卤5%, 鎬诲箙卤20%), `apply_speed_to_all_channels` 鐢?`base 脳 rate 脳 corr` 鎶垫秷 FMOD 棰戠巼閲忓寲璇樊銆?- **鍒犻櫎 Pause BGM**: `player_set_paused` + 鑿滃崟寮€鍏?+ `pauseChanged:` 鍏ㄩ儴绉婚櫎 (瀹炴祴涓?freeze 鍙岄噸鏆傚仠鍐茬獊)銆?- **闈㈡澘鏂板** `audio.meas X.XXXx  corr X.XXXx  N=N` 涓€琛岀敤浜庤瘖鏂€?- **淇 isCompleted 鍏ㄩ儴澶辫触 (inst=0/MMMMM)**: `kArcLogicNoteVtables[]` 鍋忕Щ涔嬪墠灏戝啓浜嗕竴浣?(`0x303FD0` 搴斾负 `0x1303FD0`), 瀵艰嚧姣忎釜 vtable 鎸囧悜鐨勬槸 `__DATA` 娈典箣澶栫殑闅忔満鍐呭瓨, slot[5] 璇诲埌 PAC 鍔犵鐨勫爢鎸囬拡 (`0x1714a0801ef` 涔嬬被), 涓?target `image+0x7E27B8` 涓嶅尮閰? 5 涓叏閮?`M`銆備慨姝ｄ负 `0x1303FD0 / 0x130BC40 / 0x130DBB0 / 0x13171F0 / 0x13388F0` 鍚?IDA 楠岃瘉 slot[5] 瀛楄妭姝ｅソ鏄?`b8 27 7e 00 01 ...` = `0x1007E27B8`銆?
-## 鍘嗗彶 v6.1
+- **音/谱解耦** (修复变速抽搐): `_gp_retime_logic_clock` 删除 `chart→audio` 的 5%/帧低通拉回。两路时钟独立按 `target_rate` 推进。
+- **音频自校准**: `tw_mtp_getpos` 滑窗 (~500ms) 实测 `audio_dms / real_dms = measured_rate`, 乘性逼近 `corr ← corr × (target/measured)` (单步±5%, 总幅±20%), `apply_speed_to_all_channels` 用 `base × rate × corr` 抵消 FMOD 频率量化误差。
+- **删除 Pause BGM**: `player_set_paused` + 菜单开关 + `pauseChanged:` 全部移除 (实测与 freeze 双重暂停冲突)。
+- **面板新增** `audio.meas X.XXXx  corr X.XXXx  N=N` 一行用于诊断。
+- **修复 isCompleted 全部失败 (inst=0/MMMMM)**: `kArcLogicNoteVtables[]` 偏移之前少写了一位 (`0x303FD0` 应为 `0x1303FD0`), 导致每个 vtable 指向的是 `__DATA` 段之外的随机内存, slot[5] 读到 PAC 加签的堆指针 (`0x1714a0801ef` 之类), 与 target `image+0x7E27B8` 不匹配, 5 个全部 `M`。修正为 `0x1303FD0 / 0x130BC40 / 0x130DBB0 / 0x13171F0 / 0x13388F0` 后 IDA 验证 slot[5] 字节正好是 `b8 27 7e 00 01 ...` = `0x1007E27B8`。
 
-### 宸插疄鐜?
-- **闊抽鍙橀€?*: FMOD `Channel::setFrequency(base 脳 rate)`
-- **璋遍潰鍙橀€?*: `Gameplay.update` vtable hook 鈫?`_gp_retime_logic_clock` 淇敼 `clock[16]`
-- **瑙嗚鍙橀€?*: `gettimeofday` fishhook 鈫?CCDirector deltaTime 鑷姩鍙橀€?- **Seek**: MTP::seekTo(闊抽) + clock[40] 鍋忕Щ(璋遍潰) 鍙岀郴缁熷榻?- **Seek-replay (v6 timing-aware)**: vtable-swizzle `LogicNote::isCompleted` (5 涓瓙绫?vtable+40)
-  + 1.5s grace window 鏈熼棿锛宧ook 璇诲彇 `note.timing (LogicNote+20)` 涓?seek 鐩爣姣旇緝锛?  - `note.timing >= target - 120ms` 鈫?杩斿洖 0锛堟湭鏉ラ煶绗﹂噸鏂板嚭鐜帮級
-  - `note.timing < target - 120ms`  鈫?杩斿洖鍘熷疄鐜帮紙杩囧幓闊崇淇濇寔瀹屾垚锛屾潨缁濋棯鐜帮級
-  - timing 瀛楁璇诲け璐?鈫?fallback 鍒?v5 妯″紡锛堢獥鍙ｅ唴缁熶竴杩斿洖 0锛?  - 绐楀彛鍏抽棴 鈫?瀹屽叏閫忔槑 passthrough锛岄浂骞叉壈甯歌鎾斁
-- **杩涘害鏉?*: 瀹炴椂鏄剧ず浣嶇疆鍜屾€绘椂闀?- **鏆傚仠/鎭㈠**: freeze 鏈哄埗 + retime 鍩哄噯閲嶇疆
-- **浠ｇ爜閲?*: ~1400琛? 1 fishhook + 7 vtable hook (MTP::getPos / GP::update / 5脳LogicNote::isCompleted)
-- **B-1 璇婃柇闈㈡澘** (2026-05-11): UI 瀹炴椂鏄剧ず 4 涓椂閽熷煙 (real/warp/mach/audio/chart) + freeze 娣卞害 + isCompleted 鍛戒腑鍒嗗竷, 鐢ㄤ簬鐜板満瑙傚療鏃堕挓婕傜Щ鍜屾殏鍋滃紓甯搞€?- **v6.1 (2026-05-11) 涓夐」淇**:
-  1. **isComp inst=0 璇婃柇鍗囩骇**: install 璺緞浠?卤64 slot 鎵弿鏀逛负鐩存帴璇?vtable[5]锛屾瘡涓?vtable 鍗曠嫭璁?OK / Unreadable / Mismatch / mProtect-fail 鐘舵€佺爜锛岄潰鏉挎樉绀?`inst=N [OOOOO]` + 澶辫触鏃舵墦 `vt[i] seen=0x... (target=0x...)` 甯姪涓€鐪肩湅鍑烘牴鍥犮€?  2. **寤惰繜婕傜Щ淇硶 (drift correction)**: `_gp_retime_logic_clock` 澧炲姞浣庨€氭牎姝ｏ細姣忓抚鎶?`clock[16]` 鎷夊悜 `chart_clock - audio_pos = 0`锛屽箙搴?`drift/20` 涓婇檺 卤20ms/甯с€傚交搴曟秷闄ら潪 1脳 鍊嶇巼闀挎椂闂寸疮绉殑 chart vs audio 婕傜Щ (瀹炴祴杈?5+ 绉?銆?  3. **鏆傚仠鏃惰皟閫熷け鏁堜慨娉?*: `apply_speed_to_all_channels` 鍦?`freeze_count > 0` 鏃?early-return 鈥?閮ㄥ垎 FMOD 瀹炵幇浼氬洜 setFrequency 鎶?paused channel 瑙ｆ殏鍋滐紝瀵艰嚧鐢ㄦ埛鎰熺煡 "鏆傚仠鏃惰皟閫熸棤鍝嶅簲"銆?
-### 寰呴獙璇?(v6)
+## 历史 v6.1
 
-- LogicNote.timing @ +20 鐨勫亸绉讳粠 IDA 鎺ㄧ悊锛坄sub_10086EE70` 涓?`*(_DWORD*)(*v11+20) > v15-120` 妯″紡锛夆€?闇€鐪熸満鍔犳棩蹇楃‘璁ゃ€?- 5 涓?vtable swizzle 瀹為檯鍛戒腑鐜囷細UI 璁℃暟鍣?`g_iscompleted_calls / force_zero / force_one` 楠岃瘉銆?- 瀛愮被 (LogicArcNote 鏈?+164/+288/+296 瀛楁) 鏄惁闇€瑕佹寜 typeinfo 鍒嗘敮銆?
-### 宸插簾寮?
-- **v4**: 閬嶅巻 `LogicChart+32/+40` 閲嶇疆 byte[12]/[13]锛氳繍琛屾椂 +40 鏄?chart_data 鎸囬拡锛屼笉鏄煶绗﹀悜閲忔湯灏俱€?- **v5 byte 娓呴浂**: 鍦?isCompleted hook 鍐?`*(uint8_t*)+12 = 0` `+13 = 0` 瀹屽叏鏄?no-op 鈥?  鍙嶇紪璇?vtable[3] (`sub_1007E2788`) 鏄剧ず byte +48..+55锛堣嚜鎴戜滑鎯宠薄鐨?+12/+13 涓嶅悓锛夋槸
-  姣忓抚鐢?vtable[3] 閲嶅啓鐨勮窛绂荤紦瀛橈紙`chart_time + base_offset`锛夛紝涓嶆槸鐘舵€併€倂6 宸插垹闄よ繖涓よ銆?- `_gp_drift_correct` 闊崇敾绾犲亸锛氳氨闈㈡寔缁娊鎼愩€?
+### 已实现
+
+- **音频变速**: FMOD `Channel::setFrequency(base × rate)`
+- **谱面变速**: `Gameplay.update` vtable hook → `_gp_retime_logic_clock` 修改 `clock[16]`
+- **视觉变速**: `gettimeofday` fishhook → CCDirector deltaTime 自动变速
+- **Seek**: MTP::seekTo(音频) + clock[40] 偏移(谱面) 双系统对齐
+- **Seek-replay (v6 timing-aware)**: vtable-swizzle `LogicNote::isCompleted` (5 个子类 vtable+40)
+  + 1.5s grace window 期间，hook 读取 `note.timing (LogicNote+20)` 与 seek 目标比较：
+  - `note.timing >= target - 120ms` → 返回 0（未来音符重新出现）
+  - `note.timing < target - 120ms`  → 返回原实现（过去音符保持完成，杜绝闪现）
+  - timing 字段读失败 → fallback 到 v5 模式（窗口内统一返回 0）
+  - 窗口关闭 → 完全透明 passthrough，零干扰常规播放
+- **进度条**: 实时显示位置和总时长
+- **暂停/恢复**: freeze 机制 + retime 基准重置
+- **代码量**: ~1400行, 1 fishhook + 7 vtable hook (MTP::getPos / GP::update / 5×LogicNote::isCompleted)
+- **B-1 诊断面板** (2026-05-11): UI 实时显示 4 个时钟域 (real/warp/mach/audio/chart) + freeze 深度 + isCompleted 命中分布, 用于现场观察时钟漂移和暂停异常。
+- **v6.1 (2026-05-11) 三项修复**:
+  1. **isComp inst=0 诊断升级**: install 路径从 ±64 slot 扫描改为直接读 vtable[5]，每个 vtable 单独记 OK / Unreadable / Mismatch / mProtect-fail 状态码，面板显示 `inst=N [OOOOO]` + 失败时打 `vt[i] seen=0x... (target=0x...)` 帮助一眼看出根因。
+  2. **延迟漂移修法 (drift correction)**: `_gp_retime_logic_clock` 增加低通校正：每帧把 `clock[16]` 拉向 `chart_clock - audio_pos = 0`，幅度 `drift/20` 上限 ±20ms/帧。彻底消除非 1× 倍率长时间累积的 chart vs audio 漂移 (实测达 5+ 秒)。
+  3. **暂停时调速失效修法**: `apply_speed_to_all_channels` 在 `freeze_count > 0` 时 early-return — 部分 FMOD 实现会因 setFrequency 把 paused channel 解暂停，导致用户感知 "暂停时调速无响应"。
+
+### 待验证 (v6)
+
+- LogicNote.timing @ +20 的偏移从 IDA 推理（`sub_10086EE70` 中 `*(_DWORD*)(*v11+20) > v15-120` 模式）— 需真机加日志确认。
+- 5 个 vtable swizzle 实际命中率：UI 计数器 `g_iscompleted_calls / force_zero / force_one` 验证。
+- 子类 (LogicArcNote 有 +164/+288/+296 字段) 是否需要按 typeinfo 分支。
+
+### 已废弃
+
+- **v4**: 遍历 `LogicChart+32/+40` 重置 byte[12]/[13]：运行时 +40 是 chart_data 指针，不是音符向量末尾。
+- **v5 byte 清零**: 在 isCompleted hook 内 `*(uint8_t*)+12 = 0` `+13 = 0` 完全是 no-op —
+  反编译 vtable[3] (`sub_1007E2788`) 显示 byte +48..+55（自我们想象的 +12/+13 不同）是
+  每帧由 vtable[3] 重写的距离缓存（`chart_time + base_offset`），不是状态。v6 已删除这两行。
+- `_gp_drift_correct` 音画纠偏：谱面持续抽搐。
+
 ---
 
-## 鏋舵瀯
+## 架构
 
-### 鍙橀€熺郴缁?
+### 变速系统
 
-| 缁勪欢  | 鏈哄埗                                                       | 璇存槑    |
+
+| 组件  | 机制                                                       | 说明    |
 | --- | -------------------------------------------------------- | ----- |
-| 闊抽  | `Channel::setFrequency(base 脳 rate)`                     | 闇€涓诲姩璋冪敤 |
-| 璋遍潰  | `tw_gp_update` 鈫?`_gp_retime_logic_clock` 淇敼 `clock[16]` | 姣忓抚璋冩暣  |
-| 瑙嗚  | `gettimeofday` fishhook 鈫?CCDirector delta               | 瀹屽叏鑷姩  |
+| 音频  | `Channel::setFrequency(base × rate)`                     | 需主动调用 |
+| 谱面  | `tw_gp_update` → `_gp_retime_logic_clock` 修改 `clock[16]` | 每帧调整  |
+| 视觉  | `gettimeofday` fishhook → CCDirector delta               | 完全自动  |
 
 
-### Seek 鏈哄埗
+### Seek 机制
 
 ```
-Gameplay(+928) 鈫?LogicChart(+48) 鈫?Clock
+Gameplay(+928) → LogicChart(+48) → Clock
 display_ms = clock[32] - clock[40]
 
 seek to X ms:
   1. freeze warp
-  2. MTP::seekTo(ms, 0) 鈫?闊抽璺宠浆
-  3. apply_speed 鈫?閲嶈棰戠巼
-  4. clock[40] += (cur_display - X) 鈫?璋遍潰璺宠浆
+  2. MTP::seekTo(ms, 0) → 音频跳转
+  3. apply_speed → 重设频率
+  4. clock[40] += (cur_display - X) → 谱面跳转
   5. unfreeze warp
 ```
 
-### 鏃堕挓缁撴瀯 (LogicChart+48)
+### 时钟结构 (LogicChart+48)
 
 ```
 +16: int32  start_reference (steady_clock ms)
@@ -283,31 +355,31 @@ seek to X ms:
 
 ---
 
-## 鍏抽敭鍋忕Щ (Arcaea 6.13.10)
+## 关键偏移 (Arcaea 6.13.10)
 
 
-| 绗﹀彿                               | 鍋忕Щ                                |
+| 符号                               | 偏移                                |
 | -------------------------------- | --------------------------------- |
 | Gameplay.update vtable           | `0x136E1C0`                       |
 | Gameplay.update fn               | `0xB3AD70`                        |
 | MTP vtable                       | `0x1312860`                       |
 | MTP::seekTo                      | `0x84699C`                        |
-| LogicChart 鏃堕挓鏇存柊                  | `0x8C2FEC`                        |
-| LogicChart 鏃堕棿璇诲彇                  | `0x86E69C`                        |
+| LogicChart 时钟更新                  | `0x8C2FEC`                        |
+| LogicChart 时间读取                  | `0x86E69C`                        |
 | LogicChart::update               | `0x86E728`                        |
-| 闊崇绌洪棿鏌ヨ/娲昏穬绠＄悊                      | `0x86EE70`                        |
-| LogicNote::isCompleted (鍏ㄥ瓙绫诲叡鐢? | vtable+40 鈫?`0x7E27B8`            |
-| TapNote 鍒ゅ畾鏍囧織                     | vtable+48 鈫?`0x14172C` (byte[13]) |
-| TapNote 鍛戒腑鏍囧織                     | vtable+64 鈫?`0x118A80` (byte[12]) |
-| LogicChart 鏋勯€犲伐鍘?                 | `0xB1EA08`                        |
+| 音符空间查询/活跃管理                      | `0x86EE70`                        |
+| LogicNote::isCompleted (全子类共用) | vtable+40 → `0x7E27B8`            |
+| TapNote 判定标志                     | vtable+48 → `0x14172C` (byte[13]) |
+| TapNote 命中标志                     | vtable+64 → `0x118A80` (byte[12]) |
+| LogicChart 构造工厂                  | `0xB1EA08`                        |
 | LogicChart::init                 | `0x865B28`                        |
-| Gameplay 缁撴潫/retry                | `0xB3CC7C`                        |
+| Gameplay 结束/retry                | `0xB3CC7C`                        |
 | refcount addref                  | `0xDB1A18`                        |
 | refcount release                 | `0xDB1A28`                        |
 
-### LogicNote 瀛愮被 vtable 璧峰鍦板潃 (5 涓? 鍧囧惈 isCompleted@slot+40 鎸囧悜 0x7E27B8)
+### LogicNote 子类 vtable 起始地址 (5 个, 均含 isCompleted@slot+40 指向 0x7E27B8)
 
-| 鍋忕Щ        | 澶囨敞                                       |
+| 偏移        | 备注                                       |
 | --------- | ---------------------------------------- |
 | `0x303FD0` |                                          |
 | `0x30BC40` |                                          |
@@ -318,7 +390,7 @@ seek to X ms:
 
 ---
 
-## LogicChart 鍐呭瓨甯冨眬 (IDA 閫嗗悜)
+## LogicChart 内存布局 (IDA 逆向)
 
 ```
 LogicChart (0x118 = 280 bytes):
@@ -326,8 +398,8 @@ LogicChart (0x118 = 280 bytes):
   +8:   refcount base
   +16:  song_id (ptr)
   +24:  difficulty_data (ptr)
-  +32:  notes_vector begin (init 鏃? 杩愯鏃惰涔夊緟纭)
-  +40:  notes_vector end / chart_data ptr (杩愯鏃?
+  +32:  notes_vector begin (init 时; 运行时语义待确认)
+  +40:  notes_vector end / chart_data ptr (运行时)
   +48:  Clock ptr
   +56:  timing_groups vector begin
   +64:  timing_groups vector end
@@ -351,61 +423,64 @@ LogicChart (0x118 = 280 bytes):
 
 ---
 
-## LogicNote 缁撴瀯 (IDA 閫嗗悜, v6 淇)
+## LogicNote 结构 (IDA 逆向, v6 修正)
 
 ```
 LogicNote (base class):
   +0..7:    vtable
   +8..11:   refcount (int32)
-  +12..13:  bytes - 鍚箟涓嶆槑; v4/v5 璇互涓烘槸 hit/judged 鏍囧織, v6 鍙嶇紪璇?vtable[3] 鍚?            纭 isCompleted 鐪熸璇荤殑涓嶅湪杩欓噷 (瑙?+28). 涓嶈 touch.
-  +20:      int32  鈽卬ote.timing (chart-ms judge time) 鈥?绌洪棿鏌ヨ early-prune 鐢?            (sub_10086EE70 绗?23 琛? `*(_DWORD *)(*v11 + 20) > v15 - 120`)
-  +28:      int32  end_time (active-list 绉婚櫎鏉′欢: chart_time > end_time AND completed)
-  +48..55:  int32x2 鈽卲er-frame render distance cache (vtable[3] sub_1007E2788
-            姣忓抚閲嶅啓: result = (int32)(chart_time + (float)base_offset))
-            绌洪棿鏌ヨ add-back 鐢?`min(this) < 700` 鍒ゆ柇. 涓嶆槸鐘舵€? 鍒竻闆?
-  +56..63:  int32x2 base render offset (init 鏃惰, 褰卞搷 vtable[3] 杈撳嚭)
-  +164:     int32  (LogicArcNote only) arc/trace flag (=0 鏃?highlight 璺緞)
-  +288/+296: ptr*2 (LogicArcNote only) 瀛愭 vector (begin/end)
+  +12..13:  bytes - 含义不明; v4/v5 误以为是 hit/judged 标志, v6 反编译 vtable[3] 后
+            确认 isCompleted 真正读的不在这里 (见 +28). 不要 touch.
+  +20:      int32  ★note.timing (chart-ms judge time) — 空间查询 early-prune 用
+            (sub_10086EE70 第 23 行: `*(_DWORD *)(*v11 + 20) > v15 - 120`)
+  +28:      int32  end_time (active-list 移除条件: chart_time > end_time AND completed)
+  +48..55:  int32x2 ★per-frame render distance cache (vtable[3] sub_1007E2788
+            每帧重写: result = (int32)(chart_time + (float)base_offset))
+            空间查询 add-back 用 `min(this) < 700` 判断. 不是状态, 别清零.
+  +56..63:  int32x2 base render offset (init 时设, 影响 vtable[3] 输出)
+  +164:     int32  (LogicArcNote only) arc/trace flag (=0 时 highlight 路径)
+  +288/+296: ptr*2 (LogicArcNote only) 子段 vector (begin/end)
 ```
 
-**閲嶈**: 鎴戜滑 v5 hook 鍐呯殑 `*(uint8_t*)+12 = 0; +13 = 0;` 鏄巻鍙插寘琚?no-op,
-v6 宸插垹闄? 鐪熸褰卞搷 add-back 鐨勫敮涓€鍙橀噺鏄?`vtable[5](note)` 鐨勮繑鍥炲€?
+**重要**: 我们 v5 hook 内的 `*(uint8_t*)+12 = 0; +13 = 0;` 是历史包袱 no-op,
+v6 已删除. 真正影响 add-back 的唯一变量是 `vtable[5](note)` 的返回值.
 
 ---
 
-## 鎺㈢储鍘嗙▼
+## 探索历程
 
-1. **v1**: 12 fishhook 鈫?绮剧畝鑷?2 (gettimeofday + mach_absolute_time)锛屽垹 ~500 琛屾浠ｇ爜
-2. **v2**: 绉婚櫎 `_gp_retime_logic_clock`锛堣鍒?mach_absolute_time 鑳介┍鍔ㄨ氨闈級锛岀Щ闄?CCDirector vtable hook
-3. **v3**: 瀹炴祴纭 mach_absolute_time 鏃犳硶褰卞搷璋遍潰锛屾仮澶?`_gp_retime_logic_clock`锛涗慨澶?UI 涔辩爜(ASCII鍖?锛涚Щ闄?mach_absolute_time hook (鏃犲疄闄呬綔鐢?
-4. **v4**: 灏濊瘯瀹炵幇 seek 鍚庨煶绗﹂噸鐜帮紝娣卞叆閫嗗悜 LogicNote 鐢熷懡鍛ㄦ湡銆乮sCompleted 鏈哄埗銆佺┖闂寸储寮曟煡璇㈤€昏緫銆乺etry 鍦烘櫙閲嶅缓娴佺▼锛涚‘璁ゆ牴鍥犱絾鏈兘鎵惧埌鏈夋晥鐨勮繍琛屾椂閲嶇疆鏂规
-5. **v5 (2026-05-11)**: 閲囩敤 vtable swizzle `isCompleted` + rewind grace window 鏂规銆傚彲闈犻€嗗悜璺緞锛歚sub_10086EE70` 璋遍潰绌洪棿鏌ヨ 鈫?璇嗗埆 vtable[5] 璋冪敤 鈫?IDA xref 鏌ユ壘 0x7E27B8 鐨?5 涓?vtable 瀹夸富 鈫?缁熶竴 swizzle銆?6. **v6 (2026-05-11)**: 鍙嶇紪璇?LogicTapNote vtable[3] (`sub_1007E2788`) 鍙戠幇 v5 鍐呯殑
-   byte[12]/[13] 娓呴浂鏄?no-op (vtable[3] 姣忓抚閲嶅啓 +48..+55 璺濈缂撳瓨). 寮曞叆
-   timing-aware 鍐崇瓥: hook 璇?`LogicNote+20 = note.timing`, 涓?seek 鐩爣姣旇緝;
-   杩囧幓闊崇鐩存帴 delegate 鍘熷疄鐜?(鏉滅粷閿欒闂幇). 鍙栨秷 1.5s 鍏ㄥ眬寮哄埗杩斿洖 0,
-   浠呭湪 timing 瀛楁璇诲け璐ユ椂 fallback 鍒?v5 妯″紡. 鐏垫劅鏉ヨ嚜 ArcCreate `ResetJudgeTo(int timing)`.
+1. **v1**: 12 fishhook → 精简至 2 (gettimeofday + mach_absolute_time)，删 ~500 行死代码
+2. **v2**: 移除 `_gp_retime_logic_clock`（误判 mach_absolute_time 能驱动谱面），移除 CCDirector vtable hook
+3. **v3**: 实测确认 mach_absolute_time 无法影响谱面，恢复 `_gp_retime_logic_clock`；修复 UI 乱码(ASCII化)；移除 mach_absolute_time hook (无实际作用)
+4. **v4**: 尝试实现 seek 后音符重现，深入逆向 LogicNote 生命周期、isCompleted 机制、空间索引查询逻辑、retry 场景重建流程；确认根因但未能找到有效的运行时重置方案
+5. **v5 (2026-05-11)**: 采用 vtable swizzle `isCompleted` + rewind grace window 方案。可靠逆向路径：`sub_10086EE70` 谱面空间查询 → 识别 vtable[5] 调用 → IDA xref 查找 0x7E27B8 的 5 个 vtable 宿主 → 统一 swizzle。
+6. **v6 (2026-05-11)**: 反编译 LogicTapNote vtable[3] (`sub_1007E2788`) 发现 v5 内的
+   byte[12]/[13] 清零是 no-op (vtable[3] 每帧重写 +48..+55 距离缓存). 引入
+   timing-aware 决策: hook 读 `LogicNote+20 = note.timing`, 与 seek 目标比较;
+   过去音符直接 delegate 原实现 (杜绝错误闪现). 取消 1.5s 全局强制返回 0,
+   仅在 timing 字段读失败时 fallback 到 v5 模式. 灵感来自 ArcCreate `ResetJudgeTo(int timing)`.
 
-### 琚獙璇佹棤鏁堢殑鏂规
+### 被验证无效的方案
 
 
-| 鏂规                                            | 缁撴灉               |
+| 方案                                            | 结果               |
 | --------------------------------------------- | ---------------- |
-| mach_absolute_time fishhook 椹卞姩璋遍潰鍙橀€?           | 鍑犱箮涓嶈璋冪敤锛屾棤鏁?       |
-| CCDirector vtable hook + gettimeofday 鍙岄噸 warp | 鍔ㄧ敾鍗℃             |
-| 娓呯┖娲昏穬闊崇鍒楄〃 + 閲嶆縺娲婚煶杞?                             | 闊崇涓嶉噸鐜?           |
-| 閬嶅巻 LogicChart+32/+40 閲嶇疆 byte[12]/[13]         | +40 杩愯鏃惰涔変笉纭畾锛屾湭鐢熸晥 |
-| 娓呴浂 LogicNote+12/+13 byte (v5 鍐呭祵)              | no-op: 鐪熸瀛楁鍦?+48/+52, 涓旀瘡甯ц vtable[3] 瑕嗙洊 |
-| `_gp_drift_correct` 闊崇敾绾犲亸                      | 璋遍潰鎸佺画鎶芥悙           |
+| mach_absolute_time fishhook 驱动谱面变速            | 几乎不被调用，无效        |
+| CCDirector vtable hook + gettimeofday 双重 warp | 动画卡死             |
+| 清空活跃音符列表 + 重激活音轨                              | 音符不重现            |
+| 遍历 LogicChart+32/+40 重置 byte[12]/[13]         | +40 运行时语义不确定，未生效 |
+| 清零 LogicNote+12/+13 byte (v5 内嵌)              | no-op: 真正字段在 +48/+52, 且每帧被 vtable[3] 覆盖 |
+| `_gp_drift_correct` 音画纠偏                      | 谱面持续抽搐           |
 
 
 ---
 
-## 瀹夊叏绾︽潫
+## 安全约束
 
-- 鉁?DobbyHook on `__TEXT` 鈥?iOS 16+ sideload 涓嶅厑璁?RWX
-- 鉁?fishhook `clock_gettime_nsec_np` 鍏ㄥ眬 warp 鈥?浼氭柇 FMOD mixer
-- 鉁?fishhook on 涓讳簩杩涘埗 GOT 鈥?瀹夊叏 (`__DATA` 娈?
-- 鉁?vtable 妲戒綅鏇挎崲 (`__DATA_CONST`) 鈥?mprotect RW 鍙
+- ✗ DobbyHook on `__TEXT` — iOS 16+ sideload 不允许 RWX
+- ✗ fishhook `clock_gettime_nsec_np` 全局 warp — 会断 FMOD mixer
+- ✓ fishhook on 主二进制 GOT — 安全 (`__DATA` 段)
+- ✓ vtable 槽位替换 (`__DATA_CONST`) — mprotect RW 可行
 
 
 
@@ -413,12 +488,12 @@ v6 宸插垹闄? 鐪熸褰卞搷 add-back 鐨勫敮涓€鍙橀噺鏄?`vtable
 
 ## v6.5.2 (2026-05-12) hotfix
 
-### 鐜拌薄
-v6.5.1 涓婄嚎鍚? seek (鍚戝墠/鍚戝悗鎷栨椂闂? 鐩存帴闂€€. 鐢ㄦ埛鏃ュ織鏄剧ず sk reset 姝ラ鎵撳嵃鎴愬姛
-(combo 0->0 score 1148369->0 P/F/L 254/2/30 -> 0/0/0), 涔嬪悗涓嬩竴甯у穿.
+### 现象
+v6.5.1 上线后, seek (向前/向后拖时间) 直接闪退. 用户日志显示 sk reset 步骤打印成功
+(combo 0->0 score 1148369->0 P/F/L 254/2/30 -> 0/0/0), 之后下一帧崩.
 
-### 璇婃柇
-v6.5.1 鍦?`player_seek_ms` 姝?(e) 鏈熬杩藉姞浜?
+### 诊断
+v6.5.1 在 `player_seek_ms` 步 (e) 末尾追加了:
 
 ```c
 *(int32_t *)((char *)logic + 756) = 0;
@@ -426,52 +501,58 @@ v6.5.1 鍦?`player_seek_ms` 姝?(e) 鏈熬杩藉姞浜?
 *(int32_t *)((char *)logic + 812) = 0;
 ```
 
-鎰忓浘鏄竻绌?UI 缂撳瓨璁╀笅涓€甯?`sub_100A7DD20` / `sub_100A7E71C` 寮哄埗鍒锋柊.
-浣嗚繖涓変釜鍋忕Щ**瀹為檯浣嶄簬 `*(GP+896)` (ScorePresenter)**, 涓嶅湪 LogicNoteGroup 涓?
-閲嶈 `sub_100A7DFC4` 绛惧悕 `(__int64 a1 = ScorePresenter, int a2, __int64 a3 = LogicNoteGroup)`,
-`a1+756/760/812` 鎵嶆槸 UI 缂撳瓨; 鎴戞妸 a1 / a3 鍐欐贩浜? 鍦?LogicNoteGroup 鍚庨潰鐨勫爢鍖哄煙
-闅忔満瑕嗗啓, 瑙﹀彂涓嬩竴甯х殑 OOB 瑙ｅ紩鐢?-> `EXC_BAD_ACCESS`.
+意图是清空 UI 缓存让下一帧 `sub_100A7DD20` / `sub_100A7E71C` 强制刷新.
+但这三个偏移**实际位于 `*(GP+896)` (ScorePresenter)**, 不在 LogicNoteGroup 上.
+重读 `sub_100A7DFC4` 签名 `(__int64 a1 = ScorePresenter, int a2, __int64 a3 = LogicNoteGroup)`,
+`a1+756/760/812` 才是 UI 缓存; 我把 a1 / a3 写混了, 在 LogicNoteGroup 后面的堆区域
+随机覆写, 触发下一帧的 OOB 解引用 -> `EXC_BAD_ACCESS`.
 
-### 淇
-鐩存帴鍒犳帀杩欎笁琛屽啓鍏? 涓嶉渶瑕佹浛鎹负 ScorePresenter 鍐欏叆: 涓嬩竴甯?HUD 鍚屾鍣?(`sub_100A7DFC4`) 鑷韩灏变細鍋?`cached != current` 姣旇緝, combo / score 涓嶄竴鑷?浼氳嚜鍔ㄥ埛鏂? 鐪佺暐鍚?UI 鏈€澶氭瘮 sk 鐪熷€兼櫄涓€甯? 瀹屽叏鍙帴鍙?
+### 修复
+直接删掉这三行写入. 不需要替换为 ScorePresenter 写入: 下一帧 HUD 同步器
+(`sub_100A7DFC4`) 自身就会做 `cached != current` 比较, combo / score 不一致
+会自动刷新. 省略后 UI 最多比 sk 真值晚一帧, 完全可接受.
 
-### 鏁欒
-`sub_XXXX(a1, a2, a3)` 鍙嶇紪鏃?a1 / a3 鏄笉鍚屽璞?-- 涓嶈闈?鍙嶆閮戒粠 GP 涓婃寕鐫€"鐨?鐩磋娣风敤. 鍐欏亸绉讳箣鍓嶅厛鎶?`sub_100B3AD70` 璋冪敤鐐圭殑瀹炲弬瀵归綈纭.
+### 教训
+`sub_XXXX(a1, a2, a3)` 反编时 a1 / a3 是不同对象 -- 不要靠"反正都从 GP 上挂着"的
+直觉混用. 写偏移之前先把 `sub_100B3AD70` 调用点的实参对齐确认.
 
-鎻愪氦: `bf1a689`.
+提交: `bf1a689`.
 
 ---
 
-## v6.6 鍒ゅ畾绐楀彛鎺у埗 -- 鏆傜紦 (RE 宸插畬鎴? 瀹炴柦琚鍚嶇害鏉熸尅浣?
+## v6.6 判定窗口控制 -- 暂缓 (RE 已完成, 实施被签名约束挡住)
 
-瀹屾暣 RE 璺緞涓?5 闃堝€煎畾浣嶈瑙? [arcmodwiki / iOS judgement windows](../arcmodwiki/docs/ios-judgement-windows.md).
+完整 RE 路径与 5 阈值定位详见: [arcmodwiki / iOS judgement windows](../arcmodwiki/docs/ios-judgement-windows.md).
 
-### RE 缁撹閫熻
+### RE 结论速记
 
-- 鐪熸鐨?per-tap classifier = `sub_100870FD0`.
-- 5 闃堝€? `|dt| < 26ms = MAX_PURE`, `< 51 = PURE`, `< 101 = FAR`, `< 121 = LOST`, `>= 121 = no judge`.
-- `sub_10086EE70` 閲岄偅瀵?300 / 700 鏄?**active-list entry/exit window**, 涓嶆槸鍒ゅ畾闃堝€?  (鎴戜滑涔嬪墠 v6.5 RE 璇垽浜嗚涔?.
-- ScoreKeeper 瀛楁琛ㄥ凡淇: `sk+96 = max_pure`, `+100 = pure`, `+104 = far`,
+- 真正的 per-tap classifier = `sub_100870FD0`.
+- 5 阈值: `|dt| < 26ms = MAX_PURE`, `< 51 = PURE`, `< 101 = FAR`, `< 121 = LOST`, `>= 121 = no judge`.
+- `sub_10086EE70` 里那对 300 / 700 是 **active-list entry/exit window**, 不是判定阈值
+  (我们之前 v6.5 RE 误判了语义).
+- ScoreKeeper 字段表已修正: `sk+96 = max_pure`, `+100 = pure`, `+104 = far`,
   `+108 = lost`, `+128 = late_far`, `+132 = early_far`, `+136 = late_pure`,
-  `+140 = early_pure`. (early/late 涔嬪墠鍦?summary 閲屽啓鍙嶄簡, 浠ヨ繖娆′负鍑?)
+  `+140 = early_pure`. (early/late 之前在 summary 里写反了, 以这次为准.)
 
-### 涓轰粈涔堟殏缂?
-- `sub_100870FD0` 浠呯敱 `sub_100871514` / `sub_100871FE0` 閫氳繃鐩存帴 `BL imm26` 璋冪敤
-  (瀛楄妭纭: `0x100871a34 = 97 FF FD 67` = BL). 娌℃湁 vtable 娌℃湁 GOT.
-- 鐩存帴 BL 閲嶅畾鍚?= 蹇呴』鏀?`__TEXT` 鎸囦护瀛楄妭. iOS 16+ 鏅€氳嚜绛?(Sideloadly /
-  AltStore) 涓?`__TEXT` 鏈?AMFI / CoreTrust page-hash seal, `vm_protect(WRITE)`
-  澶辫触鎴栬€呮洿绯?(鍏跺畠绾跨▼ fetch instruction 鏃?`EXC_BAD_ACCESS`).
-- **涓嶆槸 PAC 鐨勯棶棰?* -- 鐩存帴 BL 瀹屽叏涓嶈蛋 PAC.
-- TrollStore 瑁呯殑 (鏈?`dynamic-codesigning`) 鍙互 Dobby inline hook, 杩欎釜 tweak 浠撶殑
-  绾︽潫鐩爣鏄?鑷涔熻鑳借窇", 鎵€浠ユ殏涓嶅疄鐜?
+### 为什么暂缓
 
-### 鍚庣画閫夐」 (鐣欑粰浠ュ悗)
+- `sub_100870FD0` 仅由 `sub_100871514` / `sub_100871FE0` 通过直接 `BL imm26` 调用
+  (字节确认: `0x100871a34 = 97 FF FD 67` = BL). 没有 vtable 没有 GOT.
+- 直接 BL 重定向 = 必须改 `__TEXT` 指令字节. iOS 16+ 普通自签 (Sideloadly /
+  AltStore) 上 `__TEXT` 有 AMFI / CoreTrust page-hash seal, `vm_protect(WRITE)`
+  失败或者更糟 (其它线程 fetch instruction 时 `EXC_BAD_ACCESS`).
+- **不是 PAC 的问题** -- 直接 BL 完全不走 PAC.
+- TrollStore 装的 (有 `dynamic-codesigning`) 可以 Dobby inline hook, 这个 tweak 仓的
+  约束目标是"自签也要能跑", 所以暂不实现.
 
-1. TrollStore 涓撳睘鏋勫缓: build flag `ARC_TROLLSTORE_INLINE_HOOK=1`, 鍚敤鍚庣敤 Dobby
-   inline hook `sub_100870FD0`, UI slider 瀹炴椂璋冨叏 5 闃堝€?
-2. 鑷鍦烘櫙: 闈欐€?IPA patch 8 澶?`imm12` 瀛楄妭, 鍑哄嚑涓璁?IPA (easier / harder).
-3. Android: 鍚屽 RE 鎬濊矾閫傜敤, 鑰屼笖 Android 娌℃湁 `__TEXT` seal -> `mprotect` 鐩存帴
-   鑳芥垚, 涓€鏉¤矾绾垮氨澶?(Dobby / xHook 閮借). 璇﹁ wiki 璺ㄥ钩鍙?note.
+### 后续选项 (留给以后)
 
-### 鎺ヤ笅鏉?
-鍥炲埌 seek + 鍙橀€熶富绾? 涓嶅啀杩藉垽瀹氱獥鍙?
+1. TrollStore 专属构建: build flag `ARC_TROLLSTORE_INLINE_HOOK=1`, 启用后用 Dobby
+   inline hook `sub_100870FD0`, UI slider 实时调全 5 阈值.
+2. 自签场景: 静态 IPA patch 8 处 `imm12` 字节, 出几个预设 IPA (easier / harder).
+3. Android: 同套 RE 思路适用, 而且 Android 没有 `__TEXT` seal -> `mprotect` 直接
+   能成, 一条路线就够 (Dobby / xHook 都行). 详见 wiki 跨平台 note.
+
+### 接下来
+
+回到 seek + 变速主线. 不再追判定窗口.
