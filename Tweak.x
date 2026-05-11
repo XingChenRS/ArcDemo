@@ -237,6 +237,9 @@ static int player_collect_channels(void **outChs, int outCap) {
 static void apply_speed_to_all_channels(void) {
     if (!g_ch_set_frequency || !g_ch_get_frequency) return;
     if (rate_count <= 0 || !rates) return;
+    // 暂停状态不要再写 setFrequency：部分 FMOD 实现会把 paused channel 解暂停，
+    // 导致用户感知 "暂停时调速失效 / 谱面无反应"。恢复后周期 timer 会再次 apply。
+    if (atomic_load(&g_tw_freeze_count) > 0) return;
     float rate = rates[rate_i];
     if (rate <= 0.001f) return;
     void *chs[ARC_MAX_CHANNELS] = {0};
@@ -366,6 +369,12 @@ static _Atomic(uint64_t) g_iscompleted_calls = 0;
 static _Atomic(uint64_t) g_iscompleted_force_zero = 0;
 static _Atomic(uint64_t) g_iscompleted_force_one  = 0;
 static _Atomic(int)      g_iscompleted_installed_count = 0;
+// Per-vtable install diag (visible in panel). 0..4 = code:
+//   0='?' not tried, 'O'=ok, 'B'=bad-base, 'U'=unreadable, 'M'=mismatch slot5,
+//   'P'=mprotect fail, 'S'=signed-write
+static _Atomic(int) g_iscompleted_vt_code[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
+// Last raw value seen at slot 5 (post-PAC-strip), for panel hex dump on failure
+static _Atomic(uint64_t) g_iscompleted_vt_seen[ARC_OFF_VT_LOGICNOTE_COUNT] = {0};
 // Tunable: future-window slop (ms). Notes within this past-radius of seek
 // target are also treated as "future" so just-passed notes get re-shown.
 #define ARC_SEEK_FUTURE_SLOP_MS  120
@@ -409,10 +418,19 @@ static uint64_t _real_now_us_unwarped(void) {
     return 0;
 }
 
+// forward decl (defined later in file): chart clock reader used by retime drift fix
+static int32_t _read_chart_clock_ms(void *clk);
+
 // 谱面 retime: 每帧微调 clock[16] (start_ms), 使谱面时间按 rate 推进
 // clock[32] = steady_now - clock[16] + offset
 // 每帧 adjust = (1 - rate) * real_delta_ms -> clock[16] += adjust
 // 效果: 谱面推进速度 = real_delta + (rate-1)*real_delta = rate * real_delta
+//
+// + 漂移校正 (Issue 4 修复):
+//   即使 rate-driven 推进精确, FMOD setFrequency 量化 / 帧抖动 / int32 ms 截断
+//   会让 chart_clock 相对 audio_pos 缓慢漂移 (实测达 5+ 秒)。
+//   每帧额外注入 drift = (chart_now - audio_now) / 20 (5% 低通) 把 chart 拉回 audio。
+//   只在 song 内 (audio>500ms) 且 |drift|<10s 时启用，避免初始 / seek 期误干预。
 static void _gp_retime_logic_clock(void *logic) {
     if (!logic) return;
     if (atomic_load(&g_tw_freeze_count) > 0) return;
@@ -435,10 +453,25 @@ static void _gp_retime_logic_clock(void *logic) {
     if (delta_ms <= 0) return;
 
     double rate = tw_get_rate();
-    if (rate >= 0.999 && rate <= 1.001) return;
-    int32_t adjust = (int32_t)((1.0 - rate) * (double)delta_ms);
-    if (adjust == 0) return;
+    int32_t adjust = 0;
+    if (rate < 0.999 || rate > 1.001)
+        adjust = (int32_t)((1.0 - rate) * (double)delta_ms);
 
+    // Drift correction toward audio_pos (rate-agnostic, runs always)
+    int32_t chart_now = _read_chart_clock_ms(clk);
+    uint32_t audio_ms = atomic_load(&g_last_pos_ms);
+    if (chart_now > 0 && audio_ms > 500) {
+        int32_t drift = chart_now - (int32_t)audio_ms;  // >0: chart ahead
+        if (drift > -10000 && drift < 10000) {
+            // Apply 5% / frame, capped at ±20ms / frame to avoid visible jump
+            int32_t correct = drift / 20;
+            if (correct > 20) correct = 20;
+            if (correct < -20) correct = -20;
+            adjust += correct;
+        }
+    }
+
+    if (adjust == 0) return;
     int32_t *start_ms = (int32_t *)((char *)clk + 16);
     int64_t after = (int64_t)(*start_ms) + (int64_t)adjust;
     if (after > INT_MAX) after = INT_MAX;
@@ -595,18 +628,62 @@ static void install_vtable_swizzles(void) {
         // Hook isCompleted on every known LogicNote subclass vtable.
         // The first successful swizzle captures the original; later vtables share it
         // (all 5 vtables hold the same impl 0x7E27B8 at slot+40).
+        // IDA-confirmed layout: vtable[5] = isCompleted on every subclass.
+        // We bypass the ±64-slot scan and write slot 5 directly, capturing
+        // per-vtable diag codes so the panel can show why any failed.
         int n_iscomp = 0;
+        uint64_t iscomp_target = base + ARC_OFF_LOGICNOTE_ISCOMPLETED;
         for (int i = 0; i < ARC_OFF_VT_LOGICNOTE_COUNT; i++) {
-            void *captured = NULL;
-            int slot = swizzle_vtable_find_swap(base + kArcLogicNoteVtables[i],
-                                                ARC_OFF_LOGICNOTE_ISCOMPLETED,
-                                                (void *)tw_logicnote_isCompleted,
-                                                &captured);
-            if (slot != INT_MIN) {
-                n_iscomp++;
-                if (!s_orig_iscompleted && captured)
-                    s_orig_iscompleted = (orig_iscompleted_fn)captured;
+            uint64_t vt_addr = base + kArcLogicNoteVtables[i];
+            void **vt = (void **)vt_addr;
+            if (!ptr_plausible(vt) || !addr_readable(vt, 8 * 8)) {
+                atomic_store(&g_iscompleted_vt_code[i], 'U');
+                acc_flog(@"isComp[%d] vtable %p UNREADABLE", i, vt);
+                continue;
             }
+            void *cur = vt[5];
+#if __has_feature(ptrauth_calls)
+            void *stripped = ptrauth_strip(cur, ptrauth_key_asia);
+#else
+            void *stripped = cur;
+#endif
+            atomic_store(&g_iscompleted_vt_seen[i], (uint64_t)stripped);
+            if ((uint64_t)stripped != iscomp_target) {
+                atomic_store(&g_iscompleted_vt_code[i], 'M');
+                acc_flog(@"isComp[%d] vtable %p slot5=%p (stripped=%p) != target %p",
+                         i, vt, cur, stripped, (void *)iscomp_target);
+                continue;
+            }
+            // mprotect 16K page RW
+            uintptr_t page = (uintptr_t)&vt[5] & ~(uintptr_t)0x3FFF;
+            bool wrote = false;
+            if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE) == 0) {
+                wrote = true;
+            } else {
+                kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
+                                              0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                if (kr == KERN_SUCCESS) wrote = true;
+            }
+            if (!wrote) {
+                atomic_store(&g_iscompleted_vt_code[i], 'P');
+                acc_flog(@"isComp[%d] vtable %p mprotect+vmprotect FAIL page=%p",
+                         i, vt, (void *)page);
+                continue;
+            }
+            if (!s_orig_iscompleted)
+                s_orig_iscompleted = (orig_iscompleted_fn)stripped;
+#if __has_feature(ptrauth_calls)
+            void *signed_new = ptrauth_sign_unauthenticated((void *)tw_logicnote_isCompleted,
+                                  ptrauth_key_asia,
+                                  ptrauth_blend_discriminator(&vt[5], 0));
+            vt[5] = signed_new;
+#else
+            vt[5] = (void *)tw_logicnote_isCompleted;
+#endif
+            mprotect((void *)page, 0x4000, PROT_READ);
+            atomic_store(&g_iscompleted_vt_code[i], 'O');
+            n_iscomp++;
+            acc_flog(@"isComp[%d] vtable %p slot5 OK orig=%p", i, vt, stripped);
         }
         atomic_store(&g_iscompleted_installed_count, n_iscomp);
         acc_flog(@"isCompleted vtable installed on %d/%d vtables, orig=%p",
@@ -1166,15 +1243,15 @@ static void loadPref(void) {
     [card addSubview:diagHdr];
     y += 22;
 
-    // 5 行：real / warp / mach / audio / iscomp
-    UILabel *diagBody = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 90)];
-    diagBody.numberOfLines = 6;
+    // 5~6 行：real / warp / mach / audio / iscomp [+ optional vt-fail line]
+    UILabel *diagBody = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 108)];
+    diagBody.numberOfLines = 7;
     diagBody.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
     diagBody.textColor = [UIColor blackColor];
     diagBody.text = @"(initialising...)";
     diagBody.tag = 3020;
     [card addSubview:diagBody];
-    y += 96;
+    y += 114;
 
     // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
@@ -1320,6 +1397,17 @@ static void loadPref(void) {
         uint64_t isc_z     = atomic_load(&g_iscompleted_force_zero);
         uint64_t isc_o     = atomic_load(&g_iscompleted_force_one);
         int isc_inst       = atomic_load(&g_iscompleted_installed_count);
+        // build per-vtable status string e.g. "OOOMM" + first failure hex
+        char vtcodes[ARC_OFF_VT_LOGICNOTE_COUNT + 1] = {0};
+        uint64_t first_bad_seen = 0; int first_bad_idx = -1;
+        for (int vi = 0; vi < ARC_OFF_VT_LOGICNOTE_COUNT; vi++) {
+            int code = atomic_load(&g_iscompleted_vt_code[vi]);
+            vtcodes[vi] = code ? (char)code : '?';
+            if (vtcodes[vi] != 'O' && first_bad_idx < 0) {
+                first_bad_idx = vi;
+                first_bad_seen = atomic_load(&g_iscompleted_vt_seen[vi]);
+            }
+        }
         int32_t seek_tgt   = atomic_load(&g_seek_target_ms);
         uint64_t rwnd_us   = atomic_load(&g_rewind_until_us);
         int32_t freeze_n   = atomic_load(&g_tw_freeze_count);
@@ -1331,8 +1419,8 @@ static void loadPref(void) {
             @"rate %.3fx  freeze=%d  rwnd=%llums\n"
              "real %llums  warp %llums  drift %lldms\n"
              "mach %llums  audio %ums  chart %dms\n"
-             "isComp inst=%d calls=%llu z=%llu o=%llu\n"
-             "seekTgt=%@",
+             "isComp inst=%d [%s] calls=%llu z=%llu o=%llu\n"
+             "%@seekTgt=%@",
             rate, freeze_n,
             (unsigned long long)(rwnd_us ? (rwnd_us / 1000) : 0),
             (unsigned long long)(real_us / 1000),
@@ -1341,8 +1429,13 @@ static void loadPref(void) {
             (unsigned long long)mach_ms,
             audio_ms,
             chart_ms,
-            isc_inst, (unsigned long long)isc_calls,
+            isc_inst, vtcodes, (unsigned long long)isc_calls,
             (unsigned long long)isc_z, (unsigned long long)isc_o,
+            (first_bad_idx >= 0
+                ? [NSString stringWithFormat:@"vt[%d] seen=0x%llx (target=0x%llx)\n",
+                       first_bad_idx, (unsigned long long)first_bad_seen,
+                       (unsigned long long)(arc_image_base() + ARC_OFF_LOGICNOTE_ISCOMPLETED)]
+                : @""),
             (seek_tgt == INT_MIN ? @"--" : [NSString stringWithFormat:@"%dms", seek_tgt])];
     }
 }

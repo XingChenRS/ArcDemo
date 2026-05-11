@@ -8,7 +8,7 @@
 
 ---
 
-## 当前状态 (v6, 2026-05-11)
+## 当前状态 (v6.1, 2026-05-11)
 
 ### 已实现
 
@@ -26,6 +26,10 @@
 - **暂停/恢复**: freeze 机制 + retime 基准重置
 - **代码量**: ~1400行, 1 fishhook + 7 vtable hook (MTP::getPos / GP::update / 5×LogicNote::isCompleted)
 - **B-1 诊断面板** (2026-05-11): UI 实时显示 4 个时钟域 (real/warp/mach/audio/chart) + freeze 深度 + isCompleted 命中分布, 用于现场观察时钟漂移和暂停异常。
+- **v6.1 (2026-05-11) 三项修复**:
+  1. **isComp inst=0 诊断升级**: install 路径从 ±64 slot 扫描改为直接读 vtable[5]，每个 vtable 单独记 OK / Unreadable / Mismatch / mProtect-fail 状态码，面板显示 `inst=N [OOOOO]` + 失败时打 `vt[i] seen=0x... (target=0x...)` 帮助一眼看出根因。
+  2. **延迟漂移修法 (drift correction)**: `_gp_retime_logic_clock` 增加低通校正：每帧把 `clock[16]` 拉向 `chart_clock - audio_pos = 0`，幅度 `drift/20` 上限 ±20ms/帧。彻底消除非 1× 倍率长时间累积的 chart vs audio 漂移 (实测达 5+ 秒)。
+  3. **暂停时调速失效修法**: `apply_speed_to_all_channels` 在 `freeze_count > 0` 时 early-return — 部分 FMOD 实现会因 setFrequency 把 paused channel 解暂停，导致用户感知 "暂停时调速无响应"。
 
 ### 待验证 (v6)
 
