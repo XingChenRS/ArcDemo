@@ -8,7 +8,7 @@
 
 ---
 
-## 当前状态 (v4, 2026-05-10)
+## 当前状态 (v6, 2026-05-11)
 
 ### 已实现
 
@@ -16,19 +16,30 @@
 - **谱面变速**: `Gameplay.update` vtable hook → `_gp_retime_logic_clock` 修改 `clock[16]`
 - **视觉变速**: `gettimeofday` fishhook → CCDirector deltaTime 自动变速
 - **Seek**: MTP::seekTo(音频) + clock[40] 偏移(谱面) 双系统对齐
+- **Seek-replay (v6 timing-aware)**: vtable-swizzle `LogicNote::isCompleted` (5 个子类 vtable+40)
+  + 1.5s grace window 期间，hook 读取 `note.timing (LogicNote+20)` 与 seek 目标比较：
+  - `note.timing >= target - 120ms` → 返回 0（未来音符重新出现）
+  - `note.timing < target - 120ms`  → 返回原实现（过去音符保持完成，杜绝闪现）
+  - timing 字段读失败 → fallback 到 v5 模式（窗口内统一返回 0）
+  - 窗口关闭 → 完全透明 passthrough，零干扰常规播放
 - **进度条**: 实时显示位置和总时长
 - **暂停/恢复**: freeze 机制 + retime 基准重置
-- **代码量**: ~1400行, 2 fishhook + 2 vtable hook
+- **代码量**: ~1400行, 1 fishhook + 7 vtable hook (MTP::getPos / GP::update / 5×LogicNote::isCompleted)
+- **B-1 诊断面板** (2026-05-11): UI 实时显示 4 个时钟域 (real/warp/mach/audio/chart) + freeze 深度 + isCompleted 命中分布, 用于现场观察时钟漂移和暂停异常。
 
-### 未解决
+### 待验证 (v6)
 
-- **Seek 后已播放音符不重现**: 向前 seek 后，已经判定过的音符不会重新出现在谱面上。
-  - **根因**: `LogicNote::isCompleted()` 检查 `byte[12]`/`byte[13]` 判定标志，空间查询 (`sub_10086EE70`) 中 `((isCompleted^1)|isBar)&1 == 0` 导致已判定音符不被重新加入活跃列表。
-  - **已尝试**: 遍历 `LogicChart+32/+40` 主列表重置 byte[12]/byte[13]，但 +32/+40 在运行时可能被复用（init 时为音符向量，运行时 +40 似乎变为 chart_data 指针），导致遍历无效。
-  - **已尝试**: 清空活跃列表 (+160/+168) + release 引用、重激活音轨、清空事件队列、重置结束标志 — 均未能使音符重现。
-  - **游戏原生 retry 机制**: 不存在"重置"函数，retry 是直接创建全新 Gameplay 场景（`sub_100B3CC7C`）。
-  - **临时方案**: 先 retry 再 seek 到目标片段。
-  - **TODO**: 换思路——考虑 hook `isCompleted()` vtable 方法在 seek 后临时返回 0；或在 Gameplay.update hook 中后处理活跃列表；或找到运行时音符主列表的正确地址。
+- LogicNote.timing @ +20 的偏移从 IDA 推理（`sub_10086EE70` 中 `*(_DWORD*)(*v11+20) > v15-120` 模式）— 需真机加日志确认。
+- 5 个 vtable swizzle 实际命中率：UI 计数器 `g_iscompleted_calls / force_zero / force_one` 验证。
+- 子类 (LogicArcNote 有 +164/+288/+296 字段) 是否需要按 typeinfo 分支。
+
+### 已废弃
+
+- **v4**: 遍历 `LogicChart+32/+40` 重置 byte[12]/[13]：运行时 +40 是 chart_data 指针，不是音符向量末尾。
+- **v5 byte 清零**: 在 isCompleted hook 内 `*(uint8_t*)+12 = 0` `+13 = 0` 完全是 no-op —
+  反编译 vtable[3] (`sub_1007E2788`) 显示 byte +48..+55（自我们想象的 +12/+13 不同）是
+  每帧由 vtable[3] 重写的距离缓存（`chart_time + base_offset`），不是状态。v6 已删除这两行。
+- `_gp_drift_correct` 音画纠偏：谱面持续抽搐。
 
 ---
 
@@ -36,11 +47,13 @@
 
 ### 变速系统
 
-| 组件 | 机制 | 说明 |
-|------|------|------|
-| 音频 | `Channel::setFrequency(base × rate)` | 需主动调用 |
-| 谱面 | `tw_gp_update` → `_gp_retime_logic_clock` 修改 `clock[16]` | 每帧调整 |
-| 视觉 | `gettimeofday` fishhook → CCDirector delta | 完全自动 |
+
+| 组件  | 机制                                                       | 说明    |
+| --- | -------------------------------------------------------- | ----- |
+| 音频  | `Channel::setFrequency(base × rate)`                     | 需主动调用 |
+| 谱面  | `tw_gp_update` → `_gp_retime_logic_clock` 修改 `clock[16]` | 每帧调整  |
+| 视觉  | `gettimeofday` fishhook → CCDirector delta               | 完全自动  |
+
 
 ### Seek 机制
 
@@ -70,23 +83,36 @@ seek to X ms:
 
 ## 关键偏移 (Arcaea 6.13.10)
 
-| 符号 | 偏移 |
-|------|------|
-| Gameplay.update vtable | `0x136E1C0` |
-| Gameplay.update fn | `0xB3AD70` |
-| MTP vtable | `0x1312860` |
-| MTP::seekTo | `0x84699C` |
-| LogicChart 时钟更新 | `0x8C2FEC` |
-| LogicChart 时间读取 | `0x86E69C` |
-| 音符空间查询/活跃管理 | `0x86EE70` |
-| LogicNote::isCompleted (TapNote) | vtable+40 → `0x7E27B8` |
-| TapNote 判定标志 | vtable+48 → `0x14172C` (byte[13]) |
-| TapNote 命中标志 | vtable+64 → `0x118A80` (byte[12]) |
-| LogicChart 构造工厂 | `0xB1EA08` |
-| LogicChart::init | `0x865B28` |
-| Gameplay 结束/retry | `0xB3CC7C` |
-| refcount addref | `0xDB1A18` |
-| refcount release | `0xDB1A28` |
+
+| 符号                               | 偏移                                |
+| -------------------------------- | --------------------------------- |
+| Gameplay.update vtable           | `0x136E1C0`                       |
+| Gameplay.update fn               | `0xB3AD70`                        |
+| MTP vtable                       | `0x1312860`                       |
+| MTP::seekTo                      | `0x84699C`                        |
+| LogicChart 时钟更新                  | `0x8C2FEC`                        |
+| LogicChart 时间读取                  | `0x86E69C`                        |
+| LogicChart::update               | `0x86E728`                        |
+| 音符空间查询/活跃管理                      | `0x86EE70`                        |
+| LogicNote::isCompleted (全子类共用) | vtable+40 → `0x7E27B8`            |
+| TapNote 判定标志                     | vtable+48 → `0x14172C` (byte[13]) |
+| TapNote 命中标志                     | vtable+64 → `0x118A80` (byte[12]) |
+| LogicChart 构造工厂                  | `0xB1EA08`                        |
+| LogicChart::init                 | `0x865B28`                        |
+| Gameplay 结束/retry                | `0xB3CC7C`                        |
+| refcount addref                  | `0xDB1A18`                        |
+| refcount release                 | `0xDB1A28`                        |
+
+### LogicNote 子类 vtable 起始地址 (5 个, 均含 isCompleted@slot+40 指向 0x7E27B8)
+
+| 偏移        | 备注                                       |
+| --------- | ---------------------------------------- |
+| `0x303FD0` |                                          |
+| `0x30BC40` |                                          |
+| `0x30DBB0` | LogicTapNote (typeinfo @`0x10130DC00`)   |
+| `0x3171F0` |                                          |
+| `0x3388F0` |                                          |
+
 
 ---
 
@@ -123,22 +149,27 @@ LogicChart (0x118 = 280 bytes):
 
 ---
 
-## LogicNote 结构 (IDA 逆向)
+## LogicNote 结构 (IDA 逆向, v6 修正)
 
 ```
 LogicNote (base class):
-  +0:   vtable
-  +8:   refcount (int32)
-  +12:  byte  hit_flag (isCompleted check 2)
-  +13:  byte  judged_flag (isCompleted check 1)
-  +24:  int32 start_time_ms
-  +28:  int32 end_time_ms
-  +48:  int32x2 current_render_offset (updated by update())
-  +56:  int32x2 base_render_offset (set during init, immutable)
-  +64:  ptr   render_object
-  +80:  int32 track_index
-  +84:  byte  note_type_flag
+  +0..7:    vtable
+  +8..11:   refcount (int32)
+  +12..13:  bytes - 含义不明; v4/v5 误以为是 hit/judged 标志, v6 反编译 vtable[3] 后
+            确认 isCompleted 真正读的不在这里 (见 +28). 不要 touch.
+  +20:      int32  ★note.timing (chart-ms judge time) — 空间查询 early-prune 用
+            (sub_10086EE70 第 23 行: `*(_DWORD *)(*v11 + 20) > v15 - 120`)
+  +28:      int32  end_time (active-list 移除条件: chart_time > end_time AND completed)
+  +48..55:  int32x2 ★per-frame render distance cache (vtable[3] sub_1007E2788
+            每帧重写: result = (int32)(chart_time + (float)base_offset))
+            空间查询 add-back 用 `min(this) < 700` 判断. 不是状态, 别清零.
+  +56..63:  int32x2 base render offset (init 时设, 影响 vtable[3] 输出)
+  +164:     int32  (LogicArcNote only) arc/trace flag (=0 时 highlight 路径)
+  +288/+296: ptr*2 (LogicArcNote only) 子段 vector (begin/end)
 ```
+
+**重要**: 我们 v5 hook 内的 `*(uint8_t*)+12 = 0; +13 = 0;` 是历史包袱 no-op,
+v6 已删除. 真正影响 add-back 的唯一变量是 `vtable[5](note)` 的返回值.
 
 ---
 
@@ -148,16 +179,25 @@ LogicNote (base class):
 2. **v2**: 移除 `_gp_retime_logic_clock`（误判 mach_absolute_time 能驱动谱面），移除 CCDirector vtable hook
 3. **v3**: 实测确认 mach_absolute_time 无法影响谱面，恢复 `_gp_retime_logic_clock`；修复 UI 乱码(ASCII化)；移除 mach_absolute_time hook (无实际作用)
 4. **v4**: 尝试实现 seek 后音符重现，深入逆向 LogicNote 生命周期、isCompleted 机制、空间索引查询逻辑、retry 场景重建流程；确认根因但未能找到有效的运行时重置方案
+5. **v5 (2026-05-11)**: 采用 vtable swizzle `isCompleted` + rewind grace window 方案。可靠逆向路径：`sub_10086EE70` 谱面空间查询 → 识别 vtable[5] 调用 → IDA xref 查找 0x7E27B8 的 5 个 vtable 宿主 → 统一 swizzle。
+6. **v6 (2026-05-11)**: 反编译 LogicTapNote vtable[3] (`sub_1007E2788`) 发现 v5 内的
+   byte[12]/[13] 清零是 no-op (vtable[3] 每帧重写 +48..+55 距离缓存). 引入
+   timing-aware 决策: hook 读 `LogicNote+20 = note.timing`, 与 seek 目标比较;
+   过去音符直接 delegate 原实现 (杜绝错误闪现). 取消 1.5s 全局强制返回 0,
+   仅在 timing 字段读失败时 fallback 到 v5 模式. 灵感来自 ArcCreate `ResetJudgeTo(int timing)`.
 
 ### 被验证无效的方案
 
-| 方案 | 结果 |
-|------|------|
-| mach_absolute_time fishhook 驱动谱面变速 | 几乎不被调用，无效 |
-| CCDirector vtable hook + gettimeofday 双重 warp | 动画卡死 |
-| 清空活跃音符列表 + 重激活音轨 | 音符不重现 |
-| 遍历 LogicChart+32/+40 重置 byte[12]/[13] | +40 运行时语义不确定，未生效 |
-| `_gp_drift_correct` 音画纠偏 | 谱面持续抽搐 |
+
+| 方案                                            | 结果               |
+| --------------------------------------------- | ---------------- |
+| mach_absolute_time fishhook 驱动谱面变速            | 几乎不被调用，无效        |
+| CCDirector vtable hook + gettimeofday 双重 warp | 动画卡死             |
+| 清空活跃音符列表 + 重激活音轨                              | 音符不重现            |
+| 遍历 LogicChart+32/+40 重置 byte[12]/[13]         | +40 运行时语义不确定，未生效 |
+| 清零 LogicNote+12/+13 byte (v5 内嵌)              | no-op: 真正字段在 +48/+52, 且每帧被 vtable[3] 覆盖 |
+| `_gp_drift_correct` 音画纠偏                      | 谱面持续抽搐           |
+
 
 ---
 
@@ -167,3 +207,4 @@ LogicNote (base class):
 - ✗ fishhook `clock_gettime_nsec_np` 全局 warp — 会断 FMOD mixer
 - ✓ fishhook on 主二进制 GOT — 安全 (`__DATA` 段)
 - ✓ vtable 槽位替换 (`__DATA_CONST`) — mprotect RW 可行
+

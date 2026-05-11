@@ -323,6 +323,17 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
 #define ARC_OFF_GP_VTABLE    (0x136E1C0ULL)
 #define ARC_OFF_GP_UPDATE_FN (0xB3AD70ULL)
 
+// LogicNote::isCompleted (vtable+40, slot 5).
+// Same impl 0x7E27B8 lives in 5 subclass vtables (Tap/ArcTap/Hold/Arc/Bar variants).
+// Vtable starts identified via IDA xrefs to 0x1007E27B8 (image offsets):
+//   0x303FD0   0x30BC40   0x30DBB0 (LogicTapNote, typeinfo @0x10130DC00)
+//   0x3171F0   0x3388F0
+#define ARC_OFF_LOGICNOTE_ISCOMPLETED (0x7E27B8ULL)
+#define ARC_OFF_VT_LOGICNOTE_COUNT 5
+static const uint64_t kArcLogicNoteVtables[ARC_OFF_VT_LOGICNOTE_COUNT] = {
+    0x303FD0ULL, 0x30BC40ULL, 0x30DBB0ULL, 0x3171F0ULL, 0x3388F0ULL
+};
+
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 typedef int64_t (*orig_gp_update_fn)(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 
@@ -331,6 +342,36 @@ static orig_gp_update_fn s_orig_gp_update = NULL;
 static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
 static _Atomic(uint64_t) g_tw_gp_update_calls = 0;
 static _Atomic(int) g_tw_gp_update_installed = 0;
+
+// isCompleted hook state (v6: timing-aware seek-replay).
+//
+// v5 did:  during 1.5s grace window, force return 0 + clear byte[12]/[13].
+// v6 does: maintain g_seek_target_ms; for ANY note whose timing >= target-120,
+//          force return 0 (note re-appears via spatial query); for past notes
+//          delegate to original (stays completed). Window is kept as a SAFETY
+//          BACKSTOP only -- if g_seek_target_ms is unset but window is open,
+//          fall back to "force 0" (legacy v5 behaviour).
+//
+// IDA-derived layout (LogicNote, common base):
+//   +0..7   vtable
+//   +20 (DWORD, int32)  note.timing in chart-ms          ← used here
+//   +28 (DWORD, int32)  note.end_timing
+//   +48..55 (int32x2)   per-frame distance cache (vtable[3] writes; do NOT touch)
+//   +56..63 (int32x2)   distance base offset (init-time const)
+typedef int (*orig_iscompleted_fn)(void *self);
+static orig_iscompleted_fn s_orig_iscompleted = NULL;
+static _Atomic(uint64_t) g_rewind_until_us  = 0;       // legacy v5 backstop window deadline (real us)
+static _Atomic(int32_t)  g_seek_target_ms   = INT_MIN; // v6: chart-ms target of last seek; INT_MIN = inactive
+static _Atomic(uint64_t) g_iscompleted_calls = 0;
+static _Atomic(uint64_t) g_iscompleted_force_zero = 0;
+static _Atomic(uint64_t) g_iscompleted_force_one  = 0;
+static _Atomic(int)      g_iscompleted_installed_count = 0;
+// Tunable: future-window slop (ms). Notes within this past-radius of seek
+// target are also treated as "future" so just-passed notes get re-shown.
+#define ARC_SEEK_FUTURE_SLOP_MS  120
+// Heuristic plausibility for note.timing (chart-ms). Reject obviously bogus reads.
+#define ARC_NOTE_TIMING_MIN  (-10000)
+#define ARC_NOTE_TIMING_MAX  ( 1200000)   /* 20 min */
 
 // 缓存 Gameplay 实例指针 (seek 需要访问谱面时钟)
 static _Atomic(void *) g_gameplay_instance = NULL;
@@ -407,6 +448,54 @@ static void _gp_retime_logic_clock(void *logic) {
 
 // forward decl (defined after time_warp_install)
 static int32_t _read_chart_clock_ms(void *clk);
+
+// LogicNote::isCompleted vtable hook (v6 timing-aware seek-replay).
+//
+// Decision matrix (only active while seek grace window open):
+//   if window_open and g_seek_target_ms set:
+//     if note.timing >= target - SLOP   -> return 0  (treat as future, re-show)
+//     else                                -> return original (likely 1, stay completed)
+//   elif window_open (timing read failed): -> return 0 (legacy v5 fallback)
+//   else:                                  -> delegate to original
+//
+// We DELIBERATELY do NOT touch byte[12]/[13] anymore -- vtable[3] writes
+// bytes +48..+55 every frame as cached distances, so any state-clearing
+// at those offsets is a no-op (cache gets overwritten next spatial query).
+// IMPORTANT: g_seek_target_ms must be SCOPED to the grace window. If left
+// armed forever, every newly judged note during normal play would get
+// re-shown (target stale). Window expiry disarms both.
+static int tw_logicnote_isCompleted(void *self) {
+    atomic_fetch_add(&g_iscompleted_calls, 1);
+    uint64_t until = atomic_load(&g_rewind_until_us);
+    if (until == 0) {
+        // Window closed -> normal play, transparent passthrough
+        return s_orig_iscompleted ? s_orig_iscompleted(self) : 0;
+    }
+    uint64_t now_us = _real_now_us_unwarped();
+    if (now_us != 0 && now_us >= until) {
+        // Window expired -> disarm both (avoid stale target affecting normal play)
+        atomic_store(&g_rewind_until_us, 0);
+        atomic_store(&g_seek_target_ms, INT_MIN);
+        return s_orig_iscompleted ? s_orig_iscompleted(self) : 0;
+    }
+
+    // Window active.
+    int32_t target = atomic_load(&g_seek_target_ms);
+    if (target != INT_MIN && self && ptr_plausible(self) && addr_readable((char *)self + 24, 4)) {
+        int32_t note_timing = *(int32_t *)((char *)self + 20);
+        if (note_timing > ARC_NOTE_TIMING_MIN && note_timing < ARC_NOTE_TIMING_MAX) {
+            if (note_timing >= target - ARC_SEEK_FUTURE_SLOP_MS) {
+                atomic_fetch_add(&g_iscompleted_force_zero, 1);
+                return 0;
+            }
+            atomic_fetch_add(&g_iscompleted_force_one, 1);
+            return s_orig_iscompleted ? s_orig_iscompleted(self) : 1;
+        }
+    }
+    // timing read failed or target unset -> legacy v5: force 0 within window
+    atomic_fetch_add(&g_iscompleted_force_zero, 1);
+    return 0;
+}
 
 // Gameplay.update vtable hook:
 //   1. 缓存 Gameplay 实例 (seek/reset 需要)
@@ -503,6 +592,25 @@ static void install_vtable_swizzles(void) {
             atomic_store(&g_tw_gp_update_installed, 1);
             acc_flog(@"gp.update vtable installed slot=%d", gp_slot);
         }
+        // Hook isCompleted on every known LogicNote subclass vtable.
+        // The first successful swizzle captures the original; later vtables share it
+        // (all 5 vtables hold the same impl 0x7E27B8 at slot+40).
+        int n_iscomp = 0;
+        for (int i = 0; i < ARC_OFF_VT_LOGICNOTE_COUNT; i++) {
+            void *captured = NULL;
+            int slot = swizzle_vtable_find_swap(base + kArcLogicNoteVtables[i],
+                                                ARC_OFF_LOGICNOTE_ISCOMPLETED,
+                                                (void *)tw_logicnote_isCompleted,
+                                                &captured);
+            if (slot != INT_MIN) {
+                n_iscomp++;
+                if (!s_orig_iscompleted && captured)
+                    s_orig_iscompleted = (orig_iscompleted_fn)captured;
+            }
+        }
+        atomic_store(&g_iscompleted_installed_count, n_iscomp);
+        acc_flog(@"isCompleted vtable installed on %d/%d vtables, orig=%p",
+                 n_iscomp, ARC_OFF_VT_LOGICNOTE_COUNT, (void *)s_orig_iscompleted);
     });
 }
 
@@ -614,53 +722,42 @@ static void player_seek_ms(uint32_t ms) {
                          cur_ms, ms, delta, *base_off);
             }
 
-            // 3. 重置谱面状态, 让所有音符可以重新出现:
-            //
-            //    关键发现 (IDA 逆向):
-            //    - LogicTapNote::isCompleted() (vtable+40) 检查 byte[13] 和 byte[12]
-            //    - byte[13] = 判定标志 (sub_10014172C: return *(a1+13))
-            //    - byte[12] = 命中标志 (sub_100118A80: return *(a1+12))
-            //    - 一旦 isCompleted()=1, sub_10086EE70 的空间查询不会将该音符
-            //      重新添加到活跃列表: ((v82^1|v83)&1)==0 对 TapNote 失败
-            //    - 修复: 遍历全量音符主列表 (LogicChart+32/+40), 重置 byte[12]=0, byte[13]=0
-            //
-            //    a) 重置所有音符的 isCompleted 标志 (主列表 +32/+40)
-            //    b) 清空活跃音符列表 (+160/+168), release 引用后截断
-            //    c) 重新激活所有音轨 (chart_data+80 tracks byte[0])
-            //    d) 清空事件队列 (+288/+296)
-            //    e) 清除结束标志 (+313..+316)
+            // 3. 谱面状态重置 (Plan A, v6 timing-aware):
+            //    - IDA 逆向 sub_10086EE70 (空间查询) 确认: 加回活跃列表的关键
+            //      条件是 vtable[5](note) == 0 (isCompleted)。byte[12]/[13] 是
+            //      sub_1007E2788 (vtable[3]) 每帧重写的距离缓存,清零无意义。
+            //    - v6 改为 timing-aware: 设置 g_seek_target_ms 后,hook 按
+            //      note.timing(LogicNote+20) 与 target 比较精确决定返回值,
+            //      模拟 ArcCreate 的 ResetJudgeTo(timing) 语义。
+            //      - note.timing >= target-120  -> 返回 0 (重新出现)
+            //      - note.timing <  target-120  -> 返回 1 (保持已完成)
+            //    - 旧的 1.5s rewind window 仍开启,作为 timing 字段读失败时的
+            //      安全兜底 (legacy v5 path)。
+            //    保留辅助清理:
+            //      a) 清空活跃音符列表 (+160/+168) 强制下一帧重查询
+            //      b) 重新激活所有音轨 (chart_data+80 tracks byte[0])
+            //      c) 清空事件队列 (+288/+296)
+            //      d) 清除结束标志 (+313..+316)
+
+            // v6: 设置精确 seek 目标 (chart-ms)
+            if (atomic_load(&g_iscompleted_installed_count) > 0) {
+                atomic_store(&g_seek_target_ms, (int32_t)ms);
+                acc_flog(@"[seek] g_seek_target_ms = %d (timing-aware re-show armed)", (int32_t)ms);
+            } else {
+                acc_flog(@"[seek] WARN: isCompleted hook not installed, replay may fail");
+            }
+
+            // Legacy v5 backstop: ~1.5s rewind grace window (兼容 timing 读失败)
+            uint64_t now_us = _real_now_us_unwarped();
+            if (now_us != 0 && atomic_load(&g_iscompleted_installed_count) > 0) {
+                atomic_store(&g_rewind_until_us, now_us + 1500000ULL);
+                acc_flog(@"[seek] backstop rewind window opened until +1500ms (real)");
+            }
 
             typedef void (*release_fn)(void *);
             uint64_t base = arc_image_base();
 
-            // a) 遍历全量音符主列表, 重置判定标志
-            //    LogicChart+32 = notes vector begin, +40 = notes vector end
-            if (addr_readable((char *)logic + 40, 8)) {
-                void **all_begin = *(void ***)((char *)logic + 32);
-                void **all_end   = *(void ***)((char *)logic + 40);
-                ptrdiff_t all_count = (all_begin && all_end && all_end > all_begin)
-                                     ? (all_end - all_begin) : 0;
-                if (all_count > 0 && all_count < 100000) {
-                    int n_reset = 0;
-                    for (ptrdiff_t ni = 0; ni < all_count; ni++) {
-                        void *note = all_begin[ni];
-                        if (!note || !ptr_plausible(note)) continue;
-                        if (!addr_readable((char *)note + 14, 1)) continue;
-                        uint8_t b12 = *(uint8_t *)((char *)note + 12);
-                        uint8_t b13 = *(uint8_t *)((char *)note + 13);
-                        if (b12 || b13) {
-                            *(uint8_t *)((char *)note + 12) = 0;
-                            *(uint8_t *)((char *)note + 13) = 0;
-                            n_reset++;
-                        }
-                    }
-                    acc_flog(@"[seek] reset isCompleted flags on %d / %td notes", n_reset, all_count);
-                } else {
-                    acc_flog(@"[seek] master note list not found or empty (count=%td)", all_count);
-                }
-            }
-
-            // b) 清空活跃音符列表: release 每个引用, 然后截断
+            // a) 清空活跃音符列表: release 每个引用, 然后截断
             if (base && addr_readable((char *)logic + 168, 8)) {
                 void **notes_begin = *(void ***)((char *)logic + 160);
                 void **notes_end   = *(void ***)((char *)logic + 168);
@@ -675,7 +772,7 @@ static void player_seek_ms(uint32_t ms) {
                 }
             }
 
-            // c) 重新激活所有音轨
+            // b) 重新激活所有音轨
             if (addr_readable((char *)logic + 40, 8)) {
                 void *cd = *(void **)((char *)logic + 40);
                 if (cd && ptr_plausible(cd) && addr_readable((char *)cd + 96, 8)) {
@@ -694,14 +791,14 @@ static void player_seek_ms(uint32_t ms) {
                 }
             }
 
-            // d) 清空事件队列
+            // c) 清空事件队列
             if (addr_readable((char *)logic + 296, 8)) {
                 void *ev_begin = *(void **)((char *)logic + 288);
                 if (ev_begin)
                     *(void **)((char *)logic + 296) = ev_begin;
             }
 
-            // e) 清除结束标志
+            // d) 清除结束标志
             if (addr_readable((char *)logic + 321, 1)) {
                 *(uint8_t *)((char *)logic + 313) = 0;
                 *(uint8_t *)((char *)logic + 314) = 0;
@@ -1061,6 +1158,24 @@ static void loadPref(void) {
     [card addSubview:gpOn];
     y += 40;
 
+    // ---- B-1: clock-domain diagnostic panel ----
+    UILabel *diagHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
+    diagHdr.text = @"Time domains (live)";
+    diagHdr.font = [UIFont systemFontOfSize:11];
+    diagHdr.textColor = [UIColor darkGrayColor];
+    [card addSubview:diagHdr];
+    y += 22;
+
+    // 5 行：real / warp / mach / audio / iscomp
+    UILabel *diagBody = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 90)];
+    diagBody.numberOfLines = 6;
+    diagBody.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
+    diagBody.textColor = [UIColor blackColor];
+    diagBody.text = @"(initialising...)";
+    diagBody.tag = 3020;
+    [card addSubview:diagBody];
+    y += 96;
+
     // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
     speedHdr.text = @"Speed (tap=select, hold=delete)";
@@ -1170,6 +1285,65 @@ static void loadPref(void) {
     if ([gpv isKindOfClass:[UILabel class]]) {
         ((UILabel *)gpv).text = [NSString stringWithFormat:@"%llu calls",
                                  (unsigned long long)atomic_load(&g_tw_gp_update_calls)];
+    }
+    // B-1: clock-domain diagnostic
+    UIView *diagv = [card viewWithTag:3020];
+    if ([diagv isKindOfClass:[UILabel class]]) {
+        struct timeval tv = {0};
+        uint64_t real_us = 0, warp_us = 0;
+        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0)
+            real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        struct timeval tv2 = {0};
+        if (gettimeofday(&tv2, NULL) == 0)
+            warp_us = (uint64_t)tv2.tv_sec * 1000000ULL + (uint64_t)tv2.tv_usec;
+        uint64_t mach_ms = 0;
+        // mach_absolute_time -> ns -> ms
+        static mach_timebase_info_data_t s_tb = {0};
+        if (s_tb.denom == 0) mach_timebase_info(&s_tb);
+        if (s_tb.denom != 0) {
+            mach_ms = (mach_absolute_time() * (uint64_t)s_tb.numer / (uint64_t)s_tb.denom) / 1000000ULL;
+        }
+        uint32_t audio_ms = atomic_load(&g_last_pos_ms);
+        // chart clock display ms (best-effort)
+        int32_t chart_ms = INT_MIN;
+        void *gp = atomic_load(&g_gameplay_instance);
+        if (gp && ptr_plausible(gp) && addr_readable((char *)gp + 936, 8)) {
+            void *logic = *(void **)((char *)gp + 928);
+            if (logic && ptr_plausible(logic) && addr_readable((char *)logic + 56, 8)) {
+                void *clk = *(void **)((char *)logic + 48);
+                if (clk && ptr_plausible(clk) && addr_readable(clk, 64)) {
+                    chart_ms = _read_chart_clock_ms(clk);
+                }
+            }
+        }
+        uint64_t isc_calls = atomic_load(&g_iscompleted_calls);
+        uint64_t isc_z     = atomic_load(&g_iscompleted_force_zero);
+        uint64_t isc_o     = atomic_load(&g_iscompleted_force_one);
+        int isc_inst       = atomic_load(&g_iscompleted_installed_count);
+        int32_t seek_tgt   = atomic_load(&g_seek_target_ms);
+        uint64_t rwnd_us   = atomic_load(&g_rewind_until_us);
+        int32_t freeze_n   = atomic_load(&g_tw_freeze_count);
+        double rate        = tw_get_rate();
+        // wall-warp drift since rate switch (positive: warp ahead of real)
+        int64_t drift_ms = 0;
+        if (real_us && warp_us) drift_ms = ((int64_t)warp_us - (int64_t)real_us) / 1000;
+        ((UILabel *)diagv).text = [NSString stringWithFormat:
+            @"rate %.3fx  freeze=%d  rwnd=%llums\n"
+             "real %llums  warp %llums  drift %lldms\n"
+             "mach %llums  audio %ums  chart %dms\n"
+             "isComp inst=%d calls=%llu z=%llu o=%llu\n"
+             "seekTgt=%@",
+            rate, freeze_n,
+            (unsigned long long)(rwnd_us ? (rwnd_us / 1000) : 0),
+            (unsigned long long)(real_us / 1000),
+            (unsigned long long)(warp_us / 1000),
+            (long long)drift_ms,
+            (unsigned long long)mach_ms,
+            audio_ms,
+            chart_ms,
+            isc_inst, (unsigned long long)isc_calls,
+            (unsigned long long)isc_z, (unsigned long long)isc_o,
+            (seek_tgt == INT_MIN ? @"--" : [NSString stringWithFormat:@"%dms", seek_tgt])];
     }
 }
 
