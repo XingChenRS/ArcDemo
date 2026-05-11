@@ -237,9 +237,6 @@ static int player_collect_channels(void **outChs, int outCap) {
 static void apply_speed_to_all_channels(void) {
     if (!g_ch_set_frequency || !g_ch_get_frequency) return;
     if (rate_count <= 0 || !rates) return;
-    // 暂停状态不要再写 setFrequency：部分 FMOD 实现会把 paused channel 解暂停，
-    // 导致用户感知 "暂停时调速失效 / 谱面无反应"。恢复后周期 timer 会再次 apply。
-    if (atomic_load(&g_tw_freeze_count) > 0) return;
     float rate = rates[rate_i];
     if (rate <= 0.001f) return;
     void *chs[ARC_MAX_CHANNELS] = {0};
@@ -1635,7 +1632,9 @@ static void doBootstrap(void) {
         // 第一次进歌曲时会自动捕获 base_freq；之后每次倍率切换由 UI 触发，但 seek/重启歌曲会重置
         // FMOD 频率，所以这里也要兜底重新 apply。
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
-            apply_speed_to_all_channels();
+            // 暂停状态下不要 apply：部分 FMOD 实现 setFrequency 会把 paused channel 解暂停。
+            if (atomic_load(&g_tw_freeze_count) <= 0)
+                apply_speed_to_all_channels();
             void *p = get_player_or_resolve();
             static void *s_last_player = NULL;
             static void *s_last_channels = NULL;
