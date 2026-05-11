@@ -877,10 +877,10 @@ void player_seek_ms(uint32_t ms) {
                     *(int32_t *)((char *)sk + 132) = 0;  // early_in_pure
                     *(int32_t *)((char *)sk + 136) = 0;  // late_in_max_pure
                     *(int32_t *)((char *)sk + 140) = 0;  // early_in_max_pure
-                    // 同步清 a1+756/760/812 这些 LogicNoteGroup 上的 UI 缓存
-                    *(int32_t *)((char *)logic + 756) = 0;  // 上次 combo 缓存
-                    *(int32_t *)((char *)logic + 760) = 0;  // 上次 score 缓存
-                    *(int32_t *)((char *)logic + 812) = 0;  // 上次 judged_total 缓存
+                    // ⚠ 不要写 logic+756/760/812: 这些 UI 缓存字段实际在 *(GP+896)
+                    //   (即 ScorePresenter) 上, 不在 LogicNoteGroup 上!
+                    //   v6.5.1 写在这里直接堆越界, 导致 seek 后下一帧闪退。
+                    //   省略也无所谓: UI updater 下一帧自检 combo/score 不一致会刷新。
                     acc_flog(@"[seek] sk reset: combo %d->0  score %d->0  P/F/L = %d/%d/%d -> 0/0/0",
                              old_combo, old_score, old_pure, old_far, old_lost);
                 } else {
