@@ -8,9 +8,64 @@
 
 ---
 
-## 当前状态 (v6.4, 2026-05-12)
+## 当前状态 (v6.5, 2026-05-12)
 
-### v6.4 改动 — 大幅瘦身: 删除音频 hook + 回滚 ScoreKeeper 重置
+### v6.5 改动 — 修复 seek-replay sk 重置 (布局已 RE 正确)
+
+`player_seek_ms` 步骤 (e) 重新加回, 这次使用反编验证后的完整偏移集合
+(参见下方 ScoreKeeper 真布局表)。关键修复点 = sk+104 (far_count) 与
+sk+128..140 (late/early 全套) 之前 v6.3 全漏了, 这才是开局即结束的真因。
+另外 logic+756/760/812 (UI 缓存) 也一并清零, 否则下一帧 sub_100A7DD20
+触发条件 `combo != cached_combo` 会刷一次旧数。
+
+### v6.5 RE 收获 — 判定窗口入口已锁定 (但 iOS sideload 直接 patch 不可行)
+
+`sub_10086EE70` (LogicNoteGroup tick, 由 sub_10086E728 调用) 入口逻辑:
+
+```c
+if (sub_100868E28(*(GP+0x28))) {           // = *(BYTE)(chart+272), 默认 0
+    v91 = (*(*(*(GP+0x20))[0x268])[0xE0])(...);  // late 自定义
+    v90 = (*(*(*(GP+0x20))[0x268])[0xE0])(...);  // early 自定义
+} else {
+    v90 = 300;   // 默认 early-window
+    v91 = 700;   // 默认 late-window
+}
+// ...
+v66 = (int)((v65 - v91) / 10000.0);   // 判定窗下界 (screen-y 单位)
+v67 = (int)((v65 + *(int*)(a1+24)) / 10000.0);
+v68 = (int)((v85[i] - v91) / 10000.0);
+v81 = (LogicArcNote ? v91 : v90);     // arc 用 late, tap 用 early
+```
+
+**默认值在 __TEXT 写死**:
+- `0x10086EF04: MOV W9, #0x2BC (700)`  late-window
+- `0x10086EF08: MOV W8, #0x12C (300)`  early-window
+
+**为什么不能直接 patch**: Tweak.x:181 的注释已说明 — iOS 16 sideload 下
+`mprotect(rwx)` / `vm_protect VM_PROT_COPY` 在 __TEXT 上会破坏 AMFI/CoreTrust
+的 page seal, 其它线程触发该页时会被 EXC_BAD_ACCESS (Instruction Abort) 干掉。
+__DATA/__DATA_CONST 写就没问题 (vtable swizzle 是这么做的)。
+
+**v6.6 计划 — vtable 劫持方案**:
+- chart 实例 +272 字节有个 `use_custom_window` flag, 设为 1 时走自定义分支
+- 自定义分支调 `(*(*(GP+0x20))[0x268])[0xE0]()` 取 float late/early
+- 实现路径:
+  1. 在 GP.update hook 里捕获 chart 实例 (a1+0x28 deref)
+  2. 设 chart+272 = 1 强制走自定义分支
+  3. swizzle `*(chart+0x268)` 指向的对象的 vtable[0xE0/8],
+     替换成我们的 stub 返回 `g_judge_user_*_window_x100 / 100.0f`
+  4. UI 加 slider: pure 缩放 0.5..2.0x
+- 需要先抓一次实例摸清楚 `*(chart+0x268)` 是什么类 (类成员 settings 指针?
+  还是某个 singleton?), 然后才能确认 vtable swizzle 是否安全 (单实例还是
+  多实例共享 vtable, 一改全改是否有副作用)。
+
+### 已确认 ScoreKeeper 真布局
+
+详见下方 "ScoreKeeper 真布局 (供 v6.5 重新加回 seek 重置使用)" 一节。
+
+---
+
+## 历史 v6.4 — 删除音频 hook + 回滚 ScoreKeeper 重置 (作废)
 
 **删除的代码:**
 - `apply_speed_to_all_channels` (FMOD `Channel::setFrequency` 调用)

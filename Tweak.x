@@ -811,7 +811,44 @@ void player_seek_ms(uint32_t ms) {
                 acc_flog(@"[seek] chart flags reset");
             }
 
-            // (e) ScoreKeeper \u91cd\u7f6e: \u6682\u65f6\u53bb\u9664\u3002sub_100A7DFC4 \u91cc \u6307\u5b9a\u7684 sk \u504f\u79fb\n            //    (sk[+92]/[+96]/[+100]/[+104]/[+108]) \u4f7f\u7528\u5728 v14=sk[26]+sk[25]+sk[27]\n            //    \u8fd9\u4e2a\u300c\u5df2\u5224\u5b9a\u8ba1\u6570\u300d\u516c\u5f0f\u91cc, \u4f46\u6f14\u7ec3\u8868\u660e\u96f6\u5316\u4f1a\u89e6\u53d1\u300c\u5f00\u5c40\u5373\u7ed3\u675f\u300d\n            //    \u2014\u2014\u8bf4\u660e\u90a3\u4e9b\u504f\u79fb\u91cc\u67d0\u4e00\u4e2a\u5176\u5b9e\u662f\u300c\u603b\u8c31\u9762 note \u6570\u300d\u4e4b\u7c7b\u7684\u4e0d\u53d8\u91cf\uff0c\n            //    \u88ab\u6e05 0 \u540e\u201c\u5df2\u5b8c\u6210 == \u603b\u91cf\u201d\u4e0b\u4e00\u5e27\u5224\u5b9a\u4e3a\u7ed3\u5c40\u3002\u9700\u8981\u91cd\u65b0 RE \u786e\u8ba4\u4e3a\u54ea\u4e2a\n            //    \u504f\u79fb\u540e\u518d\u52a0\u56de\u3002
+            // (e) ScoreKeeper 重置 (v6.5 修复版)
+            //   v6.3 失败原因: 漏掉 sk+104(far) 与 sk+128..140(late/early), 导致下一帧
+            //   sub_100A7DFC4 看到 v14 = pure(0)+far(旧值)+lost(0) > 0,
+            //   而 sub_100A7E71C 触发条件 (judged != cached_total) 异常成立。
+            //   完整布局来自 sub_100A7DFC4 + sub_100A7E71C 反编 (label 字符串验证):
+            //     sk+20  score_displayed   sk+92  combo            sk+96  score_raw
+            //     sk+100 pure_count        sk+104 far_count        sk+108 lost_count
+            //     sk+128 late_in_pure      sk+132 early_in_pure
+            //     sk+136 late_in_max_pure  sk+140 early_in_max_pure
+            //   总 notes 不在 sk 内 (来自 *((sk+176)+184)). HP (sk+28) 不重置。
+            if (addr_readable((char *)logic + 64, 8)) {
+                void *sk = *(void **)((char *)logic + 56);
+                if (sk && ptr_plausible(sk) && addr_readable(sk, 144)) {
+                    int32_t old_combo = *(int32_t *)((char *)sk + 92);
+                    int32_t old_score = *(int32_t *)((char *)sk + 20);
+                    int32_t old_pure  = *(int32_t *)((char *)sk + 100);
+                    int32_t old_far   = *(int32_t *)((char *)sk + 104);
+                    int32_t old_lost  = *(int32_t *)((char *)sk + 108);
+                    *(int32_t *)((char *)sk + 20)  = 0;  // score_displayed
+                    *(int32_t *)((char *)sk + 92)  = 0;  // combo
+                    *(int32_t *)((char *)sk + 96)  = 0;  // score_raw (PM 投影累加器)
+                    *(int32_t *)((char *)sk + 100) = 0;  // pure_count
+                    *(int32_t *)((char *)sk + 104) = 0;  // far_count   (v6.3 漏点)
+                    *(int32_t *)((char *)sk + 108) = 0;  // lost_count
+                    *(int32_t *)((char *)sk + 128) = 0;  // late_in_pure
+                    *(int32_t *)((char *)sk + 132) = 0;  // early_in_pure
+                    *(int32_t *)((char *)sk + 136) = 0;  // late_in_max_pure
+                    *(int32_t *)((char *)sk + 140) = 0;  // early_in_max_pure
+                    // 同步清 a1+756/760/812 这些 LogicNoteGroup 上的 UI 缓存
+                    *(int32_t *)((char *)logic + 756) = 0;  // 上次 combo 缓存
+                    *(int32_t *)((char *)logic + 760) = 0;  // 上次 score 缓存
+                    *(int32_t *)((char *)logic + 812) = 0;  // 上次 judged_total 缓存
+                    acc_flog(@"[seek] sk reset: combo %d->0  score %d->0  P/F/L = %d/%d/%d -> 0/0/0",
+                             old_combo, old_score, old_pure, old_far, old_lost);
+                } else {
+                    acc_flog(@"[seek] WARN: sk ptr unreadable: %p", sk);
+                }
+            }
         }
     }
 
