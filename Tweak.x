@@ -300,7 +300,10 @@ static _Atomic(uint64_t) g_tw_frozen_us    = 0;
 _Atomic(uint64_t) g_tw_gtod_calls = 0;
 _Atomic(int) g_tw_en_gtod = 1;
 
-static inline double tw_get_rate(void) {
+// forward decl: defined later; needed by tw_mtp_getpos audio rate measurement
+static uint64_t _real_now_us_unwarped(void);
+
+double tw_get_rate(void) {
     return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
 }
 
