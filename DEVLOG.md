@@ -183,7 +183,7 @@ __DATA/__DATA_CONST 写就没问题 (vtable swizzle 是这么做的)。
 | sk+28  | f32 | HP | |
 | sk+76  | f32 | HP_max | |
 | sk+92  | i32 | combo | UI 比对 a1+756 触发 sub_100A7DD20 |
-| sk+96  | i32 | score_raw | PM 投影累加器, **不是** pure_count |
+| sk+96  | i32 | max_pure_count | sub_1009C6B38 case 0 自增; PM 起始分公式里作为 `+max_pure×1` 奖励加到投影分上 (原v6.5 误写为 score_raw，v6.6 修正) |
 | sk+100 | i32 | pure_count | "pureLabel-fullnolocalize" |
 | sk+104 | i32 | far_count | "farLabel" |
 | sk+108 | i32 | lost_count | "lostLabel" |
@@ -204,7 +204,7 @@ sub_100A7E71C 触发条件 `judged != cached_total` 仍然成立, 后续帧
 ```c
 *(int32_t *)((char*)sk + 20)  = 0;  // score
 *(int32_t *)((char*)sk + 92)  = 0;  // combo
-*(int32_t *)((char*)sk + 96)  = 0;  // score_raw
+*(int32_t *)((char*)sk + 96)  = 0;  // max_pure_count (原v6.5 误注为 score_raw, v6.6 订正)
 *(int32_t *)((char*)sk + 100) = 0;  // pure
 *(int32_t *)((char*)sk + 104) = 0;  // far  <-- v6.3 漏了
 *(int32_t *)((char*)sk + 108) = 0;  // lost
