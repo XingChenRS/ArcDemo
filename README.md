@@ -57,7 +57,13 @@ BGM 始终 1.0×。Seek 不重置已判定音符。
 | `libAccDemoArcaea.dylib` | 本 tweak（CI 已把依赖改为 `@rpath/libellekit.dylib`） |
 | `libellekit.dylib` | Substrate 替代，提供 MSHook 符号 |
 
-主二进制需已有 `LC_LOAD_DYLIB @rpath/libAccDemoArcaea.dylib` 与 `LC_RPATH @executable_path/Frameworks`。可用仓库根目录 `inject.py` 一键注入。
+主二进制需已有 `LC_LOAD_DYLIB @rpath/libAccDemoArcaea.dylib` 与 `LC_RPATH @executable_path/Frameworks`。用仓库内 `inject.py` 一键注入（**不要用 lief 写主程序**，会截断 `__LINKEDIT` 导致启动即崩）。
+
+```bash
+python graft_hook.py --binary <Arc-mobile>
+python inject.py   # 需 ios/Payload/Arc-mobile.app 布局 + ci-artifacts 内 dylib
+```
+
 
 CI artifact（sideload / trollstore）内均包含上述两个文件。
 
