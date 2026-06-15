@@ -1,4 +1,4 @@
-// JudgeWindow.c — graft slot + classifier 替换（runtime 只写 __DATA 槽位）
+// JudgeWindow.c — graft slot（__data 扩展区）+ 从 tramp 解析槽位地址
 #include "JudgeWindow.h"
 #include "ArcOffsets.h"
 
@@ -25,6 +25,8 @@ static int s_lost_ms = 120;
 static bool s_ready = false;
 static char s_install_log[512];
 
+static const char kSlotMagic[4] = {'X', 'R', 'C', 'H'};
+
 const char *judge_window_install_log(void) {
     return s_install_log;
 }
@@ -46,6 +48,42 @@ static bool insn_is_adrp(uint32_t insn) {
     return (insn & 0x9F000000u) == 0x90000000u;
 }
 
+static bool insn_is_add_imm(uint32_t insn) {
+    return (insn & 0xFF000000u) == 0x91000000u;
+}
+
+static bool insn_is_ldr_x64(uint32_t insn) {
+    return (insn & 0xFFC00000u) == 0xF9400000u;
+}
+
+static uint64_t decode_adrp_target(uint32_t insn, uint64_t pc) {
+    uint32_t immlo = (insn >> 29) & 3u;
+    uint32_t immhi = (insn >> 5) & 0x7ffffu;
+    int64_t imm = (int64_t)((immhi << 2) | immlo);
+    if (imm & 0x100000) imm |= ~(int64_t)0x1fffff;
+    return (pc & ~0xfffull) + (uint64_t)(imm << 12);
+}
+
+static void **resolve_slot_from_tramp(uint64_t image_base) {
+    uint64_t pc = image_base + ARC_OFF_JUDGE_TRAMP;
+    uint32_t w0 = *(uint32_t *)pc;
+    if (!insn_is_adrp(w0)) return NULL;
+
+    uint64_t addr = decode_adrp_target(w0, pc);
+    pc += 4;
+
+    uint32_t w1 = *(uint32_t *)pc;
+    if (insn_is_add_imm(w1)) {
+        addr += (uint64_t)((w1 >> 10) & 0xfffu);
+        pc += 4;
+    }
+
+    uint32_t w2 = *(uint32_t *)pc;
+    if (!insn_is_ldr_x64(w2)) return NULL;
+
+    return (void **)addr;
+}
+
 static void normalize_thresholds(int *max_ms, int *pure_ms, int *far_ms, int *lost_ms) {
     if (*max_ms < 1) *max_ms = 1;
     if (*max_ms > 2000) *max_ms = 2000;
@@ -62,7 +100,12 @@ static int32_t abs_i32(int32_t v) {
 }
 
 static int64_t xrc_classify(void *gp, void *note, void *ctx) {
-    if (!gp || !note || !g_score_hit || !g_score_lost) {
+    if (!gp || !note) return 0;
+
+    if (g_hook_slot && *g_hook_slot != (void *)xrc_classify)
+        *g_hook_slot = (void *)xrc_classify;
+
+    if (!g_score_hit || !g_score_lost) {
         if (g_classify_resume) return g_classify_resume(gp, note, ctx);
         return 0;
     }
@@ -111,12 +154,21 @@ bool judge_window_install(uint64_t image_base) {
         return false;
     }
 
-    g_hook_slot = (void **)(image_base + ARC_OFF_HOOK_SLOT);
+    g_hook_slot = resolve_slot_from_tramp(image_base);
+    if (!g_hook_slot) {
+        log_append("tramp_slot_resolve_fail; ");
+        return false;
+    }
+
     g_classify_resume = (classify_fn)(image_base + ARC_OFF_JUDGE_CLASSIFY + 16);
     g_score_hit = (score_hit_fn)(image_base + ARC_OFF_SCORE_COMMIT_HIT);
     g_score_lost = (score_lost_fn)(image_base + ARC_OFF_SCORE_COMMIT_LOST);
 
-    *g_hook_slot = NULL;
+    void *before = *g_hook_slot;
+    const char *magic = (const char *)g_hook_slot - 8;
+    if (memcmp(magic, kSlotMagic, 4) != 0)
+        memcpy((void *)magic, kSlotMagic, 4);
+
     *g_hook_slot = (void *)xrc_classify;
 
     if (*g_hook_slot != (void *)xrc_classify) {
@@ -125,8 +177,8 @@ bool judge_window_install(uint64_t image_base) {
     }
 
     s_ready = true;
-    log_append("graft_ok slot=0x%llx entry=0x%08x tramp=0x%08x",
-               (unsigned long long)ARC_OFF_HOOK_SLOT, entry, tramp0);
+    log_append("graft_ok slot=%p hook=%p prev=%p tramp=0x%08x magic=%.4s",
+               (void *)g_hook_slot, (void *)xrc_classify, before, tramp0, magic);
     return true;
 }
 

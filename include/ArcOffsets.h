@@ -20,9 +20,10 @@
 #define ARC_OFF_JUDGE_CALLER_A     (0x871514ULL)
 #define ARC_OFF_JUDGE_CALLER_B     (0x871FE0ULL)
 
-// graft_hook.py：tramp 在 __text 末尾 padding；槽位在 __swift56_hooks 段末（__DATA 可写）
+// graft_hook.py：槽位在 __data 末尾 XRCH 魔数 + 8B（由 tramp 指令解析地址，勿硬编码）
 #define ARC_OFF_JUDGE_TRAMP        (0x1039500ULL)
-#define ARC_OFF_HOOK_SLOT          (0x149ABF8ULL)
+// 仅作参考；运行时以 resolve_slot_from_tramp() 为准
+#define ARC_OFF_HOOK_SLOT          (0x149C008ULL)  /* graft 后 __DATA 文件尾 8B 槽位（以 tramp 解析为准） */
 
 // 八个 CMP 站点 — 仅 RE 参考 / 静态 patch_judge_static.py；graft 方案不再 runtime patch
 // 默认 imm → 有效窗口 (与 ArcCreate Values 一致):

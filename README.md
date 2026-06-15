@@ -2,7 +2,18 @@
 
 Arcaea iOS **6.13.10** 练习辅助 dylib。
 
-> **当前版本: v7.2**
+> **当前版本: v7.3.2**（TrollStore 判定需主程序 graft + 本 dylib 配套安装）
+
+## TrollStore 判定安装（主程序 + dylib 必须同一套 graft）
+
+1. 从**未 graft** 的 `Arc-mobile` 主程序开始
+2. `python graft_hook.py --binary <Arc-mobile>`（在 `__DATA` 文件尾插入 `XRCH`+槽位，刷新 tramp）
+3. 注入 `libAccDemoArcaea.dylib` + `libellekit.dylib` 到 `Frameworks/`
+4. TrollStore 签名安装
+
+成功日志示例：`graft_ok slot=... hook=... magic=XRCH tramp=0xf0002310`
+
+**不能只换 dylib 不换主程序**（tramp 槽位地址必须一致）。
 
 ## 配置文件
 
