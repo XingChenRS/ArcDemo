@@ -1,4 +1,4 @@
-// JudgeWindow.c — TrollStore: graft slot + classifier 替换（不写 __TEXT）
+// JudgeWindow.c — graft slot + classifier 替换（runtime 只写 __DATA 槽位）
 #include "JudgeWindow.h"
 #include "ArcOffsets.h"
 
@@ -8,10 +8,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+typedef int64_t (*classify_fn)(void *gp, void *note, void *ctx);
 typedef int64_t (*score_hit_fn)(void *sk, void *note, int judge_type, int sub_type,
                                 int32_t current_time, void *ctx);
 typedef int64_t (*score_lost_fn)(void *sk, void *note, int32_t current_time);
 
+static classify_fn g_classify_resume = NULL;
 static score_hit_fn g_score_hit = NULL;
 static score_lost_fn g_score_lost = NULL;
 static void **g_hook_slot = NULL;
@@ -40,6 +42,10 @@ static bool insn_is_b(uint32_t insn) {
     return (insn >> 26) == 0x05u;
 }
 
+static bool insn_is_adrp(uint32_t insn) {
+    return (insn & 0x9F000000u) == 0x90000000u;
+}
+
 static void normalize_thresholds(int *max_ms, int *pure_ms, int *far_ms, int *lost_ms) {
     if (*max_ms < 1) *max_ms = 1;
     if (*max_ms > 2000) *max_ms = 2000;
@@ -55,9 +61,11 @@ static int32_t abs_i32(int32_t v) {
     return v < 0 ? -v : v;
 }
 
-// sub_100870FD0 主路径：dt = note+24 - note+32，|dt| 分档后调 score commit
 static int64_t xrc_classify(void *gp, void *note, void *ctx) {
-    if (!gp || !note || !g_score_hit || !g_score_lost) return 0;
+    if (!gp || !note || !g_score_hit || !g_score_lost) {
+        if (g_classify_resume) return g_classify_resume(gp, note, ctx);
+        return 0;
+    }
 
     void *sk = *(void **)((char *)gp + 56);
     if (!sk) return 0;
@@ -68,17 +76,16 @@ static int64_t xrc_classify(void *gp, void *note, void *ctx) {
     int32_t signed_dt = n24 - n32;
     int32_t abs_dt = abs_i32(signed_dt);
     int sub_type = signed_dt < 0 ? 1 : 2;
-    int32_t hit_time = n32;
-    int32_t lost_time = n32 - n40;
+    int32_t commit_time = n32 - n40;
 
     if (abs_dt <= s_max_ms)
-        return g_score_hit(sk, note, 0, 0, hit_time, ctx);
+        return g_score_hit(sk, note, 0, 0, commit_time, ctx);
     if (abs_dt <= s_pure_ms)
-        return g_score_hit(sk, note, 1, sub_type, hit_time, ctx);
+        return g_score_hit(sk, note, 1, sub_type, commit_time, ctx);
     if (abs_dt <= s_far_ms)
-        return g_score_hit(sk, note, 2, sub_type, hit_time, ctx);
+        return g_score_hit(sk, note, 2, sub_type, commit_time, ctx);
     if (abs_dt <= s_lost_ms)
-        return g_score_lost(sk, note, lost_time);
+        return g_score_lost(sk, note, commit_time);
     return 0;
 }
 
@@ -88,6 +95,7 @@ bool judge_window_install(uint64_t image_base) {
     s_install_log[0] = '\0';
     s_ready = false;
     g_hook_slot = NULL;
+    g_classify_resume = NULL;
     g_score_hit = NULL;
     g_score_lost = NULL;
 
@@ -98,18 +106,27 @@ bool judge_window_install(uint64_t image_base) {
     }
 
     uint32_t tramp0 = *(uint32_t *)(image_base + ARC_OFF_JUDGE_TRAMP);
-    if ((tramp0 & 0xFF000000u) != 0x90000000u) {
+    if (!insn_is_adrp(tramp0)) {
         log_append("bad_tramp(0x%08x); ", tramp0);
         return false;
     }
 
     g_hook_slot = (void **)(image_base + ARC_OFF_HOOK_SLOT);
+    g_classify_resume = (classify_fn)(image_base + ARC_OFF_JUDGE_CLASSIFY + 16);
     g_score_hit = (score_hit_fn)(image_base + ARC_OFF_SCORE_COMMIT_HIT);
     g_score_lost = (score_lost_fn)(image_base + ARC_OFF_SCORE_COMMIT_LOST);
 
+    *g_hook_slot = NULL;
     *g_hook_slot = (void *)xrc_classify;
+
+    if (*g_hook_slot != (void *)xrc_classify) {
+        log_append("slot_write_fail; ");
+        return false;
+    }
+
     s_ready = true;
-    log_append("graft_hook slot=0x%llx", (unsigned long long)ARC_OFF_HOOK_SLOT);
+    log_append("graft_ok slot=0x%llx entry=0x%08x tramp=0x%08x",
+               (unsigned long long)ARC_OFF_HOOK_SLOT, entry, tramp0);
     return true;
 }
 

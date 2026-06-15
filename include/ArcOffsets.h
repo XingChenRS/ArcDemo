@@ -20,9 +20,9 @@
 #define ARC_OFF_JUDGE_CALLER_A     (0x871514ULL)
 #define ARC_OFF_JUDGE_CALLER_B     (0x871FE0ULL)
 
-// graft_hook.py 写入：__text 末尾 tramp + __bss 槽位（运行时 dylib 写指针）
+// graft_hook.py：tramp 在 __text 末尾 padding；槽位在 __swift56_hooks 段末（__DATA 可写）
 #define ARC_OFF_JUDGE_TRAMP        (0x1039500ULL)
-#define ARC_OFF_HOOK_SLOT          (0x149AC00ULL)
+#define ARC_OFF_HOOK_SLOT          (0x149ABF8ULL)
 
 // 八个 CMP 站点 — 仅 RE 参考 / 静态 patch_judge_static.py；graft 方案不再 runtime patch
 // 默认 imm → 有效窗口 (与 ArcCreate Values 一致):

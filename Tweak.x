@@ -1,6 +1,6 @@
 // xrc-arcdemo / Tweak.x
 // Sideload: 变速 + seek | TrollStore (ARC_TROLLSTORE=1): 额外判定窗口缩放
-#define XRC_TWEAK_VERSION  @"v7.2.5"
+#define XRC_TWEAK_VERSION  @"v7.3.0"
 #if ARC_TROLLSTORE
 #  define XRC_BUILD_LABEL    @"TrollStore"
 #else
@@ -135,7 +135,7 @@ bool addr_readable(const void *p, size_t len) {
     return true;
 }
 
-// 取 Arc-mobile 主二进制基址
+// 取 Arc-mobile 主可执行体基址（排除 Frameworks 内 dylib）
 uint64_t arc_image_base(void) {
     static uint64_t cached = 0;
     if (cached) return cached;
@@ -143,16 +143,15 @@ uint64_t arc_image_base(void) {
     for (uint32_t i = 0; i < n; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
-        // CFBundleExecutable = "Arc-mobile"
-        if (strstr(name, "Arc-mobile") != NULL) {
+        if (strstr(name, ".dylib") != NULL) continue;
+        const char *slash = strrchr(name, '/');
+        if (slash && strcmp(slash + 1, "Arc-mobile") == 0) {
             cached = (uint64_t)_dyld_get_image_header(i);
             break;
         }
     }
-    if (!cached && n > 0) {
-        // 兜底：主可执行体一般是 image 0
+    if (!cached && n > 0)
         cached = (uint64_t)_dyld_get_image_header(0);
-    }
     return cached;
 }
 
