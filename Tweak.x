@@ -1,44 +1,15 @@
 // xrc-arcdemo / Tweak.x
-// Arcaea iOS 变速 / Seek 工具 (fork of brendonjkding/accDemo)
-// 单 dylib 注入, 游戏内浮窗 UI
-//
-// 修改这个版本号 ↓ 之后所有 NSLog 与 UI 标题会同步更新。
-#define XRC_TWEAK_VERSION  @"v6.6"
-//
-// ============================================================
-// 功能范围 (v6.6 简化后)
-// ============================================================
-//   1. 变速: gettimeofday fishhook 调动画 clock + GP.update vtable
-//                hook 按估计 delta 偏移谱面 logic clock
-//   2. 前/后 seek: 只跳音频 (MTP::seekTo) + 谱面 clock
-//                  偏移 (clock+40)。跳过的 note 由游戏自动
-//                  判 lost (或者不再显示)。已判过的 note
-//                  **不会重现**, 需要重新游玩谱面请用 Retry。
-// ============================================================
-// 已被拆除的实验性部分 (v6.5 以前遗留)
-// ============================================================
-//   - LogicNote::isCompleted vtable swizzle (模拟谱面回放)
-//   - rewind grace window + g_seek_target_ms
-//   - 跳转后清活跃音符列表 / 重新激活 track / 清零 sk
-//   原因: 上述操作需要同时 RE 出 Tap/Hold/Arc/ArcTap 全部内部
-//   state 才能像 ArcCreate 那样 "无状态重派生". 闭源二进制
-//   上代价太大, 且 HoldNote 中段进入会触发越界。
-// ============================================================
-// 安全约束
-// ============================================================
-//   - iOS 16+ sideload 不能 Dobby inline hook 主二进制 __TEXT
-//     (AMFI / CoreTrust 对代码页有 hash seal). 只能:
-//       a) fishhook 主二进制 GOT (gettimeofday)  安全
-//       b) vtable 槽位替换 (__DATA_CONST mprotect RW 可以)
-//       c) 读函数指针但不改函数实现
-//   - PAC: arm64e 上 vtable 写需要 ptrauth_sign_unauthenticated +
-//     ptrauth_blend_discriminator(slot_addr, 0)。direct BL 不走 PAC。
-// ============================================================
+// Sideload: 变速 + seek | TrollStore (ARC_TROLLSTORE=1): 额外判定窗口缩放
+#define XRC_TWEAK_VERSION  @"v7.2"
+#if ARC_TROLLSTORE
+#  define XRC_BUILD_LABEL    @"TrollStore"
+#else
+#  define XRC_BUILD_LABEL    @"Sideload"
+#endif
 
 #import <substrate.h>
 #import <time.h>
 #import <dlfcn.h>
-#import <mach/mach_time.h>
 #import <mach-o/dyld.h>
 #import <sys/time.h>
 #import <sys/mman.h>
@@ -54,16 +25,17 @@
 #  import <ptrauth.h>
 #endif
 
-#import "dobby.h"
 #import "fishhook.h"
 
 extern UIApplication *UIApp;
 
 #import "SuspendView/WQSuspendView.h"
 #import "WHToast/WHToast.h"
-#import "AccCommon.h"
+#include "ArcOffsets.h"
+#if ARC_TROLLSTORE
+#  import "JudgeWindow.h"
+#endif
 
-// forward decl: 文件末尾定义，但中部诊断需要用
 void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
 
 #pragma mark - global
@@ -74,33 +46,17 @@ NSInteger rate_count = 0;
 
 BOOL     buttonEnabled = YES;
 BOOL     toast = YES;
+#if ARC_TROLLSTORE
+int judgeMaxMs = 25;
+int judgePureMs = 50;
+int judgeFarMs = 100;
+int judgeLostMs = 120;
+#endif
 
 WQSuspendView *button = nil;
 UIView        *menuView = nil;
-#pragma mark - Arcaea binary hook (Dobby)
-//
-// 已知偏移 (IDA 6.13.10 分析):
-//   sub_100846950 (vtable[7] of MultiTrackPlayer) = getPositionMs(this, channel)
-//   sub_100846914 (vtable[6])                     = setPaused(this, paused, channel)
-//   sub_10084699C (vtable[8])                     = seekTo(this, ms, channel)
-//   sub_100C9D718                                 = getRegistry() - 全局单例
-//   *(getRegistry() + 8)                          = MultiTrackPlayer
-//   sub_100EC094C                                 = Channel::getCurrentSound(ch, Sound**)
-//   sub_100F2BB64                                 = Sound::getLength(snd, uint32_t*, unit=1)
-//   sub_100EC069C                                 = Channel::setFrequency(ch, float)
-// 
-// MTP 内部布局: 通道数组 channels[i] @ player+0x38, stride=16, 每项+8 = Channel*
-//   ch0 = *(*(player+0x38) + 8)
-//
-// 运行时地址 = arcaea_base + offset
-#define ARC_OFF_GET_POSITION_MS    (0x846950ULL)
-#define ARC_OFF_GET_REGISTRY       (0xC9D718ULL)
-// 以下偏移仅用于数据/函数指针读取，不做 vtable 写入
-#define ARC_OFF_GET_CURRENT_SOUND  (0xEC094CULL)
-#define ARC_OFF_GET_SOUND_LENGTH   (0xF2BB64ULL)
-// 直接 FMOD Channel API，绕开 MTP 包装。
-//   getPositionMs(MTP, ch) 内部就是 Channel::getPosition（已确认）→ 改频率 → 谱面/音频同步
-#define ARC_OFF_CH_GET_POSITION    (0xEC03ACULL)
+#pragma mark - Arcaea binary (offsets in include/ArcOffsets.h)
+
 #define ARC_REG_PLAYER_OFFSET      (8)
 #define ARC_PLAYER_CHANNELS_OFFSET (0x38)
 #define ARC_CHANNEL_ENTRY_PTR_OFF  (8)
@@ -122,9 +78,8 @@ _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
 static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 拿到的真实总时长
 
-// 音频 hook 已废除 (用户决定: 仅留 gettimeofday + Gameplay vtable 两个 hook)。
-// MTP getPos vtable swizzle 仍保留, 仅用作位置读出 (进度条 + seek 反馈),
-// 不再做任何 setFrequency / corr / 滑窗测量。
+// 音频变速已移除 (v6.4+): BGM 始终 1.0×; 仅谱面 clock + 画面 warp 按倍率变化。
+// MTP getPos vtable swizzle 仅用于捕获 player 与进度读取。
 
 // 尝试从 player 主轨拿 Sound 总长
 static void try_capture_song_length(void *player) {
@@ -220,6 +175,15 @@ static void install_arc_hooks(void) {
     void *mtp = resolve_player_via_registry();
     NSLog(@"[xrc-arcdemo] initial MTP via registry = %p", mtp);
     if (mtp) try_capture_song_length(mtp);
+
+#if ARC_TROLLSTORE
+    if (judge_window_install(base)) {
+        applyJudgeThresholds();
+        acc_flog(@"judge patch %s", judge_window_install_log());
+    } else {
+        acc_flog(@"judge_window_install FAILED: %s", judge_window_install_log());
+    }
+#endif
 }
 
 // 通过 player vtable 调用对应槽位
@@ -247,12 +211,6 @@ static _Atomic(uint32_t) g_tw_rate_x1000   = 1000;
 _Atomic(int32_t)  g_tw_freeze_count = 0;
 static _Atomic(uint64_t) g_tw_frozen_us    = 0;
 
-_Atomic(uint64_t) g_tw_gtod_calls = 0;
-_Atomic(int) g_tw_en_gtod = 1;
-
-// forward decl: defined later; needed by tw_mtp_getpos audio rate measurement
-static uint64_t _real_now_us_unwarped(void);
-
 double tw_get_rate(void) {
     return (double)atomic_load(&g_tw_rate_x1000) / 1000.0;
 }
@@ -269,9 +227,7 @@ static uint64_t _compute_warp_us(uint64_t real_us) {
 static int tw_gettimeofday(struct timeval *tv, void *tz) {
     if (!tv) return s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
     int r = s_orig_gettod ? s_orig_gettod(tv, tz) : gettimeofday(tv, tz);
-    atomic_fetch_add(&g_tw_gtod_calls, 1);
     if (r != 0) return r;
-    if (!atomic_load(&g_tw_en_gtod)) return r;
     uint64_t real_us = (uint64_t)tv->tv_sec * 1000000ULL + (uint64_t)tv->tv_usec;
     uint64_t warp_us;
     if (atomic_load(&g_tw_freeze_count) > 0) {
@@ -297,33 +253,19 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
 #define ARC_OFF_GP_VTABLE    (0x136E1C0ULL)
 #define ARC_OFF_GP_UPDATE_FN (0xB3AD70ULL)
 
-// (v6.6) isCompleted hook 定义 / vtable 表 / hook 实现全部拆除。
-
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 typedef int64_t (*orig_gp_update_fn)(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
 
 static orig_mtp_getpos_fn s_orig_mtp_getpos = NULL;
 static orig_gp_update_fn s_orig_gp_update = NULL;
-static _Atomic(uint64_t) g_tw_mtp_getpos_calls = 0;
-_Atomic(uint64_t) g_tw_gp_update_calls = 0;
-static _Atomic(int) g_tw_gp_update_installed = 0;
 
-// LogicNote::isCompleted hook 在 v6.5 及之前用于模拟谱面回放
-// (rewind grace window). v6.6 拆除. 保留以下定义仅作为记录:
-//   - 谱面回放需要重置 Tap/Hold/Arc/ArcTap 每个节点的内部
-//     state. iOS 闭源二进制上这项工作量不现实 (参 ArcCreate
-//     ResetJudgeTo 对比)。如果需要重玩, 请用游戏内 Retry。
-
-// 缓存 Gameplay 实例指针 (seek 需要访问谱面时钟)
 _Atomic(void *) g_gameplay_instance = NULL;
 
 // retime 状态: 记录上一帧的真实时间和 clock 指针, 用于计算帧间 delta
 static void *s_gp_last_clock = NULL;
 static uint64_t s_gp_last_real_us = 0;
-// MTP getPos vtable wrapper：自动捕获 player 实例 + 位置追踪 (仅读取,不变速)
 static uint32_t tw_mtp_getpos(void *self, int channel) {
     uint32_t raw = s_orig_mtp_getpos ? s_orig_mtp_getpos(self, channel) : 0;
-    atomic_fetch_add(&g_tw_mtp_getpos_calls, 1);
     if (channel == 0) {
         atomic_store(&g_bgmPlayer, self);
         atomic_store(&g_last_pos_ms, raw);
@@ -350,14 +292,9 @@ static uint64_t _real_now_us_unwarped(void) {
     return 0;
 }
 
-// forward decl (defined later in file): chart clock reader used by retime drift fix
+// forward decl (defined later in file)
 static int32_t _read_chart_clock_ms(void *clk);
 
-// 谱面 retime: 每帧按 rate 推进 clk[16], 与音频独立。
-// 不做 audio<->chart 任何绑定 (绑定无论怎么做都会抽搐或加延迟)。
-// 公式: chart_displayed = steady_now - clk[16] - clk[40]
-// 想让 chart 走 rate 倍速 -> 每帧让 clk[16] 反向走 (rate-1)*delta_ms
-// 即  clk[16] += (1 - rate) * delta_ms
 static void _gp_retime_logic_clock(void *logic) {
     if (!logic) return;
     if (atomic_load(&g_tw_freeze_count) > 0) return;
@@ -392,16 +329,8 @@ static void _gp_retime_logic_clock(void *logic) {
     *start_ms = (int32_t)after;
 }
 
-// forward decl (defined after time_warp_install)
-static int32_t _read_chart_clock_ms(void *clk);
-
-// LogicNote::isCompleted vtable hook 已拆 (v6.6). 不再定义 tw_logicnote_isCompleted。
-
-// Gameplay.update vtable hook:
-//   1. 缓存 Gameplay 实例 (seek/reset 需要)
-//   2. _gp_retime_logic_clock 变速谱面
+// Gameplay.update: 缓存 GP 实例 + 谱面 clock retime
 static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
-    atomic_fetch_add(&g_tw_gp_update_calls, 1);
     if (self) {
         // 缓存 Gameplay 实例指针 (player_seek_ms 需要访问 logic clock)
         atomic_store(&g_gameplay_instance, self);
@@ -494,17 +423,9 @@ static void install_vtable_swizzles(void) {
         //    b) 调用 _gp_retime_logic_clock(logic) 实现谱面变速
         int gp_slot = swizzle_vtable_find_swap(base + ARC_OFF_GP_VTABLE, ARC_OFF_GP_UPDATE_FN,
                                                (void *)tw_gp_update, (void **)&s_orig_gp_update);
-        if (gp_slot != INT_MIN && s_orig_gp_update) {
-            atomic_store(&g_tw_gp_update_installed, 1);
+        if (gp_slot != INT_MIN && s_orig_gp_update)
             acc_flog(@"gp.update vtable installed slot=%d", gp_slot);
-        }
-        // (v6.6) LogicNote::isCompleted swizzle 拆除。
     });
-}
-
-int clock_hook_ready_for_idx(int idx) {
-    if (idx == 0) return s_orig_gettod != NULL;
-    return 0;
 }
 
 static void time_warp_freeze_inc(void) {
@@ -549,8 +470,6 @@ void time_warp_set_rate(double rate) {
     atomic_store(&g_tw_t0_real_us, real_us_now);
     atomic_store(&g_tw_t0_warp_us, warp_us_now);
     atomic_store(&g_tw_rate_x1000, (uint32_t)(rate * 1000.0 + 0.5));
-
-    // (\u97f3\u9891 hook \u5df2\u5e9f\u9664: \u4ec5\u8c03\u8c31\u9762\u53d8\u901f, \u97f3\u9891\u4e0d\u52a8\u3002)
     s_gp_last_real_us = 0;
 }
 
@@ -607,19 +526,6 @@ void player_seek_ms(uint32_t ms) {
                 acc_flog(@"[seek] chart clock adjusted: cur=%d target=%u delta=%d new_base=%d",
                          cur_ms, ms, delta, *base_off);
             }
-
-            // (v6.6) 不再做以下"谱面状态重置"操作:
-            //   - 清空活跃音符列表 / release 每个 note (有 use-after-free 风险)
-            //   - 重新激活所有音轨 byte[0]=1 (可能复活已死 track)
-            //   - 清空事件队列 / 清除结束标志
-            //   - 清零 ScoreKeeper (combo/score/P/F/L)
-            // 这些都是 v6 之前为模拟"向后跳后回放" 加的副作用很重的代码.
-            // 现已确认在 iOS 闭源二进制上无法做到 ArcCreate 的"无状态重派生"
-            // 语义 (HoldNote 内部 tick 计数器无法重置), 强行清理会触发崩溃.
-            //
-            // 现在 seek 只动两件事 (上面的): 音频跳 + 谱面 clock 偏移. 跳过的
-            // note 由游戏自身的 sub_100870344 路径自动判 lost; 已演奏过的 note
-            // 不会重现, 需要重玩请用 Retry.
         }
     }
 
@@ -628,7 +534,7 @@ void player_seek_ms(uint32_t ms) {
     time_warp_freeze_dec();
 }
 
-// (player_set_paused 已移除: 用户反馈暂停 BGM 没意义且与 freeze 冲突)
+// (player_set_paused 已移除)
 
 uint32_t player_get_position_ms_cached(void) {
     return atomic_load(&g_last_pos_ms);
@@ -641,11 +547,24 @@ uint32_t player_get_progress_max_ms(void) {
     return atomic_load(&g_max_seen_ms);
 }
 
-#pragma mark - prefs
+#pragma mark - config (Documents/xrc-arcdemo.plist)
 
-NSMutableDictionary *loadPrefDict(void) {
-    NSMutableDictionary *p = [[NSMutableDictionary alloc] initWithContentsOfFile:kPrefPath];
-    if (!p) p = [NSMutableDictionary new];
+NSString *arcConfigPath(void) {
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!docs) return nil;
+    return [docs stringByAppendingPathComponent:@"xrc-arcdemo.plist"];
+}
+
+static void migrateLegacyPrefsIfNeeded(void) {
+    NSString *cfg = arcConfigPath();
+    if (!cfg || [[NSFileManager defaultManager] fileExistsAtPath:cfg]) return;
+    NSMutableDictionary *old = [[NSMutableDictionary alloc] initWithContentsOfFile:kPrefPath];
+    if (!old || old.count == 0) return;
+    [old writeToFile:cfg atomically:YES];
+    acc_flog(@"migrated legacy prefs -> %@", cfg);
+}
+
+static void ensurePrefDefaults(NSMutableDictionary *p) {
     if (!p[@"speedKeys"] || ![p[@"speedKeys"] count]) {
         p[@"speedKeys"] = [@[@"speed-1", @"speed-2", @"speed-3", @"speed-4", @"speed-5"] mutableCopy];
         p[@"speed-1"] = @1.00;
@@ -656,14 +575,64 @@ NSMutableDictionary *loadPrefDict(void) {
     }
     if (!p[@"buttonEnabled"]) p[@"buttonEnabled"] = @YES;
     if (!p[@"toast"])         p[@"toast"]         = @YES;
+    if (!p[@"rateIndex"])     p[@"rateIndex"]     = @0;
+#if ARC_TROLLSTORE
+    if (!p[@"judgeMaxMs"] && p[@"judgeWindowScale"]) {
+        float sc = [p[@"judgeWindowScale"] floatValue];
+        if (sc < 0.25f) sc = 0.25f;
+        if (sc > 4.0f) sc = 4.0f;
+        p[@"judgeMaxMs"]  = @(int)lround(25.0f * sc);
+        p[@"judgePureMs"] = @(int)lround(50.0f * sc);
+        p[@"judgeFarMs"]  = @(int)lround(100.0f * sc);
+        p[@"judgeLostMs"] = @(int)lround(120.0f * sc);
+    }
+    if (!p[@"judgeMaxMs"])  p[@"judgeMaxMs"]  = @25;
+    if (!p[@"judgePureMs"]) p[@"judgePureMs"] = @50;
+    if (!p[@"judgeFarMs"])  p[@"judgeFarMs"]  = @100;
+    if (!p[@"judgeLostMs"]) p[@"judgeLostMs"] = @120;
+#endif
+}
+
+NSMutableDictionary *loadPrefDict(void) {
+    migrateLegacyPrefsIfNeeded();
+    NSString *path = arcConfigPath();
+    NSMutableDictionary *p = path ? [[NSMutableDictionary alloc] initWithContentsOfFile:path] : nil;
+    if (!p) p = [NSMutableDictionary new];
+    ensurePrefDefaults(p);
     return p;
 }
 
 void savePrefDict(NSDictionary *p) {
-    NSString *dir = [kPrefPath stringByDeletingLastPathComponent];
+    NSString *path = arcConfigPath();
+    if (!path) return;
+    NSString *dir = [path stringByDeletingLastPathComponent];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    [p writeToFile:kPrefPath atomically:YES];
+    [p writeToFile:path atomically:YES];
 }
+
+#if ARC_TROLLSTORE
+void normalizeJudgeThresholds(void) {
+    if (judgeMaxMs < 1) judgeMaxMs = 1;
+    if (judgeMaxMs > 2000) judgeMaxMs = 2000;
+    if (judgePureMs <= judgeMaxMs) judgePureMs = judgeMaxMs + 1;
+    if (judgePureMs > 2000) judgePureMs = 2000;
+    if (judgeFarMs <= judgePureMs) judgeFarMs = judgePureMs + 1;
+    if (judgeFarMs > 2000) judgeFarMs = 2000;
+    if (judgeLostMs <= judgeFarMs) judgeLostMs = judgeFarMs + 1;
+    if (judgeLostMs > 2000) judgeLostMs = 2000;
+}
+
+void applyJudgeThresholds(void) {
+    normalizeJudgeThresholds();
+    if (!judge_window_is_active()) return;
+    if (judge_window_set_thresholds_ms(judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs)) {
+        acc_flog(@"judge thresholds max=%d pure=%d far=%d lost=%d",
+                 judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs);
+    } else {
+        acc_flog(@"judge_window_set_thresholds_ms FAILED");
+    }
+}
+#endif
 
 void loadPref(void) {
     NSMutableDictionary *prefs = loadPrefDict();
@@ -676,7 +645,16 @@ void loadPref(void) {
     rates = (float *)malloc(sizeof(float) * rate_count);
     NSInteger i = 0;
     for (NSString *k in speedKeys) rates[i++] = [prefs[k] floatValue];
+    rate_i = [prefs[@"rateIndex"] integerValue];
     if (rate_i >= rate_count) rate_i = 0;
+
+#if ARC_TROLLSTORE
+    judgeMaxMs  = [prefs[@"judgeMaxMs"] intValue];
+    judgePureMs = [prefs[@"judgePureMs"] intValue];
+    judgeFarMs  = [prefs[@"judgeFarMs"] intValue];
+    judgeLostMs = [prefs[@"judgeLostMs"] intValue];
+    normalizeJudgeThresholds();
+#endif
 
     if (button) [button setHidden:!buttonEnabled];
 }
@@ -753,16 +731,13 @@ void loadPref(void) {
 
 - (void)show {
     UIWindow *w = [self keyWindow];
-    acc_flog(@"show: keyWindow=%p windows.count=%lu", w, (unsigned long)UIApp.windows.count);
     if (!w) {
-        // cocos2d-x 场景下 keyWindow 可能为 nil，手动拉一个
         for (UIWindow *win in UIApp.windows) {
-            acc_flog(@"  win=%p key=%d level=%f hidden=%d", win, win.isKeyWindow, win.windowLevel, win.hidden);
             if (!win.hidden) { w = win; break; }
         }
     }
     if (!w) {
-        acc_flog(@"show: NO USABLE WINDOW, abort");
+        acc_flog(@"show: no window");
         return;
     }
     if (menuView) [menuView removeFromSuperview];
@@ -774,7 +749,6 @@ void loadPref(void) {
     [menuView addGestureRecognizer:tap];
     [w addSubview:menuView];
     [w bringSubviewToFront:menuView];
-    acc_flog(@"show: added menuView to %p, bounds=%@", w, NSStringFromCGRect(w.bounds));
     [self rebuild];
 }
 
@@ -813,26 +787,29 @@ void loadPref(void) {
 
     // 标题
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 24)];
-    title.text = [NSString stringWithFormat:@"Arcaea 变速 (XRC) %@", XRC_TWEAK_VERSION];
+    title.text = [NSString stringWithFormat:@"Arcaea 变速 (XRC) %@ [%@]",
+                  XRC_TWEAK_VERSION, XRC_BUILD_LABEL];
     title.font = [UIFont boldSystemFontOfSize:18];
     title.textColor = [UIColor blackColor];
     [card addSubview:title];
     y += 28;
 
-    // architecture summary line
-    UILabel *warn = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 48)];
-    warn.text = @"音频: FMOD freq | 谱面: GP.update retime | 画面: gettimeofday warp";
-    warn.font = [UIFont systemFontOfSize:10];
-    warn.textColor = [UIColor colorWithRed:0.0 green:0.5 blue:0.2 alpha:1.0];
-    warn.numberOfLines = 0;
-    [card addSubview:warn];
-    y += 52;
+    UILabel *scope = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 44)];
+#if ARC_TROLLSTORE
+    scope.text = @"变速+seek。配置: Documents/xrc-arcdemo.plist";
+#else
+    scope.text = @"谱面+画面变速；BGM 1.0×。配置: Documents/xrc-arcdemo.plist";
+#endif
+    scope.font = [UIFont systemFontOfSize:11];
+    scope.textColor = [UIColor darkGrayColor];
+    scope.numberOfLines = 0;
+    [card addSubview:scope];
+    y += 48;
 
-    // ---- BGM player live controls (only meaningful while playing) ----
     BOOL playerReady = (get_player_or_resolve() != NULL);
 
     UILabel *playerHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    playerHdr.text = playerReady ? @"BGM 控制" : @"BGM (等待中...)";
+    playerHdr.text = playerReady ? @"进度 seek" : @"进度 (等待对局...)";
     playerHdr.font = [UIFont systemFontOfSize:13];
     playerHdr.textColor = [UIColor darkGrayColor];
     [card addSubview:playerHdr];
@@ -860,8 +837,6 @@ void loadPref(void) {
     self.progressLabel = posLbl;
     y += 22;
 
-    // (Pause BGM 控件已移除: setPaused 与 freeze 双重暂停冲突, 实测不可用)
-
     [self.progressTimer invalidate];
     self.progressTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
                                                           target:self
@@ -883,83 +858,40 @@ void loadPref(void) {
     [card addSubview:toastSw];
     y += MAX(28, swSize.height) + 8;
 
-    // ---- hook toggles ----
-    UILabel *clkHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
-    clkHdr.text = @"Hook 状态 (开 = 按倍率 warp)";
-    clkHdr.font = [UIFont systemFontOfSize:11];
-    clkHdr.textColor = [UIColor darkGrayColor];
-    clkHdr.numberOfLines = 0;
-    [card addSubview:clkHdr];
-    y += 36;
+#if ARC_TROLLSTORE
+    UILabel *judgeHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
+    judgeHdr.text = @"判定窗口 ±ms (Max / Pure / Far / Lost)";
+    judgeHdr.font = [UIFont systemFontOfSize:12];
+    judgeHdr.textColor = [UIColor darkGrayColor];
+    judgeHdr.numberOfLines = 2;
+    [card addSubview:judgeHdr];
+    y += 34;
 
-    struct { const char *label; _Atomic(int) *en; _Atomic(uint64_t) *cnt; } clocks[] = {
-        { "gettimeofday (visual)",             &g_tw_en_gtod,           &g_tw_gtod_calls          },
-    };
-    int nClocks = (int)(sizeof(clocks) / sizeof(clocks[0]));
-    for (int i = 0; i < nClocks; i++) {
-        UILabel *nameLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 20)];
-        nameLbl.text = [NSString stringWithFormat:@"%s", clocks[i].label];
-        nameLbl.font = [UIFont systemFontOfSize:12];
-        nameLbl.textColor = [UIColor blackColor];
-        [card addSubview:nameLbl];
+    const char *judgeTags[] = { "Max", "Pure", "Far", "Lost" };
+    int judgeVals[] = { judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs };
+    CGFloat colW = (innerW - 8) / 4.0f;
+    for (int j = 0; j < 4; j++) {
+        CGFloat cx = 12 + colW * j;
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(cx, y, colW - 4, 14)];
+        lbl.text = judgeTags[j];
+        lbl.font = [UIFont systemFontOfSize:10];
+        lbl.textAlignment = NSTextAlignmentCenter;
+        lbl.textColor = [UIColor grayColor];
+        [card addSubview:lbl];
 
-        UILabel *cntLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 18, innerW - 60, 14)];
-        cntLbl.text = [NSString stringWithFormat:@"%llu calls", (unsigned long long)atomic_load(clocks[i].cnt)];
-        cntLbl.font = [UIFont systemFontOfSize:10];
-        cntLbl.textColor = [UIColor grayColor];
-        cntLbl.tag = 3000 + i; // 给 progressTick 用，后续可刷新
-        [card addSubview:cntLbl];
-
-        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-        CGSize sz = sw.bounds.size;
-        sw.frame = CGRectMake(W - 12 - sz.width, y + 4, sz.width, sz.height);
-        sw.on = atomic_load(clocks[i].en) ? YES : NO;
-        sw.tag = 3100 + i;
-        [sw addTarget:self action:@selector(clockToggleChanged:) forControlEvents:UIControlEventValueChanged];
-        [card addSubview:sw];
-
-        y += MAX(36, sz.height) + 4;
+        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(cx, y + 16, colW - 4, 32)];
+        tf.borderStyle = UITextBorderStyleRoundedRect;
+        tf.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
+        tf.textAlignment = NSTextAlignmentCenter;
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+        tf.text = [NSString stringWithFormat:@"%d", judgeVals[j]];
+        tf.tag = 4100 + j;
+        tf.delegate = (id<UITextFieldDelegate>)self;
+        [card addSubview:tf];
     }
+    y += 52;
+#endif
 
-    // GP.update (chart retime) - 只读显示, 始终启用
-    UILabel *gpLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 20)];
-    gpLbl.text = @"GP.update (谱面 retime)";
-    gpLbl.font = [UIFont systemFontOfSize:12];
-    gpLbl.textColor = [UIColor blackColor];
-    [card addSubview:gpLbl];
-    UILabel *gpCnt = [[UILabel alloc] initWithFrame:CGRectMake(12, y + 18, innerW - 60, 14)];
-    gpCnt.text = [NSString stringWithFormat:@"%llu calls", (unsigned long long)atomic_load(&g_tw_gp_update_calls)];
-    gpCnt.font = [UIFont systemFontOfSize:10];
-    gpCnt.textColor = [UIColor grayColor];
-    gpCnt.tag = 3010;
-    [card addSubview:gpCnt];
-    UILabel *gpOn = [[UILabel alloc] initWithFrame:CGRectMake(W - 12 - 40, y + 4, 40, 20)];
-    gpOn.text = @"ON";
-    gpOn.font = [UIFont boldSystemFontOfSize:12];
-    gpOn.textColor = [UIColor colorWithRed:0.2 green:0.7 blue:0.2 alpha:1.0];
-    gpOn.textAlignment = NSTextAlignmentCenter;
-    [card addSubview:gpOn];
-    y += 40;
-
-    // ---- B-1: clock-domain diagnostic panel ----
-    UILabel *diagHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    diagHdr.text = @"时间域 (实时)";
-    diagHdr.font = [UIFont systemFontOfSize:11];
-    diagHdr.textColor = [UIColor darkGrayColor];
-    [card addSubview:diagHdr];
-    y += 22;
-
-    // 5~6 行：real / warp / mach / audio / iscomp [+ optional vt-fail line]
-    UILabel *diagBody = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 108)];
-    diagBody.numberOfLines = 7;
-    diagBody.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
-    diagBody.textColor = [UIColor blackColor];
-    diagBody.text = @"(初始化中...)";
-    diagBody.tag = 3020;
-    [card addSubview:diagBody];
-    y += 114;
-
-    // speeds list
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
     speedHdr.text = @"倍率 (单击=选中, 长按=删除)";
     speedHdr.font = [UIFont systemFontOfSize:12];
@@ -1043,73 +975,6 @@ void loadPref(void) {
                     cs / 60u, cs % 60u, ms,
                     ts / 60u, ts % 60u];
     }
-    _Atomic(uint64_t) *cnts[] = {
-        &g_tw_gtod_calls,
-    };
-    int n = (int)(sizeof(cnts) / sizeof(cnts[0]));
-    UIView *card = [menuView viewWithTag:9001];
-    for (int i = 0; i < n; i++) {
-        UIView *v = [card viewWithTag:(3000 + i)];
-        if ([v isKindOfClass:[UILabel class]]) {
-            ((UILabel *)v).text = [NSString stringWithFormat:@"%llu calls",
-                                   (unsigned long long)atomic_load(cnts[i])];
-        }
-    }
-    // GP.update 计数器
-    UIView *gpv = [card viewWithTag:3010];
-    if ([gpv isKindOfClass:[UILabel class]]) {
-        ((UILabel *)gpv).text = [NSString stringWithFormat:@"%llu calls",
-                                 (unsigned long long)atomic_load(&g_tw_gp_update_calls)];
-    }
-    // B-1: clock-domain diagnostic
-    UIView *diagv = [card viewWithTag:3020];
-    if ([diagv isKindOfClass:[UILabel class]]) {
-        struct timeval tv = {0};
-        uint64_t real_us = 0, warp_us = 0;
-        if (s_orig_gettod && s_orig_gettod(&tv, NULL) == 0)
-            real_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
-        struct timeval tv2 = {0};
-        if (gettimeofday(&tv2, NULL) == 0)
-            warp_us = (uint64_t)tv2.tv_sec * 1000000ULL + (uint64_t)tv2.tv_usec;
-        uint64_t mach_ms = 0;
-        // mach_absolute_time -> ns -> ms
-        static mach_timebase_info_data_t s_tb = {0};
-        if (s_tb.denom == 0) mach_timebase_info(&s_tb);
-        if (s_tb.denom != 0) {
-            mach_ms = (mach_absolute_time() * (uint64_t)s_tb.numer / (uint64_t)s_tb.denom) / 1000000ULL;
-        }
-        uint32_t audio_ms = atomic_load(&g_last_pos_ms);
-        // chart clock display ms (best-effort)
-        int32_t chart_ms = INT_MIN;
-        void *gp = atomic_load(&g_gameplay_instance);
-        if (gp && ptr_plausible(gp) && addr_readable((char *)gp + 936, 8)) {
-            void *logic = *(void **)((char *)gp + 928);
-            if (logic && ptr_plausible(logic) && addr_readable((char *)logic + 56, 8)) {
-                void *clk = *(void **)((char *)logic + 48);
-                if (clk && ptr_plausible(clk) && addr_readable(clk, 64)) {
-                    chart_ms = _read_chart_clock_ms(clk);
-                }
-            }
-        }
-        int32_t freeze_n   = atomic_load(&g_tw_freeze_count);
-        double rate        = tw_get_rate();
-        // wall-warp drift since rate switch (positive: warp ahead of real)
-        int64_t drift_ms = 0;
-        if (real_us && warp_us) drift_ms = ((int64_t)warp_us - (int64_t)real_us) / 1000;
-        ((UILabel *)diagv).text = [NSString stringWithFormat:
-            @"rate %.3fx  freeze=%d\n"
-             "real %llums  warp %llums  drift %lldms\n"
-             "mach %llums  audio %ums  chart %dms\n"
-             "Δ(chart-audio) %dms",
-            rate, freeze_n,
-            (unsigned long long)(real_us / 1000),
-            (unsigned long long)(warp_us / 1000),
-            (long long)drift_ms,
-            (unsigned long long)mach_ms,
-            audio_ms,
-            chart_ms,
-            (int)((int32_t)chart_ms - (int32_t)audio_ms)];
-    }
 }
 
 - (void)toastChanged:(UISwitch *)s {
@@ -1119,37 +984,44 @@ void loadPref(void) {
     loadPref();
 }
 
-- (void)clockToggleChanged:(UISwitch *)sw {
-    int idx = (int)(sw.tag - 3100);
-    _Atomic(int) *flags[] = {
-        &g_tw_en_gtod,
-    };
-    const char *names[] = {
-        "gettimeofday",
-    };
-    int n = (int)(sizeof(flags) / sizeof(flags[0]));
-    if (idx < 0 || idx >= n) return;
-    if (sw.on && !clock_hook_ready_for_idx(idx)) {
-        sw.on = NO;
-        atomic_store(flags[idx], 0);
-        if (toast) {
-        [WHToast showMessage:[NSString stringWithFormat:@"%s not ready", names[idx]]
-                    duration:0.6 finishHandler:^{}];
-        }
-        return;
+#if ARC_TROLLSTORE
+- (void)commitJudgeField:(UITextField *)tf {
+    int v = MAX(0, [tf.text intValue]);
+    switch (tf.tag - 4100) {
+        case 0: judgeMaxMs = v; break;
+        case 1: judgePureMs = v; break;
+        case 2: judgeFarMs = v; break;
+        case 3: judgeLostMs = v; break;
+        default: return;
     }
-    atomic_store(flags[idx], sw.on ? 1 : 0);
+    normalizeJudgeThresholds();
+    tf.text = [NSString stringWithFormat:@"%d",
+               (tf.tag == 4100) ? judgeMaxMs :
+               (tf.tag == 4101) ? judgePureMs :
+               (tf.tag == 4102) ? judgeFarMs : judgeLostMs];
+    NSMutableDictionary *p = loadPrefDict();
+    p[@"judgeMaxMs"]  = @(judgeMaxMs);
+    p[@"judgePureMs"] = @(judgePureMs);
+    p[@"judgeFarMs"]  = @(judgeFarMs);
+    p[@"judgeLostMs"] = @(judgeLostMs);
+    savePrefDict(p);
+    applyJudgeThresholds();
     if (toast) {
-        [WHToast showMessage:[NSString stringWithFormat:@"%s %@", names[idx], sw.on ? @"ON" : @"OFF"]
-                    duration:0.4 finishHandler:^{}];
+        [WHToast showMessage:[NSString stringWithFormat:@"判定 ±%d/%d/%d/%d",
+                              judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs]
+                    duration:0.8 finishHandler:^{}];
     }
 }
+#endif
 
 - (void)rowTapped:(UIButton *)b {
     NSInteger i = b.tag - 1000;
     if (i < 0 || i >= rate_count) return;
     rate_i = i;
     time_warp_set_rate((double)rates[rate_i]);
+    NSMutableDictionary *p = loadPrefDict();
+    p[@"rateIndex"] = @(rate_i);
+    savePrefDict(p);
     if (toast) {
         [WHToast showMessage:[NSString stringWithFormat:@"%.3fx", rates[rate_i]]
                                duration:0.5 finishHandler:^{}];
@@ -1190,6 +1062,12 @@ void loadPref(void) {
 
 // UITextFieldDelegate
 - (void)textFieldDidEndEditing:(UITextField *)tf {
+#if ARC_TROLLSTORE
+    if (tf.tag >= 4100 && tf.tag <= 4103) {
+        [self commitJudgeField:tf];
+        return;
+    }
+#endif
     NSInteger i = tf.tag - 2000;
     if (i < 0 || i >= rate_count) return;
     float v = MAX(0.0f, MIN(100.0f, [tf.text floatValue]));
@@ -1215,8 +1093,10 @@ static void initButton(void) {
         // 单击：切换倍率（低频动作）
         if (rate_count <= 0) return;
         rate_i = (rate_i + 1) % rate_count;
-        // 【修复】time_warp_set_rate现在内部已调用apply_speed_to_all_channels和重置逻辑时钟
         time_warp_set_rate((double)rates[rate_i]);
+        NSMutableDictionary *p = loadPrefDict();
+        p[@"rateIndex"] = @(rate_i);
+        savePrefDict(p);
         if (toast) {
             [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (双击打开菜单)", rates[rate_i]]
                                        duration:0.5 finishHandler:^{}];
@@ -1236,12 +1116,6 @@ static void initButton(void) {
     label.textAlignment = NSTextAlignmentCenter;
     [button addSubview:label];
 
-    // 长按浮窗 开菜单
-    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
-        initWithTarget:[AccMenuController shared] action:@selector(handleLongPress:)];
-    lp.minimumPressDuration = 0.45;
-    [button addGestureRecognizer:lp];
-    // 双击浮窗 开菜单（陪绑）
     UITapGestureRecognizer *dt = [[UITapGestureRecognizer alloc]
         initWithTarget:[AccMenuController shared] action:@selector(handleDoubleTap:)];
     dt.numberOfTapsRequired = 2;
@@ -1255,16 +1129,9 @@ static void initButton(void) {
     if (!buttonEnabled) [button setHidden:YES];
 }
 
-@interface AccMenuController (LongPress) @end
-@implementation AccMenuController (LongPress)
-- (void)handleLongPress:(UILongPressGestureRecognizer *)g {
-    if (g.state == UIGestureRecognizerStateBegan) {
-        acc_flog(@"longPress fired -> show");
-        [self show];
-    }
-}
+@interface AccMenuController (MenuGesture) @end
+@implementation AccMenuController (MenuGesture)
 - (void)handleDoubleTap:(UITapGestureRecognizer *)g {
-    acc_flog(@"doubleTap fired -> show");
     [self show];
 }
 @end
@@ -1303,12 +1170,14 @@ static void doBootstrap(void) {
         @try { install_arc_hooks(); } @catch (NSException *e) { acc_flog(@"install_arc_hooks EX: %@", e); }
         @try { time_warp_install(); } @catch (NSException *e) { acc_flog(@"time_warp_install EX: %@", e); }
         @try { install_vtable_swizzles(); } @catch (NSException *e) { acc_flog(@"install_vtable_swizzles EX: %@", e); }
-        // 0.5s \u8f6e\u8be2: \u68c0\u6d4b\u6362\u6b4c + \u8f93\u51fa\u8bca\u65ad + \u4ece FMOD \u8865\u8db3\u8fdb\u5ea6\u3002\n        // (\u97f3\u9891 hook \u5df2\u53bb\u9664, \u4e0d\u518d\u8c03\u7528 apply_speed_to_all_channels\u3002)
+        if (rate_count > 0)
+            time_warp_set_rate((double)rates[rate_i]);
+        acc_flog(@"config path: %@", arcConfigPath());
+        // 0.5s 轮询: 换曲检测 + 从 FMOD 补足进度条数据
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             void *p = get_player_or_resolve();
             static void *s_last_player = NULL;
             static void *s_last_channels = NULL;
-            static uint64_t s_diag_tick = 0;
             void *channels_base_chk = p ? *(void **)((char *)p + ARC_PLAYER_CHANNELS_OFFSET) : NULL;
             if (p != s_last_player || channels_base_chk != s_last_channels) {
                 atomic_store(&g_song_length_ms, 0);
@@ -1316,15 +1185,7 @@ static void doBootstrap(void) {
                 atomic_store(&g_last_pos_ms, 0);
                 s_last_player = p;
                 s_last_channels = channels_base_chk;
-                acc_flog(@"new song detected: player=%p channels=%p", p, channels_base_chk);
-            }
-            if ((s_diag_tick++ % 10) == 0) {
-                acc_flog(@"twcalls gtod=%llu mtp=%llu gp=%llu rate=%.3f freeze=%d",
-                         (unsigned long long)atomic_load(&g_tw_gtod_calls),
-                         (unsigned long long)atomic_load(&g_tw_mtp_getpos_calls),
-                         (unsigned long long)atomic_load(&g_tw_gp_update_calls),
-                         tw_get_rate(),
-                         atomic_load(&g_tw_freeze_count));
+                acc_flog(@"new song: player=%p", p);
             }
             if (p) try_capture_song_length(p);
             // 兜底维护 last_pos_ms / max_seen_ms（用于进度条显示）

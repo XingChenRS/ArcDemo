@@ -1,7 +1,6 @@
 ﻿#ifdef __OBJC__
 
-// Arcaea 沙箱内 prefs 路径（仅同进程 dylib 访问）
-// NSHomeDirectory() = /var/mobile/Containers/Data/Application/<UUID>/
+// 旧路径 (越狱 tweak 遗留); 新配置见 Documents/xrc-arcdemo.plist
 #define kPrefPath ([NSString stringWithFormat:@"%@/Library/Preferences/moe.low.arc.accdemoarcaea.plist", NSHomeDirectory()])
 
 #if DEBUG

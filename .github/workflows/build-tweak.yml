@@ -1,14 +1,26 @@
-name: Build AccDemoArcaea Dylib
+name: Build AccDemoArcaea
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - variant: sideload
+            arc_trollstore: "0"
+            artifact: libAccDemoArcaea-sideload
+          - variant: trollstore
+            arc_trollstore: "1"
+            artifact: libAccDemoArcaea-trollstore
     env:
       THEOS: ${{ github.workspace }}/theos
+      ARC_TROLLSTORE: ${{ matrix.arc_trollstore }}
+      DYLIB_OUT: libAccDemoArcaea.dylib
 
     steps:
       - name: Checkout
@@ -17,14 +29,10 @@ jobs:
           submodules: recursive
 
       - name: Install build deps
-        run: |
-          brew install ldid xz coreutils
-        shell: bash
+        run: brew install ldid xz coreutils
 
       - name: Clone Theos
-        run: |
-          git clone --recursive https://github.com/theos/theos.git "$THEOS"
-        shell: bash
+        run: git clone --recursive https://github.com/theos/theos.git "$THEOS"
 
       - name: Download iOS SDK 14.5
         run: |
@@ -32,73 +40,32 @@ jobs:
           curl -L -o /tmp/sdks.tar.gz https://github.com/theos/sdks/archive/master.tar.gz
           tar -xzf /tmp/sdks.tar.gz -C /tmp
           mv /tmp/sdks-master/iPhoneOS14.5.sdk "$THEOS/sdks/" || true
-          ls -la "$THEOS/sdks/"
-        shell: bash
 
-      - name: Build Dobby (static, iOS arm64 + arm64e, lipo)
+      - name: Build dylib (${{ matrix.variant }})
         run: |
-          cd "${{ github.workspace }}"
-          git clone --depth 1 https://github.com/jmpews/Dobby.git dobby-src
-          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          for ARCH in arm64 arm64e; do
-            mkdir -p "dobby-src/build-$ARCH"
-            pushd "dobby-src/build-$ARCH" > /dev/null
-            cmake .. \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
-              -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
-              -DCMAKE_SYSTEM_NAME=Darwin \
-              -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-              -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DDOBBY_BUILD_EXAMPLE=OFF \
-              -DDOBBY_BUILD_TEST=OFF
-            make -j$(sysctl -n hw.ncpu) dobby_static
-            popd > /dev/null
-            ls -la "dobby-src/build-$ARCH" | grep -i dobby || true
-          done
-          mkdir -p libs
-          lipo -create \
-            dobby-src/build-arm64/libdobby.a \
-            dobby-src/build-arm64e/libdobby.a \
-            -output libs/libdobby.a
-          lipo -info libs/libdobby.a
-        shell: bash
-
-      - name: Build dylib (theos LIBRARY)
-        run: |
-          cd "${{ github.workspace }}"
           make clean
-          make
-          find .theos -name '*.dylib' -ls
+          make ARC_TROLLSTORE=${ARC_TROLLSTORE}
           mkdir -p out
-          # theos LIBRARY 输出实际在 .theos/obj/debug/AccDemoArcaea.dylib（无 lib 前缀，merged fat）
           DYLIB="$(find .theos/obj -maxdepth 2 -name 'AccDemoArcaea.dylib' -not -path '*.dSYM*' | head -n1)"
           if [ -z "$DYLIB" ]; then echo "AccDemoArcaea.dylib not found"; exit 1; fi
-          cp "$DYLIB" out/libAccDemoArcaea.dylib
-          # 把 CydiaSubstrate 引用替换成 ellekit（sideload 设备没有 substrate）
-          install_name_tool -change \
-            /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
-            @rpath/libellekit.dylib \
-            out/libAccDemoArcaea.dylib
-          # 自身 install_name 也设置成 @rpath
-          install_name_tool -id @rpath/libAccDemoArcaea.dylib out/libAccDemoArcaea.dylib
-          ldid -S out/libAccDemoArcaea.dylib
-          echo "=== otool -L ==="
-          otool -L out/libAccDemoArcaea.dylib
-          file out/libAccDemoArcaea.dylib
-          lipo -info out/libAccDemoArcaea.dylib
-        shell: bash
+          cp "$DYLIB" "out/${DYLIB_OUT}"
+          if [ "${{ matrix.variant }}" = "sideload" ]; then
+            install_name_tool -change \
+              /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
+              @rpath/libellekit.dylib \
+              "out/${DYLIB_OUT}"
+          fi
+          install_name_tool -id @rpath/libAccDemoArcaea.dylib "out/${DYLIB_OUT}"
+          ldid -S "out/${DYLIB_OUT}"
+          otool -L "out/${DYLIB_OUT}"
+          file "out/${DYLIB_OUT}"
+          lipo -info "out/${DYLIB_OUT}"
 
-      - name: Build ellekit (sideload runtime substrate replacement)
+      - name: Build ellekit (sideload only)
+        if: matrix.variant == 'sideload'
         run: |
-          cd "${{ github.workspace }}"
           git clone --depth 1 https://github.com/tealbathingsuit/ellekit.git ek-src
           cd ek-src
-          # 用 xcodebuild 编 iOS framework target，输出 dylib
-          set +e
-          xcodebuild -project ellekit.xcodeproj -list 2>&1 | head -50
-          # 尝试编 ellekit framework target
           xcodebuild \
             -project ellekit.xcodeproj \
             -target ellekit \
@@ -110,31 +77,25 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             IPHONEOS_DEPLOYMENT_TARGET=14.0 \
-            build SYMROOT=$PWD/build 2>&1 | tail -40
-          set -e
-          # 找编出的 dylib（xcodebuild 输出 build/Release-iphoneos/libellekit.dylib）
+            build SYMROOT=$PWD/build 2>&1 | tail -30
           DYLIB=$(find build -name 'libellekit.dylib' -not -path '*.dSYM*' | head -n1)
-          if [ -z "$DYLIB" ]; then
-            DYLIB=$(find build -path '*ellekit.framework/ellekit' | head -n1)
-          fi
-          if [ -z "$DYLIB" ]; then
-            echo "ellekit binary not found"
-            find build -type f | head -50
-            exit 1
-          fi
-          cd "${{ github.workspace }}"
-          cp "ek-src/$DYLIB" out/libellekit.dylib
-          install_name_tool -id @rpath/libellekit.dylib out/libellekit.dylib
-          ldid -S out/libellekit.dylib
-          file out/libellekit.dylib
-          lipo -info out/libellekit.dylib
-        shell: bash
+          if [ -z "$DYLIB" ]; then DYLIB=$(find build -path '*ellekit.framework/ellekit' | head -n1); fi
+          test -n "$DYLIB"
+          cp "$DYLIB" ../out/libellekit.dylib
+          install_name_tool -id @rpath/libellekit.dylib ../out/libellekit.dylib
+          ldid -S ../out/libellekit.dylib
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: libAccDemoArcaea-dylib
-          path: |
-            out/libAccDemoArcaea.dylib
-            out/libellekit.dylib
+          name: ${{ matrix.artifact }}
+          path: out/libAccDemoArcaea.dylib
+          if-no-files-found: error
+
+      - name: Upload ellekit (sideload)
+        if: matrix.variant == 'sideload'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libellekit
+          path: out/libellekit.dylib
           if-no-files-found: error

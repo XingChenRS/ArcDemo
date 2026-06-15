@@ -1,4 +1,4 @@
-// Minimal Dobby header stub for AccDemoArcaea.
+// Minimal Dobby header stub — 仅 TrollStore 分支构建需要; sideload 版不链接 Dobby。
 // Real libdobby.a is downloaded by CI from
 // https://github.com/jmpews/Dobby/releases (or built locally).
 //

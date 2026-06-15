@@ -8,7 +8,87 @@
 
 ---
 
-## 当前状态 (v6.6, 2026-05-12)
+## 当前状态 (v7.2, 2026-06-15)
+
+### v7.2 — 配置持久化 + 判定四档输入框
+
+- 配置迁至 **`Documents/xrc-arcdemo.plist`**，自动从旧 `Library/Preferences/...` 迁移
+- TrollStore：判定 Max/Pure/Far/Lost 四档 **数字输入框**（非滑块），默认 25/50/100/120 ms
+- `rateIndex` 持久化；启动时 `time_warp_set_rate` 与 prefs 同步
+- CI：matrix 双构建；产物文件名统一 **`libAccDemoArcaea.dylib`**，`install_name` `@rpath/libAccDemoArcaea.dylib`（artifact 名区分 sideload/trollstore）
+
+---
+
+## 历史: v7.1.1 (2026-06-15)
+
+**问题**: 原偏移 `0x871070` 等指向 **B.CC/B.HI 分支**, 非 CMP; patch 会破坏分支编码且完全不生效。
+
+**修正** (sub_100870FD0, 6.13.10):
+| 档位 | 分支 A CMP | imm | 分支 B CMP | imm | 有效 ±ms (1.0×) |
+|------|-----------|-----|-----------|-----|----------------|
+| Max  | `0x87106C` | 26 | `0x8710D4` | 25 | **25** |
+| Pure | `0x871074` | 51 | `0x871118` | 50 | **50** |
+| Far  | `0x87107C` | 101 | `0x87115C` | 100 | **100** |
+| Lost | `0x871084` | 121 | `0x871194` | 120 | **120** |
+
+与 ArcCreate `Values` (25/50/100/120) 一致, 非 20/40ms。
+
+**插件**: 安装时校验 `insn & 0xFF800000 == 0x71000000` (CMP Wn,#imm); UI 显示四档 ms。
+
+---
+
+## 历史: v7.1 (2026-06-15)
+
+### v7.1 — TrollStore 构建变体 + 判定窗口缩放
+
+**构建**
+- `make` / `make sideload` → `ARC_TROLLSTORE=0`（免越狱 sideload）
+- `make trollstore` → `ARC_TROLLSTORE=1`（TrollStore，含判定窗口 patch）
+- CI matrix 同时产出 sideload / trollstore artifact；包内 dylib 均为 `libAccDemoArcaea.dylib`
+
+**判定窗口 (仅 TrollStore 构建)**
+- 实现: 运行时 patch `sub_100870FD0` 内 **8 处 CMP imm12**（非 Dobby classifier 全替换）
+- 偏移表: `include/ArcOffsets.h` + [ios-judgement-windows.md](../arcmodwiki/docs/ios-judgement-windows.md)
+- UI: 菜单滑块「判定窗口缩放」0.5×–2.0×，prefs `judgeWindowScale`
+- 需要 TrollStore / dynamic-codesigning 才能 `mprotect` 主二进制 `__TEXT`
+
+**hook 点位速查 (6.13.10)**
+| 符号 | 偏移 | 用途 |
+|------|------|------|
+| `sub_100870FD0` | `0x870FD0` | per-tap classifier（patch 目标函数内 CMP） |
+| CMP 站点 ×8 | `0x871070`…`0x871198` | max-pure/pure/far/lost 阈值 imm12 |
+| `sub_100871514` | `0x871514` | BL 调用 classifier |
+| `sub_100871FE0` | `0x871FE0` | BL 调用 classifier |
+| `sub_1009C6B38` | `0x9C6B38` | score hit commit |
+| `sub_1009C697C` | `0x9C697C` | score lost commit |
+| `sub_100870344` | `0x870344` | lost 自动判定 (+100ms tap) 未纳入滑块 |
+
+---
+
+## 历史: v7.0 (2026-06-15)
+
+### v7.0 — sideload 版精简
+
+在 v6.6「仅变速 + seek」范围上进一步瘦身，对齐产品描述：
+
+**删除**
+- 菜单内 Hook 开关、调用计数、实时时间域诊断面板
+- `g_tw_en_gtod` 等开发向开关与周期性 `twcalls` 日志
+- Dobby 链接（sideload 版未使用 inline hook）
+- 浮动按钮长按开菜单（保留双击）
+- `AccCommon.h` 中 replay / isCompleted 残留声明
+
+**保留**
+- 变速：谱面 retime + 画面 warp（BGM 1.0×）
+- Seek：音频 + 谱面 clock
+- 进度条、倍率列表、toast 开关
+- `acc_flog` → `Documents/xrc-arcdemo.log`
+
+**下一步**: TrollStore 分支 + Dobby inline hook 判定窗口（RE 见 wiki）。
+
+---
+
+## 历史: v6.6 (2026-05-12)
 
 ### v6.6 范围收敛 — 拆掉所有 replay 实验性 hook
 
