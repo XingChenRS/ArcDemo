@@ -1,6 +1,6 @@
 // xrc-arcdemo / Tweak.x
 // Sideload: 变速 + seek | TrollStore (ARC_TROLLSTORE=1): 额外判定窗口缩放
-#define XRC_TWEAK_VERSION  @"v7.2.2"
+#define XRC_TWEAK_VERSION  @"v7.2.3"
 #if ARC_TROLLSTORE
 #  define XRC_BUILD_LABEL    @"TrollStore"
 #else
@@ -180,8 +180,12 @@ static void install_arc_hooks(void) {
 
 #if ARC_TROLLSTORE
     if (judge_window_install(base)) {
-        applyJudgeThresholds();
-        acc_flog(@"judge patch %s", judge_window_install_log());
+        if (applyJudgeThresholds()) {
+            acc_flog(@"judge patch %s", judge_window_install_log());
+        } else {
+            acc_flog(@"judge patch SKIP (in-place write failed): %s",
+                     judge_window_install_log());
+        }
     } else {
         acc_flog(@"judge_window_install FAILED: %s", judge_window_install_log());
     }
