@@ -1,6 +1,6 @@
 // xrc-arcdemo / Tweak.x
 // Sideload: 变速 + seek | TrollStore (ARC_TROLLSTORE=1): 额外判定窗口缩放
-#define XRC_TWEAK_VERSION  @"v7.2"
+#define XRC_TWEAK_VERSION  @"v7.2.1"
 #if ARC_TROLLSTORE
 #  define XRC_BUILD_LABEL    @"TrollStore"
 #else

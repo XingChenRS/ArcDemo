@@ -56,13 +56,43 @@ static bool insn_is_cmp_w_imm(uint32_t insn) {
     return (insn & 0xFF800000u) == 0x71000000u;
 }
 
-static bool page_writable(void *addr) {
-    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0x3FFF;
-    if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0)
+// iOS 16 page size for main binary __TEXT is often 16K (0x4000).
+#define JUDGE_PAGE_SIZE 0x4000u
+#define JUDGE_PAGE_MASK (~(uintptr_t)(JUDGE_PAGE_SIZE - 1))
+
+static uintptr_t page_align(uintptr_t addr) {
+    return addr & JUDGE_PAGE_MASK;
+}
+
+static bool page_make_writable(uintptr_t page) {
+    if (mprotect((void *)page, JUDGE_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) == 0)
         return true;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, 0,
+    // COW 私有副本可写但默认不可执行; patch 后必须 restore_executable
+    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, JUDGE_PAGE_SIZE, 0,
                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     return kr == KERN_SUCCESS;
+}
+
+static void page_restore_executable(uintptr_t page) {
+    if (mprotect((void *)page, JUDGE_PAGE_SIZE, PROT_READ | PROT_EXEC) == 0)
+        return;
+    vm_protect(mach_task_self(), (vm_address_t)page, JUDGE_PAGE_SIZE, 0,
+               VM_PROT_READ | VM_PROT_EXECUTE);
+}
+
+static int collect_unique_pages(uintptr_t *pages, int max_pages) {
+    int n = 0;
+    for (int i = 0; i < ARC_JUDGE_CMP_SITE_COUNT; i++) {
+        if (!s_sites[i].insn) continue;
+        uintptr_t page = page_align((uintptr_t)s_sites[i].insn);
+        bool seen = false;
+        for (int j = 0; j < n; j++) {
+            if (pages[j] == page) { seen = true; break; }
+        }
+        if (!seen && n < max_pages)
+            pages[n++] = page;
+    }
+    return n;
 }
 
 static bool patch_site_imm(int idx, uint32_t imm) {
@@ -72,7 +102,6 @@ static bool patch_site_imm(int idx, uint32_t imm) {
     if (imm < 2) imm = 2;
     if (imm > 0xFFFu) imm = 0xFFFu;
     uint32_t patched = insn_set_imm12(site->orig, imm);
-    if (!page_writable(site->insn)) return false;
     *site->insn = patched;
     return true;
 }
@@ -125,6 +154,13 @@ bool judge_window_set_thresholds_ms(int max_ms, int pure_ms, int far_ms, int los
     s_far_ms = far_ms;
     s_lost_ms = lost_ms;
 
+    uintptr_t pages[4];
+    int page_count = collect_unique_pages(pages, 4);
+    for (int i = 0; i < page_count; i++) {
+        if (!page_make_writable(pages[i]))
+            return false;
+    }
+
     // 分支 A: CMP #imm 为严格上界 (abs(dt) < imm)
     uint32_t a_imms[4] = {
         (uint32_t)max_ms + 1,
@@ -140,11 +176,16 @@ bool judge_window_set_thresholds_ms(int max_ms, int pure_ms, int far_ms, int los
         (uint32_t)lost_ms,
     };
 
+    bool ok = true;
     for (int i = 0; i < 4; i++) {
-        if (!patch_site_imm(i, a_imms[i])) return false;
-        if (!patch_site_imm(i + 4, b_imms[i])) return false;
+        if (!patch_site_imm(i, a_imms[i])) ok = false;
+        if (!patch_site_imm(i + 4, b_imms[i])) ok = false;
     }
-    return true;
+
+    for (int i = 0; i < page_count; i++)
+        page_restore_executable(pages[i]);
+
+    return ok;
 }
 
 bool judge_window_is_active(void) {
