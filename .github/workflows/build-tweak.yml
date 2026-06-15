@@ -49,20 +49,18 @@ jobs:
           DYLIB="$(find .theos/obj -maxdepth 2 -name 'AccDemoArcaea.dylib' -not -path '*.dSYM*' | head -n1)"
           if [ -z "$DYLIB" ]; then echo "AccDemoArcaea.dylib not found"; exit 1; fi
           cp "$DYLIB" "out/${DYLIB_OUT}"
-          if [ "${{ matrix.variant }}" = "sideload" ]; then
-            install_name_tool -change \
-              /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
-              @rpath/libellekit.dylib \
-              "out/${DYLIB_OUT}"
-          fi
+          # 免越狱 / TrollStore 设备无 CydiaSubstrate，统一指向 @rpath/libellekit.dylib
+          install_name_tool -change \
+            /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
+            @rpath/libellekit.dylib \
+            "out/${DYLIB_OUT}"
           install_name_tool -id @rpath/libAccDemoArcaea.dylib "out/${DYLIB_OUT}"
           ldid -S "out/${DYLIB_OUT}"
           otool -L "out/${DYLIB_OUT}"
           file "out/${DYLIB_OUT}"
           lipo -info "out/${DYLIB_OUT}"
 
-      - name: Build ellekit (sideload only)
-        if: matrix.variant == 'sideload'
+      - name: Build ellekit
         run: |
           git clone --depth 1 https://github.com/tealbathingsuit/ellekit.git ek-src
           cd ek-src
@@ -85,17 +83,11 @@ jobs:
           install_name_tool -id @rpath/libellekit.dylib ../out/libellekit.dylib
           ldid -S ../out/libellekit.dylib
 
-      - name: Upload dylib
+      - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: out/libAccDemoArcaea.dylib
-          if-no-files-found: error
-
-      - name: Upload ellekit (sideload)
-        if: matrix.variant == 'sideload'
-        uses: actions/upload-artifact@v4
-        with:
-          name: libellekit
-          path: out/libellekit.dylib
+          path: |
+            out/libAccDemoArcaea.dylib
+            out/libellekit.dylib
           if-no-files-found: error

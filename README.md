@@ -37,6 +37,19 @@ make trollstore   # + 判定窗口自定义
 
 BGM 始终 1.0×。Seek 不重置已判定音符。
 
+## 注入（Sideload / TrollStore 均需）
+
+设备上**没有** `CydiaSubstrate.framework`。必须把 **两个** dylib 放进 `Arc-mobile.app/Frameworks/`：
+
+| 文件 | 说明 |
+|------|------|
+| `libAccDemoArcaea.dylib` | 本 tweak（CI 已把依赖改为 `@rpath/libellekit.dylib`） |
+| `libellekit.dylib` | Substrate 替代，提供 MSHook 符号 |
+
+主二进制需已有 `LC_LOAD_DYLIB @rpath/libAccDemoArcaea.dylib` 与 `LC_RPATH @executable_path/Frameworks`。可用仓库根目录 `inject.py` 一键注入。
+
+CI artifact（sideload / trollstore）内均包含上述两个文件。
+
 ## License
 
 GPL-2.0
