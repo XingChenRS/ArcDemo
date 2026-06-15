@@ -44,7 +44,7 @@ void time_warp_set_rate(double rate);
 
 #if ARC_TROLLSTORE
 void normalizeJudgeThresholds(void);
-void applyJudgeThresholds(void);
+bool applyJudgeThresholds(void);
 #endif
 
 @class WQSuspendView;

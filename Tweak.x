@@ -1,6 +1,6 @@
 // xrc-arcdemo / Tweak.x
 // Sideload: 变速 + seek | TrollStore (ARC_TROLLSTORE=1): 额外判定窗口缩放
-#define XRC_TWEAK_VERSION  @"v7.2.3"
+#define XRC_TWEAK_VERSION  @"v7.2.4"
 #if ARC_TROLLSTORE
 #  define XRC_BUILD_LABEL    @"TrollStore"
 #else
@@ -34,7 +34,7 @@ extern UIApplication *UIApp;
 #include "ArcOffsets.h"
 #if ARC_TROLLSTORE
 #  import "JudgeWindow.h"
-void applyJudgeThresholds(void);
+bool applyJudgeThresholds(void);
 void normalizeJudgeThresholds(void);
 #endif
 
@@ -628,15 +628,16 @@ void normalizeJudgeThresholds(void) {
     if (judgeLostMs > 2000) judgeLostMs = 2000;
 }
 
-void applyJudgeThresholds(void) {
+bool applyJudgeThresholds(void) {
     normalizeJudgeThresholds();
-    if (!judge_window_is_active()) return;
+    if (!judge_window_is_active()) return false;
     if (judge_window_set_thresholds_ms(judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs)) {
         acc_flog(@"judge thresholds max=%d pure=%d far=%d lost=%d",
                  judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs);
-    } else {
-        acc_flog(@"judge_window_set_thresholds_ms FAILED");
+        return true;
     }
+    acc_flog(@"judge_window_set_thresholds_ms FAILED");
+    return false;
 }
 #endif
 

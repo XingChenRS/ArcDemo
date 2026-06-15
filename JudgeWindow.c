@@ -1,4 +1,5 @@
-// JudgeWindow.c — TrollStore: in-place patch sub_100870FD0 CMP imm12 (no COW)
+// JudgeWindow.c — TrollStore: patch sub_100870FD0 CMP imm12 via vm_remap mirror
+// Ref: geode-sdk/ios-launcher (vm_remap → write mirror → icache invalidate original)
 
 #include "JudgeWindow.h"
 #include "ArcOffsets.h"
@@ -39,54 +40,14 @@ static int s_pure_ms = 50;
 static int s_far_ms = 100;
 static int s_lost_ms = 120;
 static bool s_ready = false;
-static bool s_inplace_ok = false;
+static bool s_mirror_ok = false;
 static char s_install_log[512];
 
 #define JUDGE_PAGE_SIZE 0x4000u
-#define JUDGE_PAGE_MASK (~(uintptr_t)(JUDGE_PAGE_SIZE - 1))
+#define JUDGE_PAGE_MASK (JUDGE_PAGE_SIZE - 1u)
 
 const char *judge_window_install_log(void) {
     return s_install_log;
-}
-
-static uintptr_t page_align(uintptr_t addr) {
-    return addr & JUDGE_PAGE_MASK;
-}
-
-// TrollStore: 原地 RWX，禁止 VM_PROT_COPY（COW 页在 iOS16 上取指会 SIGBUS）
-static bool page_unlock_inplace(uintptr_t page) {
-    if (mprotect((void *)page, JUDGE_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC) == 0)
-        return true;
-    kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, JUDGE_PAGE_SIZE, 0,
-                                 VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    return kr == KERN_SUCCESS;
-}
-
-static void page_lock_exec(uintptr_t page) {
-    if (mprotect((void *)page, JUDGE_PAGE_SIZE, PROT_READ | PROT_EXEC) == 0)
-        return;
-    vm_protect(mach_task_self(), (vm_address_t)page, JUDGE_PAGE_SIZE, 0,
-               VM_PROT_READ | VM_PROT_EXECUTE);
-}
-
-static int collect_unique_pages(uintptr_t *pages, int max_pages) {
-    int n = 0;
-    for (int i = 0; i < ARC_JUDGE_CMP_SITE_COUNT; i++) {
-        if (!s_sites[i].insn) continue;
-        uintptr_t page = page_align((uintptr_t)s_sites[i].insn);
-        bool seen = false;
-        for (int j = 0; j < n; j++) {
-            if (pages[j] == page) { seen = true; break; }
-        }
-        if (!seen && n < max_pages)
-            pages[n++] = page;
-    }
-    return n;
-}
-
-static void flush_insn_range(uintptr_t lo, uintptr_t hi) {
-    if (lo < hi)
-        sys_icache_invalidate((void *)lo, hi - lo);
 }
 
 static uint32_t insn_set_imm12(uint32_t insn, uint32_t imm12) {
@@ -97,16 +58,36 @@ static bool insn_is_cmp_w_imm(uint32_t insn) {
     return (insn & 0xFF800000u) == 0x71000000u;
 }
 
-static bool probe_inplace_write(void) {
+// vm_remap 镜像写入 + 对原始取指地址刷 icache（避免 COW 页 SIGBUS）
+static bool patch_u32_mirror(uint32_t *target, uint32_t value) {
+    const vm_size_t size = (vm_size_t)sizeof(uint32_t);
+    vm_address_t mirror = 0;
+    vm_prot_t cur_prot, max_prot;
+    kern_return_t kr = vm_remap(mach_task_self(), &mirror, size, 0, VM_FLAGS_ANYWHERE,
+                                mach_task_self(), (vm_address_t)target, FALSE,
+                                &cur_prot, &max_prot, VM_INHERIT_SHARE);
+    if (kr != KERN_SUCCESS)
+        return false;
+
+    vm_address_t writable = mirror + ((vm_address_t)target & JUDGE_PAGE_MASK);
+    kr = vm_protect(mach_task_self(), writable, size, 0, VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        vm_deallocate(mach_task_self(), mirror, size);
+        return false;
+    }
+
+    *(uint32_t *)writable = value;
+    sys_icache_invalidate(target, size);
+    vm_deallocate(mach_task_self(), mirror, size);
+    return true;
+}
+
+static bool probe_mirror_write(void) {
     if (!s_sites[0].insn) return false;
-    uintptr_t page = page_align((uintptr_t)s_sites[0].insn);
-    if (!page_unlock_inplace(page)) return false;
-    uint32_t *p = s_sites[0].insn;
-    uint32_t saved = *p;
-    *p = saved;
-    flush_insn_range((uintptr_t)p, (uintptr_t)p + sizeof(uint32_t));
-    page_lock_exec(page);
-    return insn_is_cmp_w_imm(*p);
+    uint32_t saved = *s_sites[0].insn;
+    if (!patch_u32_mirror(s_sites[0].insn, saved))
+        return false;
+    return insn_is_cmp_w_imm(*s_sites[0].insn);
 }
 
 static bool patch_site_imm(int idx, uint32_t imm) {
@@ -116,7 +97,8 @@ static bool patch_site_imm(int idx, uint32_t imm) {
     if (imm < 2) imm = 2;
     if (imm > 0xFFFu) imm = 0xFFFu;
     uint32_t patched = insn_set_imm12(site->orig, imm);
-    *site->insn = patched;
+    if (!patch_u32_mirror(site->insn, patched))
+        return false;
     site->orig = patched;
     return true;
 }
@@ -136,7 +118,7 @@ bool judge_window_install(uint64_t image_base) {
     if (!image_base) return false;
     memset(s_sites, 0, sizeof(s_sites));
     s_install_log[0] = '\0';
-    s_inplace_ok = false;
+    s_mirror_ok = false;
     int ok = 0;
 
     for (int i = 0; i < ARC_JUDGE_CMP_SITE_COUNT; i++) {
@@ -154,45 +136,30 @@ bool judge_window_install(uint64_t image_base) {
     }
 
     if (ok >= 6) {
-        s_inplace_ok = probe_inplace_write();
-        if (!s_inplace_ok)
+        s_mirror_ok = probe_mirror_write();
+        if (!s_mirror_ok)
             snprintf(s_install_log + strlen(s_install_log),
                      sizeof(s_install_log) - strlen(s_install_log),
-                     " inplace_fail; ");
+                     " mirror_fail; ");
     }
 
     snprintf(s_install_log + strlen(s_install_log),
              sizeof(s_install_log) - strlen(s_install_log),
-             "cmp_ok=%d/%d inplace=%s", ok, ARC_JUDGE_CMP_SITE_COUNT,
-             s_inplace_ok ? "yes" : "no");
+             "cmp_ok=%d/%d mirror=%s", ok, ARC_JUDGE_CMP_SITE_COUNT,
+             s_mirror_ok ? "yes" : "no");
 
-    s_ready = (ok >= 6) && s_inplace_ok;
+    s_ready = (ok >= 6) && s_mirror_ok;
     return s_ready;
 }
 
 bool judge_window_set_thresholds_ms(int max_ms, int pure_ms, int far_ms, int lost_ms) {
-    if (!s_ready || !s_inplace_ok) return false;
+    if (!s_ready || !s_mirror_ok) return false;
 
     normalize_thresholds(&max_ms, &pure_ms, &far_ms, &lost_ms);
     s_max_ms = max_ms;
     s_pure_ms = pure_ms;
     s_far_ms = far_ms;
     s_lost_ms = lost_ms;
-
-    uintptr_t pages[4];
-    int page_count = collect_unique_pages(pages, 4);
-    for (int i = 0; i < page_count; i++) {
-        if (!page_unlock_inplace(pages[i]))
-            return false;
-    }
-
-    uintptr_t lo = UINTPTR_MAX, hi = 0;
-    for (int i = 0; i < ARC_JUDGE_CMP_SITE_COUNT; i++) {
-        if (!s_sites[i].insn) continue;
-        uintptr_t a = (uintptr_t)s_sites[i].insn;
-        if (a < lo) lo = a;
-        if (a + sizeof(uint32_t) > hi) hi = a + sizeof(uint32_t);
-    }
 
     uint32_t a_imms[4] = {
         (uint32_t)max_ms + 1,
@@ -212,11 +179,6 @@ bool judge_window_set_thresholds_ms(int max_ms, int pure_ms, int far_ms, int los
         if (!patch_site_imm(i, a_imms[i])) ok = false;
         if (!patch_site_imm(i + 4, b_imms[i])) ok = false;
     }
-
-    flush_insn_range(lo, hi);
-    for (int i = 0; i < page_count; i++)
-        page_lock_exec(pages[i]);
-
     return ok;
 }
 
