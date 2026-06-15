@@ -34,6 +34,8 @@ extern UIApplication *UIApp;
 #include "ArcOffsets.h"
 #if ARC_TROLLSTORE
 #  import "JudgeWindow.h"
+void applyJudgeThresholds(void);
+void normalizeJudgeThresholds(void);
 #endif
 
 void acc_flog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -581,10 +583,10 @@ static void ensurePrefDefaults(NSMutableDictionary *p) {
         float sc = [p[@"judgeWindowScale"] floatValue];
         if (sc < 0.25f) sc = 0.25f;
         if (sc > 4.0f) sc = 4.0f;
-        p[@"judgeMaxMs"]  = @(int)lround(25.0f * sc);
-        p[@"judgePureMs"] = @(int)lround(50.0f * sc);
-        p[@"judgeFarMs"]  = @(int)lround(100.0f * sc);
-        p[@"judgeLostMs"] = @(int)lround(120.0f * sc);
+        p[@"judgeMaxMs"]  = @((int)lround(25.0f * sc));
+        p[@"judgePureMs"] = @((int)lround(50.0f * sc));
+        p[@"judgeFarMs"]  = @((int)lround(100.0f * sc));
+        p[@"judgeLostMs"] = @((int)lround(120.0f * sc));
     }
     if (!p[@"judgeMaxMs"])  p[@"judgeMaxMs"]  = @25;
     if (!p[@"judgePureMs"]) p[@"judgePureMs"] = @50;
@@ -873,7 +875,7 @@ void loadPref(void) {
     for (int j = 0; j < 4; j++) {
         CGFloat cx = 12 + colW * j;
         UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(cx, y, colW - 4, 14)];
-        lbl.text = judgeTags[j];
+        lbl.text = @(judgeTags[j]);
         lbl.font = [UIFont systemFontOfSize:10];
         lbl.textAlignment = NSTextAlignmentCenter;
         lbl.textColor = [UIColor grayColor];
