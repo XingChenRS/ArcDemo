@@ -181,13 +181,13 @@ static void install_arc_hooks(void) {
 #if ARC_TROLLSTORE
     if (judge_window_install(base)) {
         if (applyJudgeThresholds()) {
-            acc_flog(@"judge patch %s", judge_window_install_log());
+            acc_flog(@"judge graft %s", judge_window_install_log());
         } else {
-            acc_flog(@"judge patch SKIP (in-place write failed): %s",
+            acc_flog(@"judge graft OK but thresholds apply failed: %s",
                      judge_window_install_log());
         }
     } else {
-        acc_flog(@"judge_window_install FAILED: %s (变速/seek 仍可用)",
+        acc_flog(@"judge_window_install FAILED: %s (需 inject+graft_hook+签名; 变速/seek 仍可用)",
                      judge_window_install_log());
     }
 #endif

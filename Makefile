@@ -2,7 +2,7 @@
 ARCHS = arm64 arm64e
 
 # 构建变体: make          → Sideload (默认)
-#           make trollstore → TrollStore (+ 判定窗口 __TEXT patch)
+#           make trollstore → TrollStore (+ graft slot 判定 classifier 替换)
 ARC_TROLLSTORE ?= 0
 
 LIBRARY_NAME = AccDemoArcaea

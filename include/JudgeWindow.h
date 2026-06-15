@@ -9,3 +9,4 @@ bool judge_window_is_active(void);
 const char *judge_window_install_log(void);
 
 void judge_window_get_thresholds_ms(int *max_ms, int *pure_ms, int *far_ms, int *lost_ms);
+void judge_window_uninstall(void);

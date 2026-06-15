@@ -20,7 +20,11 @@
 #define ARC_OFF_JUDGE_CALLER_A     (0x871514ULL)
 #define ARC_OFF_JUDGE_CALLER_B     (0x871FE0ULL)
 
-// 八个 CMP Wn,#imm 站点 (IDA 6.13.10 已核对; 非紧随其后的 B.CC/B.HI)
+// graft_hook.py 写入：__text 末尾 tramp + __bss 槽位（运行时 dylib 写指针）
+#define ARC_OFF_JUDGE_TRAMP        (0x1039500ULL)
+#define ARC_OFF_HOOK_SLOT          (0x149AC00ULL)
+
+// 八个 CMP 站点 — 仅 RE 参考 / 静态 patch_judge_static.py；graft 方案不再 runtime patch
 // 默认 imm → 有效窗口 (与 ArcCreate Values 一致):
 //   Max ±25ms  | Pure ±50ms | Far ±100ms | Lost ±120ms
 // 分支 A (clock+45==1): CMP #26/51/101/121 + B.CC/B.CS
