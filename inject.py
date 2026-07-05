@@ -1,5 +1,5 @@
 """
-Inject libAccDemoArcaea.dylib + libellekit.dylib into Arc-mobile.app.
+Inject libArcDemo.dylib + libellekit.dylib into Arc-mobile.app.
 
 This script only copies dylibs and inserts LC_LOAD_DYLIB / LC_RPATH into the
 existing load-command padding. It intentionally does not graft, reserve slots,
@@ -14,8 +14,8 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(ROOT, "ios", "Payload", "Arc-mobile.app")
 MAIN = os.path.join(APP, "Arc-mobile")
 FW_DIR = os.path.join(APP, "Frameworks")
-DYLIB_NAMES = ["libAccDemoArcaea.dylib", "libellekit.dylib"]
-INJECT_NAME = "@rpath/libAccDemoArcaea.dylib"
+DYLIB_NAMES = ["libArcDemo.dylib", "libellekit.dylib"]
+INJECT_NAME = "@rpath/libArcDemo.dylib"
 
 LC_LOAD_DYLIB = 0x8000000C
 LC_RPATH = 0x8000001C
@@ -146,7 +146,7 @@ def insert_load_commands_inplace(data: bytearray, base: int) -> list[str]:
 
 
 def find_dylibs() -> list[str]:
-    candidates = [ROOT, os.path.join(ROOT, "ci-artifacts", "libAccDemoArcaea-sideload")]
+    candidates = [ROOT, os.path.join(ROOT, "ci-artifacts", "libArcDemo-sideload")]
     found = []
     for name in DYLIB_NAMES:
         path = None
@@ -200,7 +200,7 @@ def main():
     print(f"[+] wrote {MAIN}")
     print(f"[i] size={size} (slice_end={sl_end})")
     if size < sl_end - 1000:
-        print("[!] WARNING: file smaller than slice — possible corruption")
+        print("[!] WARNING: file smaller than slice - possible corruption")
         sys.exit(1)
 
 

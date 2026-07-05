@@ -3,19 +3,19 @@ ARCHS = arm64 arm64e
 
 # Active build: sideload dylib only. Prior privileged-install and main-binary
 # surgery experiments are not part of the maintained build path.
-LIBRARY_NAME = AccDemoArcaea
+LIBRARY_NAME = ArcDemo
 
-AccDemoArcaea_FILES = Tweak.x
-AccDemoArcaea_FILES += fishhook.c
-AccDemoArcaea_FILES += WQSuspendView/SuspendView/SuspendView/WQSuspendView.m
-AccDemoArcaea_FILES += $(wildcard WHToast/WHToast/*.m)
+ArcDemo_FILES = Tweak.x
+ArcDemo_FILES += fishhook.c
+ArcDemo_FILES += WQSuspendView/SuspendView/SuspendView/WQSuspendView.m
+ArcDemo_FILES += $(wildcard WHToast/WHToast/*.m)
 
-AccDemoArcaea_CFLAGS  += -fobjc-arc
-AccDemoArcaea_CFLAGS += -I./WQSuspendView/SuspendView -I./WHToast -I./include
+ArcDemo_CFLAGS  += -fobjc-arc
+ArcDemo_CFLAGS += -I./WQSuspendView/SuspendView -I./WHToast -I./include
 
-AccDemoArcaea_LIBRARIES = substrate
-AccDemoArcaea_LOGOSFLAGS = -c generator=MobileSubstrate
-AccDemoArcaea_LDFLAGS = -Xlinker -not_for_dyld_shared_cache
+ArcDemo_LIBRARIES = substrate
+ArcDemo_LOGOSFLAGS = -c generator=MobileSubstrate
+ArcDemo_LDFLAGS = -Xlinker -not_for_dyld_shared_cache
 
 ADDITIONAL_CFLAGS += -Wno-error=unused-variable -Wno-error=unused-function
 ADDITIONAL_CFLAGS += -Wno-error=deprecated-declarations

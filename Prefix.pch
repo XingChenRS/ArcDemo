@@ -1,7 +1,7 @@
-﻿#ifdef __OBJC__
+#ifdef __OBJC__
 
-// 旧路径 (越狱 tweak 遗留); 新配置见 Documents/xrc-arcdemo.plist
-#define kPrefPath ([NSString stringWithFormat:@"%@/Library/Preferences/moe.low.arc.accdemoarcaea.plist", NSHomeDirectory()])
+// Legacy jailbreak preference path; active config lives in Documents/xrc-arcdemo.plist.
+#define kPrefPath ([NSString stringWithFormat:@"%@/Library/Preferences/moe.low.arc.arcdemo.plist", NSHomeDirectory()])
 
 #if DEBUG
 #else

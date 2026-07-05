@@ -61,16 +61,12 @@ static get_current_sound_fn g_get_current_sound = NULL;
 static get_sound_length_fn  g_get_sound_length = NULL;
 static ch_get_position_fn   g_ch_get_position = NULL;
 
-// hook 鍏滃簳鎹曡幏 + 涓诲姩閫氳繃 registry 鑾峰彇
 static _Atomic(void *)   g_bgmPlayer = NULL;
 _Atomic(uint32_t) g_last_pos_ms = 0;
 static _Atomic(uint32_t) g_max_seen_ms = 0;
-static _Atomic(uint32_t) g_song_length_ms = 0;   // FMOD 鎷垮埌鐨勭湡瀹炴€绘椂闀?
+static _Atomic(uint32_t) g_song_length_ms = 0;
 
-// 闊抽鍙橀€熷凡绉婚櫎 (v6.4+): BGM 濮嬬粓 1.0脳; 浠呰氨闈?clock + 鐢婚潰 warp 鎸夊€嶇巼鍙樺寲銆?
-// MTP getPos vtable swizzle 浠呯敤浜庢崟鑾?player 涓庤繘搴﹁鍙栥€?
 
-// 灏濊瘯浠?player 涓昏建鎷?Sound 鎬婚暱
 static void try_capture_song_length(void *player) {
     if (!player || !g_get_current_sound || !g_get_sound_length) return;
     if (atomic_load(&g_song_length_ms) != 0) return;
@@ -86,7 +82,6 @@ static void try_capture_song_length(void *player) {
     }
 }
 
-// 涓诲姩閫氳繃 registry 鎷?MTP锛堜笉闇€瑕佺瓑 hook 瑙﹀彂锛?
 static void *resolve_player_via_registry(void) {
     if (!g_get_registry) return NULL;
     void *reg = g_get_registry();
@@ -102,7 +97,6 @@ void *get_player_or_resolve(void) {
     return resolve_player_via_registry();
 }
 
-// 闃叉璇诲埌閲庢寚閽堬細鍏堝仛鐢ㄦ埛鎬佸湴鍧€绮楃瓫銆?
 bool ptr_plausible(const void *p) {
     uintptr_t v = (uintptr_t)p;
     if (v < 0x100000000ULL) return false;
@@ -116,13 +110,10 @@ bool addr_readable(const void *p, size_t len) {
     uintptr_t start_u = (uintptr_t)p;
     uintptr_t end_u = start_u + len;
     if (end_u < start_u) return false;
-    // 鍚彂寮忎笂闄愶細鎷掔粷瓒呭ぇ璺ㄥ害璁块棶锛岄伩鍏嶉噹 end 鎸囬拡瀵艰嚧鍚庣画瓒婄晫銆?
     if (len > (1ULL << 20)) return false;
-    // 杩欓噷涓嶅啀璋冪敤 vm_region_recurse锛堥儴鍒?Theos/SDK 缁勫悎涓嬭绗﹀彿缂哄け瀵艰嚧閾炬帴澶辫触锛夈€?
     return true;
 }
 
-// 鍙?Arc-mobile 涓诲彲鎵ц浣撳熀鍧€锛堟帓闄?Frameworks 鍐?dylib锛?
 uint64_t arc_image_base(void) {
     static uint64_t cached = 0;
     if (cached) return cached;
@@ -164,7 +155,6 @@ static void install_arc_hooks(void) {
 
 }
 
-// 閫氳繃 player vtable 璋冪敤瀵瑰簲妲戒綅
 static inline void *_player_vt_slot(void *self, size_t byte_off) {
     if (!self) return NULL;
     void **vtable = *(void ***)self;
@@ -174,9 +164,6 @@ static inline void *_player_vt_slot(void *self, size_t byte_off) {
 
 #pragma mark - Time Warp (gettimeofday fishhook for CCDirector visual speed)
 
-// gettimeofday fishhook: CCDirector 鐢ㄥ畠璁＄畻甯ч棿 delta, warp 鍚庤瑙夊姩鐢绘寜 rate 鎾斁
-// 鍏紡: t_warp(real) = t0_warp + (real - t0_real) * rate
-// 鍒囧€嶇巼鐬棿: t0_real = real_now; t0_warp = warp_now (淇濇寔杩炵画, 涓嶈烦鍙?
 
 typedef int (*orig_gettod_t)(struct timeval *tv, void *tz);
 orig_gettod_t s_orig_gettod = NULL;
@@ -185,7 +172,6 @@ static _Atomic(uint64_t) g_tw_t0_real_us   = 0;
 static _Atomic(uint64_t) g_tw_t0_warp_us   = 0;
 static _Atomic(uint32_t) g_tw_rate_x1000   = 1000;
 
-// 鍐荤粨鏈哄埗: 鏆傚仠 / 鍒囧悗鍙?/ seek 鏃跺喕缁?warp 鏃堕棿
 _Atomic(int32_t)  g_tw_freeze_count = 0;
 static _Atomic(uint64_t) g_tw_frozen_us    = 0;
 
@@ -224,7 +210,7 @@ static int tw_gettimeofday(struct timeval *tv, void *tz) {
 
 
 
-#pragma mark - vtable swizzle (鏍稿績 Hook)
+#pragma mark - vtable swizzle
 
 typedef uint32_t (*orig_mtp_getpos_fn)(void *self, int channel);
 typedef int64_t (*orig_gp_update_fn)(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5);
@@ -234,7 +220,6 @@ static orig_gp_update_fn s_orig_gp_update = NULL;
 
 _Atomic(void *) g_gameplay_instance = NULL;
 
-// retime 鐘舵€? 璁板綍涓婁竴甯х殑鐪熷疄鏃堕棿鍜?clock 鎸囬拡, 鐢ㄤ簬璁＄畻甯ч棿 delta
 static void *s_gp_last_clock = NULL;
 static uint64_t s_gp_last_real_us = 0;
 static uint32_t tw_mtp_getpos(void *self, int channel) {
@@ -252,7 +237,6 @@ static uint32_t tw_mtp_getpos(void *self, int channel) {
     return raw;
 }
 
-// 鍙栨湭琚?warp 鐨勭湡瀹?microsecond 鏃堕棿 (鐢ㄤ簬 retime delta 璁＄畻)
 static uint64_t _real_now_us_unwarped(void) {
     struct timeval tv = {0};
     if (s_orig_gettod) {
@@ -302,10 +286,8 @@ static void _gp_retime_logic_clock(void *logic) {
     *start_ms = (int32_t)after;
 }
 
-// Gameplay.update: 缂撳瓨 GP 瀹炰緥 + 璋遍潰 clock retime
 static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
     if (self) {
-        // 缂撳瓨 Gameplay 瀹炰緥鎸囬拡 (player_seek_ms 闇€瑕佽闂?logic clock)
         atomic_store(&g_gameplay_instance, self);
         void *logic = NULL;
         if (addr_readable((char *)self + 936, sizeof(void *)))
@@ -317,8 +299,6 @@ static int64_t tw_gp_update(void *self, uint64_t a2, uint64_t a3, uint64_t a4, u
 }
 
 
-// 鍦?vtable 鍖哄煙 卤64 slots 鑼冨洿鍐呮壂鎻?鎵惧埌鍖归厤 orig_fn 鐨?slot 骞舵浛鎹负 new_fn銆?
-// 杩斿洖鎵惧埌鐨?slot index (鐩稿 vtable 璧峰,鍙兘璐熸暟),澶辫触杩斿洖 INT_MIN銆?
 static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
                                      void *new_fn, void **out_orig)
 {
@@ -335,21 +315,18 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
     for (int i = -4; i < 64; i++) {
         void *cur = vt[i];
         if (!cur) continue;
-        // PAC strip (arm64e instruction key A);arm64 涓婃槸 noop
 #if __has_feature(ptrauth_calls)
         void *stripped = ptrauth_strip(cur, ptrauth_key_asia);
 #else
         void *stripped = cur;
 #endif
         if ((uint64_t)stripped != target) continue;
-        // 鎵惧埌浜嗐€俶protect 鏁?16K 椤?RW (iOS 16 __DATA_CONST 鍙兘 deny 鈫?閫€鍖?vm_protect+COPY)
         uintptr_t page = (uintptr_t)&vt[i] & ~(uintptr_t)0x3FFF;
         bool wrote = false;
         if (mprotect((void *)page, 0x4000, PROT_READ | PROT_WRITE) == 0) {
             wrote = true;
         } else {
             int e1 = errno;
-            // 澶囩敤:vm_protect with VM_PROT_COPY (fishhook 鍚屾)
             kern_return_t kr = vm_protect(mach_task_self(), (vm_address_t)page, 0x4000,
                                           0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
             if (kr == KERN_SUCCESS) {
@@ -360,10 +337,8 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
             }
         }
         if (!wrote) return INT_MIN;
-        if (out_orig) *out_orig = stripped;  // 瑁稿湴鍧€,鍙洿鎺ヨ皟鐢?
+        if (out_orig) *out_orig = stripped;
 #if __has_feature(ptrauth_calls)
-        // arm64e: 鐢ㄧ浉鍚?slot 鍦板潃浣滀负 discriminator blend 閲嶆柊绛惧悕
-        // 娉ㄦ剰:C++ vtable 鐪熷疄 discriminator 鍦ㄧ紪璇戞湡 hash 鍐冲畾,杩欓噷鍙槸灏藉姏鑰屼负
         void *signed_new = ptrauth_sign_unauthenticated(new_fn,
                               ptrauth_key_asia,
                               ptrauth_blend_discriminator(&vt[i], 0));
@@ -371,7 +346,6 @@ static int swizzle_vtable_find_swap(uint64_t vtable_addr, uint64_t orig_fn_off,
 #else
         vt[i] = new_fn;
 #endif
-        // 涓嶈兘 PROT_EXEC, __DATA_CONST 涓嶅厑璁? 鎭㈠ RO (灏藉姏鑰屼负,澶辫触涔熸棤鎵€璋?
         mprotect((void *)page, 0x4000, PROT_READ);
         acc_flog(@"swizzle OK: vtable=%p slot[%d] orig=%p -> new=%p",
                  (void *)vtable_addr, i, stripped, new_fn);
@@ -387,13 +361,8 @@ static void install_vtable_swizzles(void) {
     dispatch_once(&once, ^{
         uint64_t base = arc_image_base();
         if (!base) { acc_flog(@"swizzle: no image base"); return; }
-        // 1) MTP::getPositionMs vtable swap: 浠呯敤浜庤褰撳墠鎾斁浣嶇疆 (杩涘害鏉?
-        //    + seek 鍙嶉), 涓嶅彉閫熴€?
         swizzle_vtable_find_swap(base + ARC_OFF_MTP_VTABLE, ARC_OFF_MTP_GETPOS,
                                  (void *)tw_mtp_getpos, (void **)&s_orig_mtp_getpos);
-        // 2) Gameplay::update vtable swap: 姣忓抚鎷︽埅浠?
-        //    a) 缂撳瓨 Gameplay 瀹炰緥 (渚?player_seek_ms 璁块棶 logic clock)
-        //    b) 璋冪敤 _gp_retime_logic_clock(logic) 瀹炵幇璋遍潰鍙橀€?
         int gp_slot = swizzle_vtable_find_swap(base + ARC_OFF_GP_VTABLE, ARC_OFF_GP_UPDATE_FN,
                                                (void *)tw_gp_update, (void **)&s_orig_gp_update);
         if (gp_slot != INT_MIN && s_orig_gp_update)
@@ -457,8 +426,6 @@ static void time_warp_install(void) {
     });
 }
 
-// 璇诲彇璋遍潰鏃堕挓鐨勫綋鍓嶆樉绀?ms锛堝鍒?sub_10086E69C 閫昏緫锛?
-// 鏃堕挓缁撴瀯: clock[32]=绱鏃堕棿, clock[40]=鍩哄噯鍋忕Щ, clock[45]=鍐呴儴椹卞姩鏍囧織, clock[52]=澶栭儴浣嶇疆
 static int32_t _read_chart_clock_ms(void *clk) {
     if (!clk || !ptr_plausible(clk) || !addr_readable(clk, 64)) return -1;
     if (*(uint8_t *)((char *)clk + 45) & 1)
@@ -474,7 +441,6 @@ void player_seek_ms(uint32_t ms) {
 
     time_warp_freeze_inc();
 
-    // 1. 闊抽璺宠浆锛歁TP::seekTo(this, ms, channel=0)
     typedef void (*seek_fn)(void *, uint32_t, int);
     seek_fn fn = (seek_fn)_player_vt_slot(self, 0x40);
     if (fn) {
@@ -482,10 +448,6 @@ void player_seek_ms(uint32_t ms) {
         acc_flog(@"[seek] audio seek to %u ms", ms);
     }
 
-    // 2. 璋遍潰鏃堕挓璺宠浆锛氫慨鏀?clock[40] 浣垮緱 display_time = target_ms
-    //    Gameplay(+928) 鈫?LogicChart(+48) 鈫?Clock
-    //    display = clock[32] - clock[40]  (褰?clock[45] 缃綅鏃? steady_clock 椹卞姩)
-    //    璋冩暣: clock[40] += (current_display - target_ms)
     void *gp = atomic_load(&g_gameplay_instance);
     if (gp && ptr_plausible(gp) && addr_readable((char *)gp + 936, 8)) {
         void *logic = *(void **)((char *)gp + 928);
@@ -507,13 +469,11 @@ void player_seek_ms(uint32_t ms) {
     time_warp_freeze_dec();
 }
 
-// (player_set_paused 宸茬Щ闄?
 
 uint32_t player_get_position_ms_cached(void) {
     return atomic_load(&g_last_pos_ms);
 }
 
-// 璋冪敤鑰呴渶瑕佺殑鏈€澶ц繘搴﹀€硷細浼樺厛 FMOD 鎷垮埌鐨勭湡瀹炴€婚暱锛屽叾娆℃槸杩愯涓湅鍒拌繃鐨勬渶澶?ms
 uint32_t player_get_progress_max_ms(void) {
     uint32_t len = atomic_load(&g_song_length_ms);
     if (len > 0) return len;
@@ -632,7 +592,6 @@ void loadPref(void) {
 %hook UIWindow
 - (void)bringSubviewToFront:(UIView *)view {
     %orig;
-    // 闃查€掑綊锛氬綋澶栭儴鎶?button/menuView 鑷繁缃《鏃讹紝涓嶈鍐嶉€掑綊缃《瀹冧滑
     if (view == button || view == menuView) return;
     if (button) %orig(button);
     if (menuView) %orig(menuView);
@@ -741,9 +700,9 @@ void loadPref(void) {
     CGFloat y = 12;
     CGFloat innerW = W - 24;
 
-    // 鏍囬
+    // Title.
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 24)];
-    title.text = [NSString stringWithFormat:@"Arcaea 鍙橀€?(XRC) %@ [%@]",
+    title.text = [NSString stringWithFormat:@"ArcDemo %@ [%@]",
                   XRC_TWEAK_VERSION, XRC_BUILD_LABEL];
     title.font = [UIFont boldSystemFontOfSize:18];
     title.textColor = [UIColor blackColor];
@@ -751,7 +710,7 @@ void loadPref(void) {
     y += 28;
 
     UILabel *scope = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 44)];
-    scope.text = @"璋遍潰+鐢婚潰鍙橀€燂紱BGM 1.0脳銆傞厤缃? Documents/xrc-arcdemo.plist";
+    scope.text = @"Chart + visual speed control; BGM stays 1.0x. Config: Documents/xrc-arcdemo.plist";
     scope.font = [UIFont systemFontOfSize:11];
     scope.textColor = [UIColor darkGrayColor];
     scope.numberOfLines = 0;
@@ -761,7 +720,7 @@ void loadPref(void) {
     BOOL playerReady = (get_player_or_resolve() != NULL);
 
     UILabel *playerHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    playerHdr.text = playerReady ? @"杩涘害 seek" : @"杩涘害 (绛夊緟瀵瑰眬...)";
+    playerHdr.text = playerReady ? @"Seek" : @"Seek (waiting for gameplay...)";
     playerHdr.font = [UIFont systemFontOfSize:13];
     playerHdr.textColor = [UIColor darkGrayColor];
     [card addSubview:playerHdr];
@@ -811,7 +770,7 @@ void loadPref(void) {
     y += MAX(28, swSize.height) + 8;
 
     UILabel *judgeHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 32)];
-    judgeHdr.text = @"鍒ゅ畾绐楀彛 卤ms (Max / Pure / Far / Lost)";
+    judgeHdr.text = @"Judgement window +/-ms (Max / Pure / Far / Lost)";
     judgeHdr.font = [UIFont systemFontOfSize:12];
     judgeHdr.textColor = [UIColor darkGrayColor];
     judgeHdr.numberOfLines = 2;
@@ -843,7 +802,7 @@ void loadPref(void) {
     y += 52;
 
     UILabel *speedHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW, 18)];
-    speedHdr.text = @"鍊嶇巼 (鍗曞嚮=閫変腑, 闀挎寜=鍒犻櫎)";
+    speedHdr.text = @"Speed presets (tap to select, long-press to delete)";
     speedHdr.font = [UIFont systemFontOfSize:12];
     speedHdr.textColor = [UIColor darkGrayColor];
     speedHdr.numberOfLines = 0;
@@ -859,7 +818,7 @@ void loadPref(void) {
         UIButton *row = [UIButton buttonWithType:UIButtonTypeSystem];
         row.frame = CGRectMake(12, y, innerW - 60, 32);
         row.tag = 1000 + i;
-        [row setTitle:[NSString stringWithFormat:@"  %.3f脳", v] forState:UIControlStateNormal];
+        [row setTitle:[NSString stringWithFormat:@"  %.3fx", v] forState:UIControlStateNormal];
         row.titleLabel.font = [UIFont systemFontOfSize:15];
         row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
         row.backgroundColor = (i == rate_i) ? [UIColor colorWithRed:0.9 green:0.95 blue:1 alpha:1] : [UIColor clearColor];
@@ -885,14 +844,14 @@ void loadPref(void) {
 
     UIButton *addBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     addBtn.frame = CGRectMake(12, y, innerW, 32);
-    [addBtn setTitle:@"+ 娣诲姞鍊嶇巼" forState:UIControlStateNormal];
+    [addBtn setTitle:@"+ Add speed" forState:UIControlStateNormal];
     [addBtn addTarget:self action:@selector(addSpeed) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:addBtn];
     y += 40;
 
     UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     closeBtn.frame = CGRectMake(12, y, innerW, 32);
-    [closeBtn setTitle:@"鍏抽棴" forState:UIControlStateNormal];
+    [closeBtn setTitle:@"Close" forState:UIControlStateNormal];
     [closeBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
     [closeBtn addTarget:self action:@selector(hide) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:closeBtn];
@@ -955,7 +914,7 @@ void loadPref(void) {
     p[@"judgeLostMs"] = @(judgeLostMs);
     savePrefDict(p);
     if (toast) {
-        [WHToast showMessage:[NSString stringWithFormat:@"鍒ゅ畾鍙傛暟宸蹭繚瀛?卤%d/%d/%d/%d",
+        [WHToast showMessage:[NSString stringWithFormat:@"Judgement params saved: +/- %d/%d/%d/%d",
                               judgeMaxMs, judgePureMs, judgeFarMs, judgeLostMs]
                     duration:0.8 finishHandler:^{}];
     }
@@ -983,7 +942,7 @@ void loadPref(void) {
     NSMutableDictionary *p = loadPrefDict();
     NSMutableArray *keys = [p[@"speedKeys"] mutableCopy];
     if (i >= (NSInteger)keys.count) return;
-    if (keys.count <= 1) return; // 鑷冲皯鐣欎竴涓?
+    if (keys.count <= 1) return; // Keep at least one preset.
     NSString *k = keys[i];
     [keys removeObjectAtIndex:i];
     [p removeObjectForKey:k];
@@ -1035,7 +994,7 @@ void loadPref(void) {
 static void initButton(void) {
     [WHToast setShowMask:NO];
     [WQSuspendView showWithType:WQSuspendViewTypeNone tapBlock:^{
-        // 鍗曞嚮锛氬垏鎹㈠€嶇巼锛堜綆棰戝姩浣滐級
+        // Single tap switches the active speed preset.
         if (rate_count <= 0) return;
         rate_i = (rate_i + 1) % rate_count;
         time_warp_set_rate((double)rates[rate_i]);
@@ -1043,7 +1002,7 @@ static void initButton(void) {
         p[@"rateIndex"] = @(rate_i);
         savePrefDict(p);
         if (toast) {
-            [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (鍙屽嚮鎵撳紑鑿滃崟)", rates[rate_i]]
+            [WHToast showMessage:[NSString stringWithFormat:@"%.3fx (double-tap opens menu)", rates[rate_i]]
                                        duration:0.5 finishHandler:^{}];
         }
     }];
@@ -1083,7 +1042,7 @@ static void initButton(void) {
 
 #pragma mark - bootstrap
 
-// 鏂囦欢鏃ュ織锛歴ideload 涓嬫病娉曟帴 Console锛屽啓鍒?app Documents/xrc-arcdemo.log
+// File log for sideload builds where Console access is inconvenient.
 void acc_flog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *line = [[NSString alloc] initWithFormat:fmt arguments:ap];
@@ -1118,7 +1077,6 @@ static void doBootstrap(void) {
         if (rate_count > 0)
             time_warp_set_rate((double)rates[rate_i]);
         acc_flog(@"config path: %@", arcConfigPath());
-        // 0.5s 杞: 鎹㈡洸妫€娴?+ 浠?FMOD 琛ヨ冻杩涘害鏉℃暟鎹?
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) {
             void *p = get_player_or_resolve();
             static void *s_last_player = NULL;
@@ -1133,7 +1091,6 @@ static void doBootstrap(void) {
                 acc_flog(@"new song: player=%p", p);
             }
             if (p) try_capture_song_length(p);
-            // 鍏滃簳缁存姢 last_pos_ms / max_seen_ms锛堢敤浜庤繘搴︽潯鏄剧ず锛?
             if (p && g_ch_get_position) {
                 void *channels_base = channels_base_chk;
                 if (channels_base) {
@@ -1154,7 +1111,6 @@ static void doBootstrap(void) {
 static void onAppDidEnterBackground(CFNotificationCenterRef center, void *observer,
                                     CFStringRef name, const void *object,
                                     CFDictionaryRef userInfo) {
-    // 鍒囧悗鍙帮細鍐荤粨 warp 鏃堕棿锛岄槻姝㈠洖鍓嶅彴鏃?currentTimeMs 璺冲彉 = 鍚庡彴鏃堕暱 * rate
     time_warp_freeze_inc();
     acc_flog(@"app -> background, warp frozen (count=%d)", atomic_load(&g_tw_freeze_count));
 }
@@ -1162,7 +1118,7 @@ static void onAppDidEnterBackground(CFNotificationCenterRef center, void *observ
 static void onAppWillEnterForeground(CFNotificationCenterRef center, void *observer,
                                      CFStringRef name, const void *object,
                                      CFDictionaryRef userInfo) {
-    s_gp_last_real_us = 0;  // 鍥炲墠鍙板悗閲嶅缓 retime 鍩哄噯
+    s_gp_last_real_us = 0;
     time_warp_freeze_dec();
     acc_flog(@"app -> foreground, warp unfrozen (count=%d)", atomic_load(&g_tw_freeze_count));
 }
@@ -1190,8 +1146,6 @@ static void onAppLaunched(CFNotificationCenterRef center, void *observer,
         onAppWillEnterForeground,
         (CFStringRef)UIApplicationWillEnterForegroundNotification,
         NULL, CFNotificationSuspensionBehaviorCoalesce);
-    // 鍏滃簳锛氬鏋?ctor 鍦?UIApplicationDidFinishLaunching 涔嬪悗鎵嶈窇锛堢悊璁轰笂涓嶄細锛屼絾
-    // 娉ㄥ叆宸ュ叿濡傛灉鐢?LC_LOAD_WEAK_DYLIB / 寤惰繜鍔犺浇鍙兘閿欒繃閫氱煡锛夛紝3 绉掑悗寮哄埗璧颁竴娆?
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         acc_flog(@"3s fallback bootstrap");

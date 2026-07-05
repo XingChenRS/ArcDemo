@@ -1,4 +1,4 @@
-name: Build AccDemoArcaea
+name: Build ArcDemo
 
 on:
   push:
@@ -8,7 +8,7 @@ jobs:
     runs-on: macos-latest
     env:
       THEOS: ${{ github.workspace }}/theos
-      DYLIB_OUT: libAccDemoArcaea.dylib
+      DYLIB_OUT: libArcDemo.dylib
 
     steps:
       - name: Checkout
@@ -34,14 +34,14 @@ jobs:
           make clean
           make
           mkdir -p out
-          DYLIB="$(find .theos/obj -maxdepth 2 -name 'AccDemoArcaea.dylib' -not -path '*.dSYM*' | head -n1)"
-          if [ -z "$DYLIB" ]; then echo "AccDemoArcaea.dylib not found"; exit 1; fi
+          DYLIB="$(find .theos/obj -maxdepth 2 -name 'ArcDemo.dylib' -not -path '*.dSYM*' | head -n1)"
+          if [ -z "$DYLIB" ]; then echo "ArcDemo.dylib not found"; exit 1; fi
           cp "$DYLIB" "out/${DYLIB_OUT}"
           install_name_tool -change \
             /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
             @rpath/libellekit.dylib \
             "out/${DYLIB_OUT}"
-          install_name_tool -id @rpath/libAccDemoArcaea.dylib "out/${DYLIB_OUT}"
+          install_name_tool -id @rpath/libArcDemo.dylib "out/${DYLIB_OUT}"
           ldid -S "out/${DYLIB_OUT}"
           otool -L "out/${DYLIB_OUT}"
           file "out/${DYLIB_OUT}"
@@ -73,8 +73,8 @@ jobs:
       - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
-          name: libAccDemoArcaea-sideload
+          name: libArcDemo-sideload
           path: |
-            out/libAccDemoArcaea.dylib
+            out/libArcDemo.dylib
             out/libellekit.dylib
           if-no-files-found: error

@@ -75,19 +75,19 @@ Settings are stored in `Documents/xrc-arcdemo.plist`.
 make
 ```
 
-The build produces `AccDemoArcaea.dylib`. For sideload use, package it with
+The build produces `ArcDemo.dylib`. For sideload use, package it with
 `libellekit.dylib` and load both from `Arc-mobile.app/Frameworks`.
 
 GitHub Actions builds the same single target on each pushed commit and uploads:
-- `libAccDemoArcaea.dylib`
+- `libArcDemo.dylib`
 - `libellekit.dylib`
 
 ## Injection Helper
 
 `inject.py` expects `ios/Payload/Arc-mobile.app/Arc-mobile` and copies
-`libAccDemoArcaea.dylib` plus `libellekit.dylib` into `Frameworks`, then inserts:
+`libArcDemo.dylib` plus `libellekit.dylib` into `Frameworks`, then inserts:
 
-- `LC_LOAD_DYLIB @rpath/libAccDemoArcaea.dylib`
+- `LC_LOAD_DYLIB @rpath/libArcDemo.dylib`
 - `LC_RPATH @executable_path/Frameworks`
 
 It does not patch gameplay or judgement code in the main binary.

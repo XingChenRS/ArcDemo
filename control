@@ -1,9 +1,9 @@
-﻿Package: moe.low.arc.accdemoarcaea
-Name: AccDemoArcaea
+Package: moe.low.arc.arcdemo
+Name: ArcDemo
 Depends: mobilesubstrate
 Version: 7.3.2
 Architecture: iphoneos-arm
-Description: Arcaea-only fork of AccDemo (chart speed control + practice tools)
+Description: Arcaea sideload practice tweak
 Maintainer: XingChenRS
-Author: XingChenRS (fork of brendonjkding/accDemo)
+Author: XingChenRS
 Section: Tweaks
