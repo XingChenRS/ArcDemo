@@ -13,13 +13,10 @@ extern BOOL buttonEnabled;
 extern NSInteger rate_i;
 extern NSInteger rate_count;
 extern float *rates;
-
-#if ARC_TROLLSTORE
 extern int judgeMaxMs;
 extern int judgePureMs;
 extern int judgeFarMs;
 extern int judgeLostMs;
-#endif
 
 extern _Atomic(int32_t) g_tw_freeze_count;
 extern int (*s_orig_gettod)(struct timeval *, void *);
@@ -42,10 +39,7 @@ double tw_get_rate(void);
 uint64_t arc_image_base(void);
 void time_warp_set_rate(double rate);
 
-#if ARC_TROLLSTORE
 void normalizeJudgeThresholds(void);
-bool applyJudgeThresholds(void);
-#endif
 
 @class WQSuspendView;
 extern WQSuspendView *button;

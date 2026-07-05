@@ -1,71 +1,105 @@
-# accDemo-arcaea (arcdemo)
+# arcdemo
 
-Arcaea iOS **6.13.10** 练习辅助 dylib。
+Arcaea iOS 6.13.10 sideload dylib for practice.
 
-> **当前版本: v7.3.2**（TrollStore 判定需主程序 graft + 本 dylib 配套安装）
+Repository: <https://github.com/XingChenRS/ArcDemo>
 
-## TrollStore 判定安装（主程序 + dylib 必须同一套 graft）
+The active branch is intentionally narrow: keep the features that work, keep
+the judgement UI as a design surface, and remove failed main-binary surgery from
+the build path.
 
-1. 从**未 graft** 的 `Arc-mobile` 主程序开始
-2. `python graft_hook.py --binary <Arc-mobile>`（在 `__DATA` 文件尾插入 `XRCH`+槽位，刷新 tramp）
-3. 注入 `libAccDemoArcaea.dylib` + `libellekit.dylib` 到 `Frameworks/`
-4. TrollStore 签名安装
+## Scope
 
-成功日志示例：`graft_ok slot=... hook=... magic=XRCH tramp=0xf0002310`
+Implemented:
+- chart speed retime through `Gameplay.update`
+- visual speed warp through `gettimeofday`
+- basic seek through the in-game music player
+- floating UI, plist config, and file logging
+- judgement-window UI parameters, saved for the next design pass
 
-**不能只换 dylib 不换主程序**（tramp 槽位地址必须一致）。
+Not implemented:
+- runtime `__TEXT` patching
+- main-binary payload insertion
+- alternate privileged-install build variants
+- audio speed control
+- audio/chart drift correction
+- replaying already-judged notes after seek
+- scorekeeper or note-state reset experiments
 
-## 配置文件
+## Code Stack
 
-所有设置写入 **`Documents/xrc-arcdemo.plist`**（与 `xrc-arcdemo.log` 同目录，可导出编辑）。
+| Area | File | Notes |
+| --- | --- | --- |
+| Main tweak | `Tweak.x` | Bootstrap, hooks, UI, config, logging |
+| Offsets | `include/ArcOffsets.h` | 6.13.10 runtime offsets and judgement research anchors |
+| Fishhook | `fishhook.c`, `include/fishhook.h` | Used for `gettimeofday` visual warp |
+| Shared declarations | `AccCommon.h` | Cross-file declarations for tweak/UI helpers |
+| Packaging helper | `inject.py` | Copies dylibs and inserts load commands only |
+| Build | `Makefile` | Single sideload dylib target |
 
-首次启动会从旧路径 `Library/Preferences/moe.low.arc.accdemoarcaea.plist` 自动迁移。
+## Runtime Semantics
 
-| 键 | 说明 | 默认 |
-|----|------|------|
-| `speedKeys` / `speed-N` | 变速档位列表 | 1.0 / 0.8 / 0.6 / 1.25 / 1.5 |
-| `rateIndex` | 当前选中倍率索引 | 0 |
-| `toast` | 切倍率 toast | YES |
-| `buttonEnabled` | 浮动按钮 | YES |
-| `judgeMaxMs` | Max 判定 ±ms (TrollStore) | 25 |
-| `judgePureMs` | Pure ±ms | 50 |
-| `judgeFarMs` | Far ±ms | 100 |
-| `judgeLostMs` | Lost ±ms | 120 |
+Speed has two cooperating parts:
+- `gettimeofday` fishhook changes the visual/Cocos time domain.
+- `Gameplay.update` vtable swap advances the chart clock at the selected rate.
 
-## 构建
+Seek is intentionally limited:
+- `MTP::seekTo(ms, 0)` jumps the music player.
+- The chart clock is shifted to the requested display time.
+- Already-judged notes do not replay. The game rebuilds those states only when
+  entering a fresh gameplay scene, so this branch treats seek as navigation, not
+  full gameplay reset.
 
-```bash
-make              # Sideload
-make trollstore   # + 判定窗口自定义
+Judgement parameters are UI/config only today. They are saved as
+`judgeMaxMs`, `judgePureMs`, `judgeFarMs`, and `judgeLostMs`, but no active code
+applies them to the classifier.
+
+## Config
+
+Settings are stored in `Documents/xrc-arcdemo.plist`.
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `speedKeys` / `speed-N` | Speed preset list | `1.0, 0.8, 0.6, 1.25, 1.5` |
+| `rateIndex` | Selected speed preset index | `0` |
+| `toast` | Show speed-change toast | `YES` |
+| `buttonEnabled` | Floating button visibility | `YES` |
+| `judgeMaxMs` | Judgement design parameter, not applied yet | `25` |
+| `judgePureMs` | Judgement design parameter, not applied yet | `50` |
+| `judgeFarMs` | Judgement design parameter, not applied yet | `100` |
+| `judgeLostMs` | Judgement design parameter, not applied yet | `120` |
+
+## Build
+
+```sh
+make
 ```
 
-## 功能
+The build produces `AccDemoArcaea.dylib`. For sideload use, package it with
+`libellekit.dylib` and load both from `Arc-mobile.app/Frameworks`.
 
-| 功能 | Sideload | TrollStore |
-|------|----------|------------|
-| 谱面/画面变速 + seek | ✅ | ✅ |
-| 判定四档自定义 (输入框 / plist) | ❌ | ✅ |
+GitHub Actions builds the same single target on each pushed commit and uploads:
+- `libAccDemoArcaea.dylib`
+- `libellekit.dylib`
 
-BGM 始终 1.0×。Seek 不重置已判定音符。
+## Injection Helper
 
-## 注入（Sideload / TrollStore 均需）
+`inject.py` expects `ios/Payload/Arc-mobile.app/Arc-mobile` and copies
+`libAccDemoArcaea.dylib` plus `libellekit.dylib` into `Frameworks`, then inserts:
 
-设备上**没有** `CydiaSubstrate.framework`。必须把 **两个** dylib 放进 `Arc-mobile.app/Frameworks/`：
+- `LC_LOAD_DYLIB @rpath/libAccDemoArcaea.dylib`
+- `LC_RPATH @executable_path/Frameworks`
 
-| 文件 | 说明 |
-|------|------|
-| `libAccDemoArcaea.dylib` | 本 tweak（CI 已把依赖改为 `@rpath/libellekit.dylib`） |
-| `libellekit.dylib` | Substrate 替代，提供 MSHook 符号 |
+It does not patch gameplay or judgement code in the main binary.
 
-主二进制需已有 `LC_LOAD_DYLIB @rpath/libAccDemoArcaea.dylib` 与 `LC_RPATH @executable_path/Frameworks`。用仓库内 `inject.py` 一键注入（**不要用 lief 写主程序**，会截断 `__LINKEDIT` 导致启动即崩）。
+## Next Research
 
-```bash
-python graft_hook.py --binary <Arc-mobile>
-python inject.py   # 需 ios/Payload/Arc-mobile.app 布局 + ci-artifacts 内 dylib
-```
-
-
-CI artifact（sideload / trollstore）内均包含上述两个文件。
+The judgement problem should be approached read-only first:
+- verify whether classifier callers are direct `BL` sites or pass through any
+  writable dispatch/vtable layer
+- look for data-side inputs that influence `dt` before the hardcoded CMP sites
+- avoid any design that requires runtime `__TEXT` writes or fragile payload
+  insertion into the app binary
 
 ## License
 

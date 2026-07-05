@@ -1,10 +1,10 @@
-// ArcOffsets.h — Arcaea iOS 6.13.10 (Arc-mobile) 已知偏移
-// Image base (IDA): 0x100000000; 运行时 = arc_image_base() + offset
+// Known offsets for Arcaea iOS 6.13.10 (Arc-mobile).
+// IDA image base: 0x100000000. Runtime address = arc_image_base() + offset.
 #pragma once
 
 #include <stdint.h>
 
-// ---- 变速 / seek ----
+// Speed / seek helpers.
 #define ARC_OFF_GET_REGISTRY       (0xC9D718ULL)
 #define ARC_OFF_GET_CURRENT_SOUND  (0xEC094CULL)
 #define ARC_OFF_GET_SOUND_LENGTH   (0xF2BB64ULL)
@@ -15,21 +15,18 @@
 #define ARC_OFF_GP_VTABLE          (0x136E1C0ULL)
 #define ARC_OFF_GP_UPDATE_FN       (0xB3AD70ULL)
 
-// ---- 判定 classifier sub_100870FD0 ----
-#define ARC_OFF_JUDGE_CLASSIFY     (0x870FD0ULL)
-#define ARC_OFF_JUDGE_CALLER_A     (0x871514ULL)
-#define ARC_OFF_JUDGE_CALLER_B     (0x871FE0ULL)
+// Judgement classifier research anchors. The active sideload dylib does not
+// patch these addresses; they are kept so the next design pass can reference
+// the verified 6.13.10 sites without re-deriving them.
+#define ARC_OFF_JUDGE_CLASSIFY      (0x870FD0ULL)
+#define ARC_OFF_JUDGE_CALLER_A      (0x871514ULL)
+#define ARC_OFF_JUDGE_CALLER_B      (0x871FE0ULL)
 
-// graft_hook.py：槽位在 __data 末尾 XRCH 魔数 + 8B（由 tramp 指令解析地址，勿硬编码）
-#define ARC_OFF_JUDGE_TRAMP        (0x1039500ULL)
-// 仅作参考；运行时以 resolve_slot_from_tramp() 为准
-#define ARC_OFF_HOOK_SLOT          (0x149C008ULL)  /* graft 后 __DATA 文件尾 8B 槽位（以 tramp 解析为准） */
-
-// 八个 CMP 站点 — 仅 RE 参考 / 静态 patch_judge_static.py；graft 方案不再 runtime patch
-// 默认 imm → 有效窗口 (与 ArcCreate Values 一致):
-//   Max ±25ms  | Pure ±50ms | Far ±100ms | Lost ±120ms
-// 分支 A (clock+45==1): CMP #26/51/101/121 + B.CC/B.CS
-// 分支 B (另一 clock 路径): CMP #25/50/100/120 + B.HI
+// Eight CMP immediate sites inside the classifier.
+// Effective default windows: Max +/-25ms, Pure +/-50ms, Far +/-100ms,
+// Lost +/-120ms.
+// Branch A (clock+45 == 1): CMP #26/#51/#101/#121 with B.CC/B.CS.
+// Branch B: CMP #25/#50/#100/#120 with B.HI.
 #define ARC_OFF_JUDGE_CMP_MAXPURE_A (0x87106CULL)
 #define ARC_OFF_JUDGE_CMP_PURE_A    (0x871074ULL)
 #define ARC_OFF_JUDGE_CMP_FAR_A     (0x87107CULL)
@@ -41,7 +38,6 @@
 
 #define ARC_JUDGE_CMP_SITE_COUNT 8
 
-// 默认 imm12 (仅作安装校验 fallback)
 #define ARC_JUDGE_DEF_MAXPURE_A 26
 #define ARC_JUDGE_DEF_PURE_A    51
 #define ARC_JUDGE_DEF_FAR_A     101
@@ -51,6 +47,4 @@
 #define ARC_JUDGE_DEF_FAR_B     100
 #define ARC_JUDGE_DEF_LOST_B    120
 
-#define ARC_OFF_SCORE_COMMIT_HIT   (0x9C6B38ULL)
-#define ARC_OFF_SCORE_COMMIT_LOST  (0x9C697CULL)
 #define ARC_OFF_LOST_AUTO_JUDGE    (0x870344ULL)

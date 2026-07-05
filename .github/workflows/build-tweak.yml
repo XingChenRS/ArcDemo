@@ -2,24 +2,12 @@ name: Build AccDemoArcaea
 
 on:
   push:
-  pull_request:
-  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-    strategy:
-      matrix:
-        include:
-          - variant: sideload
-            arc_trollstore: "0"
-            artifact: libAccDemoArcaea-sideload
-          - variant: trollstore
-            arc_trollstore: "1"
-            artifact: libAccDemoArcaea-trollstore
     env:
       THEOS: ${{ github.workspace }}/theos
-      ARC_TROLLSTORE: ${{ matrix.arc_trollstore }}
       DYLIB_OUT: libAccDemoArcaea.dylib
 
     steps:
@@ -41,15 +29,14 @@ jobs:
           tar -xzf /tmp/sdks.tar.gz -C /tmp
           mv /tmp/sdks-master/iPhoneOS14.5.sdk "$THEOS/sdks/" || true
 
-      - name: Build dylib (${{ matrix.variant }})
+      - name: Build dylib
         run: |
           make clean
-          make ARC_TROLLSTORE=${ARC_TROLLSTORE}
+          make
           mkdir -p out
           DYLIB="$(find .theos/obj -maxdepth 2 -name 'AccDemoArcaea.dylib' -not -path '*.dSYM*' | head -n1)"
           if [ -z "$DYLIB" ]; then echo "AccDemoArcaea.dylib not found"; exit 1; fi
           cp "$DYLIB" "out/${DYLIB_OUT}"
-          # 免越狱 / TrollStore 设备无 CydiaSubstrate，统一指向 @rpath/libellekit.dylib
           install_name_tool -change \
             /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
             @rpath/libellekit.dylib \
@@ -86,7 +73,7 @@ jobs:
       - name: Upload dylibs
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: libAccDemoArcaea-sideload
           path: |
             out/libAccDemoArcaea.dylib
             out/libellekit.dylib

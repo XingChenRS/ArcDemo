@@ -1,10 +1,13 @@
 """
-注入 libAccDemoArcaea.dylib + libellekit.dylib（与仓库根 inject.py 同步）
+Inject libAccDemoArcaea.dylib + libellekit.dylib into Arc-mobile.app.
+
+This script only copies dylibs and inserts LC_LOAD_DYLIB / LC_RPATH into the
+existing load-command padding. It intentionally does not graft, reserve slots,
+or patch gameplay/judgement code in the main binary.
 """
 import os
 import shutil
 import struct
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -143,10 +146,7 @@ def insert_load_commands_inplace(data: bytearray, base: int) -> list[str]:
 
 
 def find_dylibs() -> list[str]:
-    candidates = [
-        os.path.join(ROOT, "ci-artifacts", "libAccDemoArcaea-trollstore"),
-        ROOT,
-    ]
+    candidates = [ROOT, os.path.join(ROOT, "ci-artifacts", "libAccDemoArcaea-sideload")]
     found = []
     for name in DYLIB_NAMES:
         path = None
@@ -178,19 +178,6 @@ def main():
         shutil.copy2(d, dst)
         print(f"[+] copied -> {dst}")
 
-    graft_script = os.path.join(ROOT, "graft_hook.py")
-    if os.path.isfile(graft_script):
-        r = subprocess.run(
-            [sys.executable, graft_script, "--binary", MAIN],
-            capture_output=True,
-            text=True,
-        )
-        if r.returncode == 0:
-            print(r.stdout.strip())
-        else:
-            print("[!] graft_hook failed:", r.stderr or r.stdout)
-            sys.exit(1)
-
     with open(MAIN, "rb") as f:
         data = bytearray(f.read())
 
@@ -209,10 +196,9 @@ def main():
     size = os.path.getsize(MAIN)
     with open(MAIN, "rb") as f:
         raw = f.read()
-    xrch = raw.find(b"XRCH")
     _, sl_end = slice_range(raw)
     print(f"[+] wrote {MAIN}")
-    print(f"[i] size={size} (slice_end={sl_end}) XRCH@{xrch}")
+    print(f"[i] size={size} (slice_end={sl_end})")
     if size < sl_end - 1000:
         print("[!] WARNING: file smaller than slice — possible corruption")
         sys.exit(1)
