@@ -103,4 +103,4 @@ The judgement problem should be approached read-only first:
 
 ## License
 
-GPL-2.0
+MIT. See `LICENSE`.
