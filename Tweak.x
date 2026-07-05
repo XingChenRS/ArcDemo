@@ -1,4 +1,4 @@
-﻿// xrc-arcdemo / Tweak.x
+// xrc-arcdemo / Tweak.x
 // Sideload dylib: chart/visual speed control + basic seek.
 #define XRC_TWEAK_VERSION  @"v7.3.2"
 #define XRC_BUILD_LABEL    @"Sideload"
@@ -798,7 +798,7 @@ void loadPref(void) {
 
     // toast switch
     UILabel *toastLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, y, innerW - 60, 28)];
-    toastLbl.text = @"鍒囨崲鍊嶇巼鏃舵彁绀?;
+    toastLbl.text = @"Show speed toast";
     toastLbl.font = [UIFont systemFontOfSize:14];
     toastLbl.textColor = [UIColor blackColor];
     [card addSubview:toastLbl];
